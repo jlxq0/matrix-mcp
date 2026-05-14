@@ -32,6 +32,10 @@ sha2 = "0.10"
 # Constant-time string comparison for auth headers, kept simple by leaning on
 # subtle's idioms. Used by the bearer extractor.
 subtle = "2.6"
+# Used only for generating Matrix transaction ids (random suffix on a
+# millisecond timestamp). Not security-sensitive — Synapse de-duplicates on
+# txn id, so what matters is uniqueness, not unpredictability.
+rand = "0.8"
 # Official MCP Rust SDK. `transport-streamable-http-server` umbrella enables
 # session manager + http transport + worker bits we need to mount the service
 # via `axum::Router::nest_service("/mcp", ...)`.

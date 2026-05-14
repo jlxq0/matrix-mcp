@@ -71,6 +71,7 @@ mod tests {
         Config::new(
             "https://example.test",
             "https://auth.example.test",
+            "https://matrix.example.test",
             SocketAddr::from(([0, 0, 0, 0], 3000)),
         )
         .unwrap()
