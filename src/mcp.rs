@@ -257,7 +257,7 @@ impl MatrixMcpService {
             .await
             .map_err(|e| ErrorData::internal_error(format!("room.send: {e}"), None))?;
         structured_result(&SendTextMessageResult {
-            event_id: response.event_id.to_string(),
+            event_id: response.response.event_id.to_string(),
         })
     }
 

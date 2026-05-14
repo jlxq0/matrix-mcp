@@ -46,16 +46,16 @@ rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
 # message bodies. Default features are off so we don't drag in native
 # TLS (we use rustls everywhere), SSO redirects (we authenticate via
 # OAuth bearer), qrcode, or other unneeded surface.
-matrix-sdk = { version = "0.13", default-features = false, features = [
+matrix-sdk = { version = "0.17", default-features = false, features = [
     "e2e-encryption",
     "sqlite",
     "markdown",
-    "rustls-tls",
 ] }
 # `ruma-events` types we pull off the SDK's room timelines (e.g.
 # `RoomMessageEventContent` for sending m.text bodies). Pinned to the
-# same Matrix-spec generation as matrix-sdk 0.13.
-ruma = { version = "0.13", features = ["client-api-c", "html"] }
+# same Matrix-spec generation as matrix-sdk 0.17. 0.15 is the API line
+# matrix-sdk 0.17 re-exports under `matrix_sdk::ruma::*`.
+ruma = { version = "0.15", features = ["client-api-c", "html"] }
 # HKDF for deriving the per-user store-cipher key from the shared pepper.
 # `salt = mxid`, `ikm = pepper`, `info = "matrix-mcp-store-cipher v1"`.
 hkdf = "0.12"

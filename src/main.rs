@@ -1,3 +1,9 @@
+// matrix-sdk's `Client::sync()` produces a deeply-generic Future. The
+// default `Send` auto-trait recursion limit (128) overflows during
+// trait resolution. Bump it; this is the documented workaround in
+// matrix-sdk's own README.
+#![recursion_limit = "512"]
+
 //! `matrix-mcp` — Remote MCP server exposing Matrix to claude.ai.
 //!
 //! Phase 1.3: real MCP framework wired up. `/mcp` is served by
