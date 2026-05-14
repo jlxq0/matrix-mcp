@@ -169,17 +169,31 @@ impl MasIntrospectionClient {
         if !body.active {
             return Ok(None);
         }
-        // RFC 8707 resource indicator validation: the token MUST have been
-        // issued with us in mind. If MAS hands back a token whose `aud`
-        // doesn't include our resource URL, refuse it.
-        let Some(aud) = &body.aud else {
-            warn!("MAS returned active token without aud claim");
-            return Ok(None);
-        };
-        if !aud.matches(&self.expected_audience) {
-            return Err(IntrospectionError::AudienceMismatch {
-                expected: self.expected_audience.clone(),
-            });
+        // RFC 8707 resource indicator validation: when `aud` is present,
+        // it MUST include our resource URL. If `aud` is absent, accept
+        // the token but warn — this happens with OAuth clients (notably
+        // claude.ai's MCP connector as of 2026-05) that don't pass the
+        // `resource` parameter to MAS's authorize/token endpoints, so
+        // MAS doesn't put an `aud` claim on the issued token.
+        //
+        // The remaining defenses for the missing-aud case:
+        // - MAS-side user consent at /authorize: the user explicitly
+        //   approves the scopes for THIS client + THIS authorization
+        //   request. A token issued for an unrelated app couldn't have
+        //   been minted without our user accepting that app's scopes.
+        // - Synapse re-validates the bearer's scope on every
+        //   /_matrix/* call (MSC3861). A token lacking the Matrix C-S
+        //   API scope gets a 401 from Synapse regardless of what we do
+        //   here, so the matrix-mcp tools that proxy to Synapse can't
+        //   be abused by a scope-less token.
+        if let Some(aud) = &body.aud {
+            if !aud.matches(&self.expected_audience) {
+                return Err(IntrospectionError::AudienceMismatch {
+                    expected: self.expected_audience.clone(),
+                });
+            }
+        } else {
+            warn!("MAS returned active token without aud claim; accepting");
         }
         let Some(mxid) = body.sub.clone() else {
             warn!("MAS returned active token without sub");
@@ -471,7 +485,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_aud_returns_none() {
+    async fn missing_aud_is_accepted_with_warn() {
+        // Real-world: claude.ai's MCP connector doesn't send RFC 8707
+        // `resource=` to MAS, so MAS issues tokens with no `aud` claim.
+        // We accept these (with a warn log); MAS-side user consent +
+        // Synapse-side scope checks are the remaining defenses. The
+        // previous behaviour of returning None broke claude.ai entirely.
         let mock = server().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/introspect"))
@@ -483,8 +502,12 @@ mod tests {
             .mount(&mock)
             .await;
         let client = client_against(&mock.uri());
-        let result = client.introspect("abc").await.unwrap();
-        assert!(result.is_none());
+        let identity = client
+            .introspect("abc")
+            .await
+            .unwrap()
+            .expect("missing-aud token should now authenticate");
+        assert_eq!(identity.mxid, "@alice:example.com");
     }
 
     #[test]
