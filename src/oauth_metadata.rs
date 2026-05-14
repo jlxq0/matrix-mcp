@@ -13,6 +13,24 @@ use serde::Serialize;
 
 use crate::config::Config;
 
+/// Fixed Matrix device id this matrix-mcp instance pins itself to.
+///
+/// Why a constant: MSC2967 requires the device-binding OAuth scope to
+/// be `urn:matrix:org.matrix.msc2967.client:device:<DEVICE_ID>` with a
+/// concrete id (no wildcard). The connector client (claude.ai today)
+/// reads scopes from our protected-resource metadata and requests them
+/// verbatim, so the device id is whatever we *advertise* — there is
+/// no negotiation step. matrix-mcp is single-tenant for now, so a
+/// single device id is fine. When we onboard a second user we'll
+/// need to derive a per-user device id (e.g. `MATRIXMCP<short-hash>`)
+/// and serve a per-request metadata document, or use a different
+/// device-binding flow entirely.
+///
+/// The id is ASCII, Crockford-base32-ish, ≤ 32 chars so Synapse's
+/// device-id surface doesn't complain. Element X will surface this
+/// string in the device list, so it's deliberately recognisable.
+pub const MATRIX_MCP_DEVICE_ID: &str = "MATRIXMCPCONNECTOR";
+
 /// Matches RFC 9728 §3.2. Optional fields are omitted with
 /// `#[serde(skip_serializing_if = "Option::is_none")]` to keep the document
 /// terse and stable.
@@ -21,7 +39,7 @@ pub struct ProtectedResourceMetadata {
     pub resource: String,
     pub authorization_servers: Vec<String>,
     pub bearer_methods_supported: Vec<&'static str>,
-    pub scopes_supported: Vec<&'static str>,
+    pub scopes_supported: Vec<String>,
 }
 
 impl ProtectedResourceMetadata {
@@ -31,11 +49,17 @@ impl ProtectedResourceMetadata {
             authorization_servers: vec![cfg.authorization_server.clone()],
             bearer_methods_supported: vec!["header"],
             scopes_supported: vec![
-                "openid",
-                // The Matrix C-S API scope minted by MAS via MSC3861. Claude
-                // requests this so the token MAS issues is directly usable
-                // against Synapse's client-server endpoints.
-                "urn:matrix:org.matrix.msc2967.client:api:*",
+                "openid".to_owned(),
+                // Matrix C-S API access scope (MSC3861). Issues an
+                // OAuth token Synapse accepts on `/_matrix/*`.
+                "urn:matrix:org.matrix.msc2967.client:api:*".to_owned(),
+                // Device-binding scope (MSC2967). When the client
+                // requests this, MAS creates the device under the
+                // authorising user's account and binds the issued
+                // token to it. Without this, the token is "deviceless"
+                // and matrix-sdk can't use it for E2EE (no vodozemac
+                // identity to attach, no cross-signing target).
+                format!("urn:matrix:org.matrix.msc2967.client:device:{MATRIX_MCP_DEVICE_ID}"),
             ],
         }
     }
@@ -113,13 +137,20 @@ mod tests {
             "https://auth.example.test"
         );
         assert_eq!(json["bearer_methods_supported"][0], "header");
+        let scopes = json["scopes_supported"].as_array().unwrap();
         assert!(
-            json["scopes_supported"]
-                .as_array()
-                .unwrap()
+            scopes
                 .iter()
                 .any(|s| s == "urn:matrix:org.matrix.msc2967.client:api:*"),
-            "matrix scope missing in {json}"
+            "C-S api scope missing in {json}"
+        );
+        // Device-binding scope: without this in the metadata, claude.ai
+        // requests a deviceless token and E2EE breaks. Regression lock.
+        assert!(
+            scopes
+                .iter()
+                .any(|s| s == "urn:matrix:org.matrix.msc2967.client:device:MATRIXMCPCONNECTOR"),
+            "device scope missing in {json}"
         );
     }
 
