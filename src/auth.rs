@@ -35,6 +35,11 @@ pub async fn bearer_auth(
     match state.mas.introspect(&token).await {
         Ok(Some(identity)) => {
             debug!(mxid = %identity.mxid, "authenticated request");
+            // Stash the identity on request extensions. rmcp's streamable-http
+            // tower layer wraps the request's `Parts` (including our extension)
+            // into the tool handler's `RequestContext.extensions`, where the
+            // tool reads it via `mcp::identity_from_ctx`. A `task_local!` is
+            // tempting but doesn't survive the rmcp session worker spawn.
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
