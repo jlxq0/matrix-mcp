@@ -4,7 +4,7 @@
 # Final image ~25-35 MiB (Rust release binary + glibc-shared libraries).
 # Compatible with our existing PSS-restricted namespace conventions.
 
-ARG RUST_VERSION=1.90
+ARG RUST_VERSION=1.93
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 WORKDIR /build

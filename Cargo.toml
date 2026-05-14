@@ -2,7 +2,7 @@
 name = "matrix-mcp"
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 description = "Remote MCP server exposing Matrix (kampong.social) to claude.ai"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/jlxq0/matrix-mcp"
@@ -40,6 +40,28 @@ rand = "0.8"
 # session manager + http transport + worker bits we need to mount the service
 # via `axum::Router::nest_service("/mcp", ...)`.
 rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
+# Matrix client SDK. We pull in just the pieces needed for E2EE-aware
+# tools: vodozemac (olm/megolm) via `e2e-encryption`, the encrypted
+# on-disk SQLite store via `sqlite`, and markdown rendering for outgoing
+# message bodies. Default features are off so we don't drag in native
+# TLS (we use rustls everywhere), SSO redirects (we authenticate via
+# OAuth bearer), qrcode, or other unneeded surface.
+matrix-sdk = { version = "0.17", default-features = false, features = [
+    "e2e-encryption",
+    "sqlite",
+    "markdown",
+] }
+# `ruma-events` types we pull off the SDK's room timelines (e.g.
+# `RoomMessageEventContent` for sending m.text bodies). Pinned to the
+# same Matrix-spec generation as matrix-sdk 0.17. 0.15 is the API line
+# matrix-sdk 0.17 re-exports under `matrix_sdk::ruma::*`.
+ruma = { version = "0.15", features = ["client-api-c", "html"] }
+# HKDF for deriving the per-user store-cipher key from the shared pepper.
+# `salt = mxid`, `ikm = pepper`, `info = "matrix-mcp-store-cipher v1"`.
+hkdf = "0.12"
+# Hex-encoding the SHA-256 of the mxid for the on-disk store directory
+# name (avoid putting raw `@user:host` chars on the filesystem).
+hex = "0.4"
 
 [dev-dependencies]
 # Mock HTTP server for MAS introspection tests. Used by `cargo test` only;

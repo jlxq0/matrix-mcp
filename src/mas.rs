@@ -26,6 +26,11 @@ use tracing::{debug, warn};
 
 /// Maximum age of a cached introspection result. Bounded so revocations
 /// propagate in at most this window even if a token's own `exp` is later.
+///
+/// `from_secs(60)` over `from_mins(1)` because the latter is unstable
+/// on stable Rust as of 1.93. Clippy's nudge is correct in spirit, but
+/// hitting an unstable API is worse than the readability win.
+#[allow(clippy::duration_suboptimal_units)]
 const MAX_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Soft cap on the cache size. Above this, the next miss triggers a sweep
