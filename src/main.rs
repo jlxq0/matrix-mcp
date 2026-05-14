@@ -1,9 +1,9 @@
 //! `matrix-mcp` — Remote MCP server exposing Matrix to claude.ai.
 //!
-//! Phase 1.2: real bearer-token validation. claude.ai's token is introspected
-//! against MAS on every `/mcp` request (cached for ≤60 s). On success, an
-//! `AuthenticatedIdentity` is attached to the request extensions for tools to
-//! pick up in phase 1.3.
+//! Phase 1.3: real MCP framework wired up. `/mcp` is served by
+//! `rmcp::transport::streamable_http_server::StreamableHttpService` behind
+//! the bearer-auth middleware. First tool: `whoami` — returns the MXID +
+//! device id read from the authenticated token. No Matrix calls yet.
 
 mod auth;
 mod config;
@@ -11,12 +11,17 @@ mod mas;
 mod mcp;
 mod oauth_metadata;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -26,7 +31,7 @@ use crate::config::Config;
 #[cfg(test)]
 use crate::config::IntrospectionCredentials;
 use crate::mas::MasIntrospectionClient;
-use crate::mcp::mcp_handler;
+use crate::mcp::MatrixMcpService;
 use crate::oauth_metadata::protected_resource_metadata;
 
 #[tokio::main]
@@ -65,11 +70,27 @@ fn build_app(cfg: Config) -> Result<Router> {
 }
 
 fn build_router(cfg: Config, auth_state: AuthState) -> Router {
-    // /mcp gets the bearer-auth middleware. /healthz and the OAuth metadata
-    // endpoint are intentionally unauthenticated — they're the entry points
-    // for liveness probes and OAuth discovery respectively.
+    // rmcp's StreamableHttpService is a tower::Service that handles all the
+    // MCP transport details (initialize, tools/list, tools/call, SSE
+    // upgrades). We nest it under /mcp behind our bearer-auth middleware.
+    //
+    // `allowed_hosts` is the rmcp DNS-rebinding defence: only Host headers
+    // matching one of these strings are accepted. We seed it with localhost
+    // (for dev), 127.0.0.1 / ::1, plus the host of our resource_url
+    // (production public hostname).
+    let resource_host = parse_host(&cfg.resource_url);
+    let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    if let Some(h) = resource_host {
+        allowed_hosts.push(h);
+    }
+    let mcp_service = StreamableHttpService::new(
+        || Ok(MatrixMcpService::new()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+    );
+
     let mcp_routes = Router::new()
-        .route("/mcp", get(mcp_handler).post(mcp_handler))
+        .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn_with_state(auth_state, bearer_auth));
 
     Router::new()
@@ -85,6 +106,21 @@ fn build_router(cfg: Config, auth_state: AuthState) -> Router {
 
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
+}
+
+/// Best-effort `https://host:port/path` → `host[:port]` extraction.
+/// Returns `None` if the URL doesn't have an authority.
+fn parse_host(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_owned())
+    }
 }
 
 fn init_tracing() {
@@ -130,7 +166,7 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, header};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tower::ServiceExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -162,6 +198,104 @@ mod tests {
         build_router(cfg.clone(), AuthState { config: cfg, mas })
     }
 
+    /// Active-token introspection body that audiences correctly for our test
+    /// resource URL.
+    fn active_introspection_body() -> Value {
+        json!({
+            "active": true,
+            "sub": "@alice:example.com",
+            "aud": "https://res.example",
+            "device_id": "matrix-mcp-test-device",
+            "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
+            "exp": 9_999_999_999i64,
+        })
+    }
+
+    /// A minimal initialize-and-call-whoami JSON-RPC body. The MCP protocol
+    /// requires `initialize` before tool calls in stateful mode, but in
+    /// stateless mode each request stands alone. The default
+    /// `StreamableHttpServerConfig` is stateful, so we issue `initialize` once
+    /// to capture the session id, then issue `tools/call`.
+    async fn initialize_then_call_whoami(
+        app: &Router,
+    ) -> Result<(StatusCode, Value), anyhow::Error> {
+        let init_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "matrix-mcp-test", "version": "0.0.1"}
+            }
+        });
+        let init_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from(serde_json::to_vec(&init_body)?))
+                    .unwrap(),
+            )
+            .await?;
+
+        let session_id = init_response
+            .headers()
+            .get("mcp-session-id")
+            .map(|h| h.to_str().unwrap_or("").to_owned());
+
+        let call_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}}
+        });
+        let mut request_builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, "Bearer test-token");
+        if let Some(sid) = &session_id {
+            request_builder = request_builder.header("mcp-session-id", sid);
+        }
+        let call_response = app
+            .clone()
+            .oneshot(
+                request_builder
+                    .body(Body::from(serde_json::to_vec(&call_body)?))
+                    .unwrap(),
+            )
+            .await?;
+
+        let status = call_response.status();
+        let body = axum::body::to_bytes(call_response.into_body(), 64 * 1024).await?;
+        let parsed = parse_response_body(&body)?;
+        Ok((status, parsed))
+    }
+
+    /// Streamable HTTP returns either JSON or SSE; this helper extracts the
+    /// JSON-RPC body either way.
+    fn parse_response_body(body: &[u8]) -> Result<Value, anyhow::Error> {
+        let text = std::str::from_utf8(body)?;
+        // SSE frames look like "event: message\ndata: { ... }\n\n". Strip
+        // to the first JSON object we can find.
+        if let Some(idx) = text.find('{') {
+            let candidate = &text[idx..];
+            // Trim any trailing SSE event terminator
+            let end = candidate.rfind('}').map_or(candidate.len(), |i| i + 1);
+            Ok(serde_json::from_str(&candidate[..end])?)
+        } else {
+            anyhow::bail!("no JSON payload in response: {text}")
+        }
+    }
+
     #[tokio::test]
     async fn healthz_remains_public() {
         let app = router(test_config("https://auth.example", "https://res.example"));
@@ -181,7 +315,13 @@ mod tests {
     async fn mcp_without_token_returns_401() {
         let app = router(test_config("https://auth.example", "https://res.example"));
         let response = app
-            .oneshot(Request::builder().uri("/mcp").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -195,47 +335,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_with_valid_token_passes_middleware() {
+    async fn whoami_returns_authenticated_mxid() {
         let mas_mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/introspect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "active": true,
-                "sub": "@alice:example.com",
-                "aud": "https://res.example",
-                "exp": 9_999_999_999i64,
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
             .mount(&mas_mock)
             .await;
 
         let app = router(test_config(&mas_mock.uri(), "https://res.example"));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mcp")
-                    .header(header::AUTHORIZATION, "Bearer abc123")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        // Phase 1.2: middleware succeeds, handler returns 401 still (it's the
-        // placeholder mcp_handler from phase 1.1 that always returns 401).
-        // We assert middleware behaviour by NOT seeing
-        // WWW-Authenticate (handler doesn't set one in this path because
-        // there's no upstream auth challenge yet — that gets fixed in 1.3
-        // when the real MCP framework lands).
-        //
-        // Actually mcp_handler from 1.1 DOES still 401, so we can't easily
-        // distinguish here. The 1.3 work will replace the placeholder. For
-        // now, assert that the middleware did NOT short-circuit:
-        // - status is 401 (placeholder)
-        // - the body is "unauthorized\n" if from middleware, also "unauthorized\n" if from handler
-        // The way to tell them apart is the WWW-Authenticate header: the
-        // middleware sets it on rejection; the handler also sets it. So
-        // both paths look identical. We'll add a stronger assertion in 1.3
-        // once the handler returns 200 on success.
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let (status, body) = initialize_then_call_whoami(&app).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        // body shape: {"jsonrpc":"2.0","id":2,"result":{"content":[...],"structuredContent":{...}}}
+        // The whoami tool returned a structured result containing mxid + device_id.
+        let result = &body["result"];
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["mxid"], "@alice:example.com", "body: {body}");
+        assert_eq!(
+            structured["device_id"], "matrix-mcp-test-device",
+            "body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -251,45 +371,17 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .method("POST")
                     .uri("/mcp")
+                    .header("Content-Type", "application/json")
                     .header(header::AUTHORIZATION, "Bearer abc123")
-                    .body(Body::empty())
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn mcp_with_wrong_audience_returns_500() {
-        // Audience mismatch is an upstream-not-trusting-us signal; surface
-        // it as a 500 so it shows up in alerts, rather than 401 which a
-        // user could misread as "my token is wrong" when actually the
-        // client registration is wrong.
-        let mas_mock = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/introspect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "active": true,
-                "sub": "@alice:example.com",
-                "aud": "https://wrong.example",
-                "exp": 9_999_999_999i64,
-            })))
-            .mount(&mas_mock)
-            .await;
-
-        let app = router(test_config(&mas_mock.uri(), "https://res.example"));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mcp")
-                    .header(header::AUTHORIZATION, "Bearer abc")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
