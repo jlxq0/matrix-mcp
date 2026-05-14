@@ -14,6 +14,20 @@ use crate::config::Config;
 use crate::mas::{AuthenticatedIdentity, MasIntrospectionClient};
 use crate::oauth_metadata::www_authenticate_header;
 
+/// Newtype around the raw OAuth access token, stashed on request extensions
+/// by `bearer_auth`. Per MSC3861, the OAuth access token issued by MAS is
+/// the same token Synapse accepts on `/_matrix/*` endpoints, so tools that
+/// talk to the homeserver re-use this verbatim. Wrapping it in a dedicated
+/// type avoids accidental collisions with other `String` extensions.
+#[derive(Clone)]
+pub struct AccessToken(pub String);
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AccessToken").field(&"<redacted>").finish()
+    }
+}
+
 /// State the auth middleware needs. Cheap to clone: the inner `Arc`s in
 /// `MasIntrospectionClient` make the actual data shared.
 #[derive(Clone)]
@@ -35,12 +49,17 @@ pub async fn bearer_auth(
     match state.mas.introspect(&token).await {
         Ok(Some(identity)) => {
             debug!(mxid = %identity.mxid, "authenticated request");
-            // Stash the identity on request extensions. rmcp's streamable-http
-            // tower layer wraps the request's `Parts` (including our extension)
-            // into the tool handler's `RequestContext.extensions`, where the
-            // tool reads it via `mcp::identity_from_ctx`. A `task_local!` is
+            // Stash both the identity and the raw OAuth token on the request
+            // extensions. rmcp's streamable-http tower layer wraps the
+            // request's `Parts` (including our extensions) into the tool
+            // handler's `RequestContext.extensions`. A `task_local!` is
             // tempting but doesn't survive the rmcp session worker spawn.
+            //
+            // The token round-trips because per MSC3861 it doubles as the
+            // Matrix access token: homeserver tools re-present it on every
+            // `/_matrix/*` call.
             request.extensions_mut().insert(identity);
+            request.extensions_mut().insert(AccessToken(token));
             next.run(request).await
         }
         Ok(None) => {

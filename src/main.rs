@@ -8,6 +8,7 @@
 mod auth;
 mod config;
 mod mas;
+mod matrix;
 mod mcp;
 mod oauth_metadata;
 
@@ -31,6 +32,7 @@ use crate::config::Config;
 #[cfg(test)]
 use crate::config::IntrospectionCredentials;
 use crate::mas::MasIntrospectionClient;
+use crate::matrix::HomeserverClient;
 use crate::mcp::MatrixMcpService;
 use crate::oauth_metadata::protected_resource_metadata;
 
@@ -83,8 +85,18 @@ fn build_router(cfg: Config, auth_state: AuthState) -> Router {
     if let Some(h) = resource_host {
         allowed_hosts.push(h);
     }
+    // One HomeserverClient is shared across every MCP session. `reqwest`'s
+    // internal connection pool is on `Client` itself, so reusing it across
+    // sessions is the whole point. `expect` is justified here: a bad
+    // homeserver URL is a startup misconfiguration, not a runtime input,
+    // and Config::new already validated it.
+    #[allow(clippy::expect_used)]
+    let homeserver = Arc::new(
+        HomeserverClient::new(cfg.homeserver_url.clone())
+            .expect("validated homeserver URL builds an http client"),
+    );
     let mcp_service = StreamableHttpService::new(
-        || Ok(MatrixMcpService::new()),
+        move || Ok(MatrixMcpService::new(homeserver.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
@@ -174,9 +186,14 @@ mod tests {
     use super::*;
 
     fn test_config(auth_server: &str, resource: &str) -> Config {
+        test_config_with_homeserver(auth_server, resource, "https://matrix.example.test")
+    }
+
+    fn test_config_with_homeserver(auth_server: &str, resource: &str, homeserver: &str) -> Config {
         Config::new(
             resource,
             auth_server,
+            homeserver,
             SocketAddr::from(([0, 0, 0, 0], 3000)),
         )
         .unwrap()
@@ -296,6 +313,72 @@ mod tests {
         }
     }
 
+    /// Generic helper: do `initialize` then `tools/call <name>` with the
+    /// supplied arguments. Returns the parsed JSON-RPC response body.
+    async fn initialize_then_call_tool(
+        app: &Router,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<(StatusCode, Value), anyhow::Error> {
+        let init_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "matrix-mcp-test", "version": "0.0.1"}
+            }
+        });
+        let init_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from(serde_json::to_vec(&init_body)?))
+                    .unwrap(),
+            )
+            .await?;
+        let session_id = init_response
+            .headers()
+            .get("mcp-session-id")
+            .map(|h| h.to_str().unwrap_or("").to_owned());
+
+        let call_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments}
+        });
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, "Bearer test-token");
+        if let Some(sid) = &session_id {
+            builder = builder.header("mcp-session-id", sid);
+        }
+        let call_response = app
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(serde_json::to_vec(&call_body)?))
+                    .unwrap(),
+            )
+            .await?;
+        let status = call_response.status();
+        let body = axum::body::to_bytes(call_response.into_body(), 64 * 1024).await?;
+        let parsed = parse_response_body(&body)?;
+        Ok((status, parsed))
+    }
+
     #[tokio::test]
     async fn healthz_remains_public() {
         let app = router(test_config("https://auth.example", "https://res.example"));
@@ -356,6 +439,117 @@ mod tests {
             structured["device_id"], "matrix-mcp-test-device",
             "body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn list_joined_rooms_tool_round_trips() {
+        // Wiremock plays both the MAS introspection endpoint and the
+        // homeserver's /joined_rooms endpoint — same mock server, different
+        // paths. The router gets `mas_mock.uri()` as both the auth server
+        // and the homeserver. Realistic for unit testing; production
+        // separates them.
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/v3/joined_rooms"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "joined_rooms": ["!a:kampong.social", "!b:kampong.social"]
+            })))
+            .mount(&mock)
+            .await;
+
+        let cfg = test_config_with_homeserver(&mock.uri(), "https://res.example", &mock.uri());
+        let app = router(cfg);
+        let (status, body) = initialize_then_call_tool(&app, "list_joined_rooms", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let structured = &body["result"]["structuredContent"];
+        let room_ids = structured["room_ids"]
+            .as_array()
+            .expect("expected room_ids array in structured result");
+        assert_eq!(room_ids.len(), 2);
+        assert_eq!(room_ids[0], "!a:kampong.social");
+    }
+
+    #[tokio::test]
+    async fn read_recent_messages_tool_round_trips() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                "^/_matrix/client/v3/rooms/%21abc%3Akampong.social/messages$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "chunk": [{
+                    "type": "m.room.message",
+                    "event_id": "$e1",
+                    "sender": "@julian:kampong.social",
+                    "origin_server_ts": 1_700_000_000_000u64,
+                    "content": {"msgtype": "m.text", "body": "hi from test"}
+                }],
+                "start": "t1",
+                "end": "t2"
+            })))
+            .mount(&mock)
+            .await;
+
+        let cfg = test_config_with_homeserver(&mock.uri(), "https://res.example", &mock.uri());
+        let app = router(cfg);
+        let (status, body) = initialize_then_call_tool(
+            &app,
+            "read_recent_messages",
+            json!({"room_id": "!abc:kampong.social", "limit": 5}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let events = body["result"]["structuredContent"]["events"]
+            .as_array()
+            .expect("expected events array in structured result");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["sender"], "@julian:kampong.social");
+        assert_eq!(events[0]["content"]["body"], "hi from test");
+    }
+
+    #[tokio::test]
+    async fn send_text_message_tool_returns_event_id() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mock)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wiremock::matchers::path_regex(
+                "^/_matrix/client/v3/rooms/%21abc%3Akampong.social/send/m\\.room\\.message/.+$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$sent.evt"
+            })))
+            .mount(&mock)
+            .await;
+
+        let cfg = test_config_with_homeserver(&mock.uri(), "https://res.example", &mock.uri());
+        let app = router(cfg);
+        let (status, body) = initialize_then_call_tool(
+            &app,
+            "send_text_message",
+            json!({"room_id": "!abc:kampong.social", "body": "Hello, world!"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let event_id = &body["result"]["structuredContent"]["event_id"];
+        assert_eq!(event_id, "$sent.evt", "body: {body}");
     }
 
     #[tokio::test]
