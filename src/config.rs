@@ -33,6 +33,13 @@ const ENV_INTROSPECTION_CLIENT_SECRET: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_S
 /// every call — there is exactly one homeserver per matrix-mcp instance
 /// (currently `kampong.social` → `https://matrix.kampong.social`).
 const ENV_HOMESERVER_URL: &str = "MATRIX_MCP_HOMESERVER_URL";
+/// Matrix server name — the right-hand side of every MXID on this
+/// homeserver (e.g. `kampong.social`). Distinct from the homeserver
+/// URL: the URL is `https://matrix.kampong.social`, the server name
+/// is `kampong.social`. We need this to reconstruct the MXID from
+/// MAS's introspection `username` field (MAS uses ULID-shaped `sub`s,
+/// not MXIDs).
+const ENV_SERVER_NAME: &str = "MATRIX_MCP_SERVER_NAME";
 /// Root directory for per-user encrypted Matrix stores. In production
 /// this points at a PVC mount (Longhorn); each user gets a subdirectory
 /// named `sha256(mxid)[..32]`.
@@ -57,6 +64,10 @@ pub struct Config {
     /// Matrix homeserver base URL (no trailing slash). Phase-2+ tools talk
     /// to `{homeserver_url}/_matrix/client/...`.
     pub homeserver_url: String,
+    /// Matrix server name (right-hand side of MXIDs), e.g.
+    /// `kampong.social`. Used to reconstruct `@user:server` from MAS's
+    /// `username` introspection claim.
+    pub server_name: String,
     /// Optional introspection credentials. `None` is the Phase 0/1.1 mode
     /// where we haven't wired auth yet; from Phase 1.2 onward `from_env`
     /// requires them.
@@ -113,11 +124,22 @@ impl Config {
         resource_url: impl Into<String>,
         authorization_server: impl Into<String>,
         homeserver_url: impl Into<String>,
+        server_name: impl Into<String>,
         bind_addr: SocketAddr,
     ) -> Result<Self> {
         let resource_url = strip_trailing_slash(resource_url.into());
         let authorization_server = strip_trailing_slash(authorization_server.into());
         let homeserver_url = strip_trailing_slash(homeserver_url.into());
+        let server_name = server_name.into();
+        if server_name.is_empty() {
+            anyhow::bail!("{ENV_SERVER_NAME} must not be empty");
+        }
+        if server_name.starts_with("http") {
+            anyhow::bail!(
+                "{ENV_SERVER_NAME} must be a Matrix server name (e.g. `kampong.social`), \
+                 not a URL — got `{server_name}`"
+            );
+        }
         validate_url(&resource_url, ENV_RESOURCE_URL)?;
         validate_url(&authorization_server, ENV_AUTH_SERVER_URL)?;
         validate_url(&homeserver_url, ENV_HOMESERVER_URL)?;
@@ -125,6 +147,7 @@ impl Config {
             resource_url,
             authorization_server,
             bind_addr,
+            server_name,
             homeserver_url,
             introspection: None,
             store: None,
@@ -154,6 +177,7 @@ impl Config {
         let resource_url = require_env(ENV_RESOURCE_URL)?;
         let authorization_server = require_env(ENV_AUTH_SERVER_URL)?;
         let homeserver_url = require_env(ENV_HOMESERVER_URL)?;
+        let server_name = require_env(ENV_SERVER_NAME)?;
         let bind_addr_str = std::env::var(ENV_BIND_ADDR).unwrap_or_else(|_| "0.0.0.0:3000".into());
         let bind_addr = SocketAddr::from_str(&bind_addr_str)
             .with_context(|| format!("invalid {ENV_BIND_ADDR}: {bind_addr_str}"))?;
@@ -172,6 +196,7 @@ impl Config {
             resource_url,
             authorization_server,
             homeserver_url,
+            server_name,
             bind_addr,
         )?
         .with_introspection(IntrospectionCredentials {
@@ -218,6 +243,7 @@ mod tests {
             "https://example.test",
             "https://auth.example.test",
             "https://matrix.example.test",
+            "example.test",
             bind(),
         )
         .unwrap();
@@ -232,6 +258,7 @@ mod tests {
             "https://example.test/",
             "https://auth.example.test///",
             "https://matrix.example.test/",
+            "example.test",
             bind(),
         )
         .unwrap();
@@ -246,6 +273,7 @@ mod tests {
             "not-a-url",
             "https://auth.example.test",
             "https://matrix.example.test",
+            "example.test",
             bind(),
         )
         .unwrap_err();
@@ -259,6 +287,7 @@ mod tests {
             "https://example.test",
             "ftp://auth.example.test",
             "https://matrix.example.test",
+            "example.test",
             bind(),
         )
         .unwrap_err();
@@ -272,6 +301,7 @@ mod tests {
             "https://example.test",
             "https://auth.example.test",
             "not-a-url",
+            "example.test",
             bind(),
         )
         .unwrap_err();
@@ -287,6 +317,7 @@ mod tests {
             "http://localhost:3000",
             "http://localhost:8080",
             "http://localhost:8008",
+            "localhost",
             bind(),
         )
         .unwrap();

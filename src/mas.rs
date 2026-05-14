@@ -43,7 +43,17 @@ const CACHE_SOFT_CAP: usize = 256;
 #[derive(Debug, Deserialize, Clone)]
 pub struct IntrospectionResponse {
     pub active: bool,
+    /// MAS-internal user identifier (a ULID, e.g. `01JM…`). NOT a Matrix
+    /// MXID — MAS uses opaque subject ids because mxids are mutable
+    /// (localpart renames). We keep it for logging only; the actual
+    /// mxid is reconstructed from `username` + the configured server
+    /// name.
     pub sub: Option<String>,
+    /// Matrix localpart (e.g. `julian`). Combined with the configured
+    /// server name to form the full mxid (`@{username}:{server_name}`).
+    /// MAS adds this as an MSC3861-specific extension on top of
+    /// RFC 7662.
+    pub username: Option<String>,
     #[allow(dead_code)] // Surfaced in audit logs in phase 1.4; field-validated below.
     pub scope: Option<String>,
     pub aud: Option<AudField>,
@@ -101,6 +111,10 @@ pub struct MasIntrospectionClient {
     expected_audience: String,
     client_id: String,
     client_secret: String,
+    /// Matrix server name used to construct the MXID from MAS's
+    /// `username` claim. E.g. `kampong.social` (not the homeserver
+    /// URL — that's a separate concept).
+    server_name: String,
     cache: Arc<RwLock<HashMap<[u8; 32], CacheEntry>>>,
 }
 
@@ -119,6 +133,7 @@ impl MasIntrospectionClient {
         expected_audience: String,
         client_id: String,
         client_secret: String,
+        server_name: String,
     ) -> Result<Self> {
         let introspection_url = format!("{authorization_server}/oauth2/introspect");
         let http = reqwest::Client::builder()
@@ -132,6 +147,7 @@ impl MasIntrospectionClient {
             expected_audience,
             client_id,
             client_secret,
+            server_name,
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -195,10 +211,18 @@ impl MasIntrospectionClient {
         } else {
             warn!("MAS returned active token without aud claim; accepting");
         }
-        let Some(mxid) = body.sub.clone() else {
-            warn!("MAS returned active token without sub");
+        // MAS's `sub` is the user ULID (mas-internal), not the MXID.
+        // The mxid comes from the MSC3861 `username` extension —
+        // reconstruct as `@{username}:{server_name}`.
+        let Some(username) = body.username.clone() else {
+            warn!(
+                sub = ?body.sub,
+                "MAS introspection response missing `username` field; \
+                 cannot construct MXID — rejecting"
+            );
             return Ok(None);
         };
+        let mxid = format!("@{username}:{}", self.server_name);
 
         let identity = AuthenticatedIdentity {
             mxid,
@@ -289,6 +313,7 @@ mod tests {
             "https://matrix-mcp.example.test".to_owned(),
             "matrix-mcp-client".to_owned(),
             "secret-shh".to_owned(),
+            "kampong.social".to_owned(),
         )
         .unwrap()
     }
@@ -296,7 +321,10 @@ mod tests {
     fn active_response_body(aud: &str) -> serde_json::Value {
         json!({
             "active": true,
-            "sub": "@julian:kampong.social",
+            // MAS-internal ULID; we no longer interpret this as the
+            // MXID — see the username field below.
+            "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+            "username": "julian",
             "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
             "aud": aud,
             "device_id": "matrix-mcp-test-device",
@@ -331,7 +359,7 @@ mod tests {
 
         let client = client_against(&mock.uri());
         let identity = client.introspect("abc123").await.unwrap().unwrap();
-        assert_eq!(identity.mxid, "@julian:kampong.social");
+        assert_eq!(identity.mxid, "@julian:kampong.social"); // server_name="kampong.social" in client_against
         assert_eq!(
             identity.device_id.as_deref(),
             Some("matrix-mcp-test-device")
@@ -373,7 +401,8 @@ mod tests {
             .and(path("/oauth2/introspect"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "active": true,
-                "sub": "@julian:kampong.social",
+                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+                "username": "julian",
                 "aud": ["https://other.example.test", "https://matrix-mcp.example.test"],
                 "exp": i64::try_from(
                     std::time::SystemTime::now()
@@ -388,7 +417,7 @@ mod tests {
             .await;
         let client = client_against(&mock.uri());
         let identity = client.introspect("abc").await.unwrap().unwrap();
-        assert_eq!(identity.mxid, "@julian:kampong.social");
+        assert_eq!(identity.mxid, "@julian:kampong.social"); // server_name="kampong.social" in client_against
     }
 
     #[tokio::test]
@@ -426,7 +455,8 @@ mod tests {
         .unwrap();
         let body = json!({
             "active": true,
-            "sub": "@julian:kampong.social",
+            "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+            "username": "julian",
             "aud": "https://matrix-mcp.example.test",
             "exp": now + 1,
         });
@@ -485,6 +515,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_token_without_username_claim() {
+        // Regression: in production we briefly used `sub` as the MXID,
+        // which gave back the MAS-internal ULID (e.g. `01JMVS29KA...`)
+        // instead of `@julian:kampong.social`. The verify_status tool
+        // crashed downstream because the ULID has no `@user:server`
+        // shape. Now: no `username` → reject, full stop.
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+                // no username — pre-MSC3861 / older MAS / misconfigured client
+                "aud": "https://matrix-mcp.example.test",
+                "exp": 9_999_999_999i64,
+            })))
+            .mount(&mock)
+            .await;
+        let client = client_against(&mock.uri());
+        let result = client.introspect("abc").await.unwrap();
+        assert!(result.is_none(), "token without username must be rejected");
+    }
+
+    #[tokio::test]
+    async fn mxid_is_built_from_username_plus_server_name() {
+        // Confirms the username + server_name concatenation, including
+        // for a multi-byte unicode localpart (Matrix allows these).
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+                "username": "marco.rossi",
+                "aud": "https://matrix-mcp.example.test",
+                "exp": 9_999_999_999i64,
+            })))
+            .mount(&mock)
+            .await;
+        let client = client_against(&mock.uri());
+        let identity = client.introspect("t").await.unwrap().unwrap();
+        assert_eq!(identity.mxid, "@marco.rossi:kampong.social");
+    }
+
+    #[tokio::test]
     async fn missing_aud_is_accepted_with_warn() {
         // Real-world: claude.ai's MCP connector doesn't send RFC 8707
         // `resource=` to MAS, so MAS issues tokens with no `aud` claim.
@@ -496,7 +571,8 @@ mod tests {
             .and(path("/oauth2/introspect"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "active": true,
-                "sub": "@julian:kampong.social",
+                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+                "username": "julian",
                 "exp": 9_999_999_999i64,
             })))
             .mount(&mock)
@@ -507,7 +583,7 @@ mod tests {
             .await
             .unwrap()
             .expect("missing-aud token should now authenticate");
-        assert_eq!(identity.mxid, "@julian:kampong.social");
+        assert_eq!(identity.mxid, "@julian:kampong.social"); // server_name="kampong.social" in client_against
     }
 
     #[test]
