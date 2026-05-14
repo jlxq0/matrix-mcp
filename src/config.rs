@@ -27,6 +27,11 @@ const ENV_INTROSPECTION_CLIENT_ID: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_ID";
 /// OAuth client secret paired with the id above. Loaded from 1Password via
 /// `ExternalSecret` in production.
 const ENV_INTROSPECTION_CLIENT_SECRET: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_SECRET";
+/// Public URL of the Matrix homeserver this MCP server talks to. We
+/// configure this directly rather than running .well-known discovery on
+/// every call — there is exactly one homeserver per matrix-mcp instance
+/// (currently `kampong.social` → `https://matrix.kampong.social`).
+const ENV_HOMESERVER_URL: &str = "MATRIX_MCP_HOMESERVER_URL";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -38,6 +43,9 @@ pub struct Config {
     pub authorization_server: String,
     /// TCP bind address.
     pub bind_addr: SocketAddr,
+    /// Matrix homeserver base URL (no trailing slash). Phase-2+ tools talk
+    /// to `{homeserver_url}/_matrix/client/...`.
+    pub homeserver_url: String,
     /// Optional introspection credentials. `None` is the Phase 0/1.1 mode
     /// where we haven't wired auth yet; from Phase 1.2 onward `from_env`
     /// requires them.
@@ -66,16 +74,20 @@ impl Config {
     pub fn new(
         resource_url: impl Into<String>,
         authorization_server: impl Into<String>,
+        homeserver_url: impl Into<String>,
         bind_addr: SocketAddr,
     ) -> Result<Self> {
         let resource_url = strip_trailing_slash(resource_url.into());
         let authorization_server = strip_trailing_slash(authorization_server.into());
+        let homeserver_url = strip_trailing_slash(homeserver_url.into());
         validate_url(&resource_url, ENV_RESOURCE_URL)?;
         validate_url(&authorization_server, ENV_AUTH_SERVER_URL)?;
+        validate_url(&homeserver_url, ENV_HOMESERVER_URL)?;
         Ok(Self {
             resource_url,
             authorization_server,
             bind_addr,
+            homeserver_url,
             introspection: None,
         })
     }
@@ -93,19 +105,22 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let resource_url = require_env(ENV_RESOURCE_URL)?;
         let authorization_server = require_env(ENV_AUTH_SERVER_URL)?;
+        let homeserver_url = require_env(ENV_HOMESERVER_URL)?;
         let bind_addr_str = std::env::var(ENV_BIND_ADDR).unwrap_or_else(|_| "0.0.0.0:3000".into());
         let bind_addr = SocketAddr::from_str(&bind_addr_str)
             .with_context(|| format!("invalid {ENV_BIND_ADDR}: {bind_addr_str}"))?;
         let client_id = require_env(ENV_INTROSPECTION_CLIENT_ID)?;
         let client_secret = require_env(ENV_INTROSPECTION_CLIENT_SECRET)?;
-        Ok(
-            Self::new(resource_url, authorization_server, bind_addr)?.with_introspection(
-                IntrospectionCredentials {
-                    client_id,
-                    client_secret,
-                },
-            ),
-        )
+        Ok(Self::new(
+            resource_url,
+            authorization_server,
+            homeserver_url,
+            bind_addr,
+        )?
+        .with_introspection(IntrospectionCredentials {
+            client_id,
+            client_secret,
+        }))
     }
 }
 
@@ -138,9 +153,16 @@ mod tests {
 
     #[test]
     fn pure_constructor_succeeds_on_valid_input() {
-        let cfg = Config::new("https://example.test", "https://auth.example.test", bind()).unwrap();
+        let cfg = Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            "https://matrix.example.test",
+            bind(),
+        )
+        .unwrap();
         assert_eq!(cfg.resource_url, "https://example.test");
         assert_eq!(cfg.authorization_server, "https://auth.example.test");
+        assert_eq!(cfg.homeserver_url, "https://matrix.example.test");
     }
 
     #[test]
@@ -148,24 +170,50 @@ mod tests {
         let cfg = Config::new(
             "https://example.test/",
             "https://auth.example.test///",
+            "https://matrix.example.test/",
             bind(),
         )
         .unwrap();
         assert_eq!(cfg.resource_url, "https://example.test");
         assert_eq!(cfg.authorization_server, "https://auth.example.test");
+        assert_eq!(cfg.homeserver_url, "https://matrix.example.test");
     }
 
     #[test]
     fn rejects_non_url_resource() {
-        let err = Config::new("not-a-url", "https://auth.example.test", bind()).unwrap_err();
+        let err = Config::new(
+            "not-a-url",
+            "https://auth.example.test",
+            "https://matrix.example.test",
+            bind(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("must be an absolute"), "error was: {msg}");
     }
 
     #[test]
     fn rejects_non_url_auth_server() {
-        let err =
-            Config::new("https://example.test", "ftp://auth.example.test", bind()).unwrap_err();
+        let err = Config::new(
+            "https://example.test",
+            "ftp://auth.example.test",
+            "https://matrix.example.test",
+            bind(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("must be an absolute"), "error was: {msg}");
+    }
+
+    #[test]
+    fn rejects_non_url_homeserver() {
+        let err = Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            "not-a-url",
+            bind(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("must be an absolute"), "error was: {msg}");
     }
@@ -174,7 +222,14 @@ mod tests {
     fn http_is_allowed_for_dev() {
         // We allow http:// so that local dev against a non-TLS MAS works.
         // Production requires https in operator policy, enforced elsewhere.
-        let cfg = Config::new("http://localhost:3000", "http://localhost:8080", bind()).unwrap();
+        let cfg = Config::new(
+            "http://localhost:3000",
+            "http://localhost:8080",
+            "http://localhost:8008",
+            bind(),
+        )
+        .unwrap();
         assert_eq!(cfg.resource_url, "http://localhost:3000");
+        assert_eq!(cfg.homeserver_url, "http://localhost:8008");
     }
 }
