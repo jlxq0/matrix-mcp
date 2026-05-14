@@ -231,9 +231,22 @@ impl MasIntrospectionClient {
         };
         let mxid = format!("@{username}:{}", self.server_name);
 
+        // Device id can arrive two ways:
+        // 1. As a dedicated `device_id` field — only on newer MAS
+        //    versions, and only when the introspecting client sends
+        //    `X-MAS-Supports-Device-Id: 1` (we do).
+        // 2. Embedded in the `scope` string as a
+        //    `urn:matrix:(org.matrix.msc2967.)?client:device:<id>`
+        //    token — the format every MAS version uses.
+        // Prefer (1), fall back to (2).
+        let device_id = body
+            .device_id
+            .clone()
+            .or_else(|| body.scope.as_deref().and_then(device_from_scope));
+
         let identity = AuthenticatedIdentity {
             mxid,
-            device_id: body.device_id.clone(),
+            device_id,
             raw_scope: body.scope.clone(),
         };
 
@@ -299,6 +312,28 @@ fn hash_token(token: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     hasher.finalize().into()
+}
+
+/// Extract a Matrix device id from the `scope` claim of an introspection
+/// response. Returns `None` if no `device:` token is present.
+///
+/// Both the stable (`urn:matrix:client:device:`) and unstable
+/// (`urn:matrix:org.matrix.msc2967.client:device:`) prefixes are
+/// accepted; MAS commonly emits both. If they disagree, the stable one
+/// wins because that's what the spec settled on.
+fn device_from_scope(scope: &str) -> Option<String> {
+    const STABLE: &str = "urn:matrix:client:device:";
+    const UNSTABLE: &str = "urn:matrix:org.matrix.msc2967.client:device:";
+    let mut stable: Option<String> = None;
+    let mut unstable: Option<String> = None;
+    for token in scope.split_whitespace() {
+        if let Some(id) = token.strip_prefix(STABLE) {
+            stable = Some(id.to_owned());
+        } else if let Some(id) = token.strip_prefix(UNSTABLE) {
+            unstable = Some(id.to_owned());
+        }
+    }
+    stable.or(unstable)
 }
 
 #[cfg(test)]
@@ -591,6 +626,58 @@ mod tests {
             .unwrap()
             .expect("missing-aud token should now authenticate");
         assert_eq!(identity.mxid, "@alice:example.com"); // server_name="example.com" in client_against
+    }
+
+    #[tokio::test]
+    async fn device_id_parsed_from_scope_when_no_explicit_field() {
+        // Real prod case (2026-05-14): MAS embeds the device id in the
+        // scope string and leaves `device_id` unset, even with the
+        // X-MAS-Supports-Device-Id opt-in header. matrix-mcp must
+        // recover the id from the scope.
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+                "username": "alice",
+                "aud": "https://matrix-mcp.example.test",
+                "scope":
+                    "openid \
+                     urn:matrix:client:api:* \
+                     urn:matrix:client:device:MATRIXMCPCONNECTOR \
+                     urn:matrix:org.matrix.msc2967.client:api:* \
+                     urn:matrix:org.matrix.msc2967.client:device:MATRIXMCPCONNECTOR",
+                "exp": 9_999_999_999i64,
+            })))
+            .mount(&mock)
+            .await;
+        let client = client_against(&mock.uri());
+        let identity = client.introspect("t").await.unwrap().unwrap();
+        assert_eq!(identity.device_id.as_deref(), Some("MATRIXMCPCONNECTOR"));
+    }
+
+    #[test]
+    fn device_from_scope_unit() {
+        assert_eq!(
+            device_from_scope(
+                "openid urn:matrix:client:device:ABCDEFGHIJ \
+                 urn:matrix:org.matrix.msc2967.client:device:ABCDEFGHIJ"
+            )
+            .as_deref(),
+            Some("ABCDEFGHIJ"),
+            "stable prefix preferred when both present"
+        );
+        assert_eq!(
+            device_from_scope("urn:matrix:org.matrix.msc2967.client:device:OLDONLY").as_deref(),
+            Some("OLDONLY"),
+            "falls back to unstable prefix when only that is present"
+        );
+        assert!(
+            device_from_scope("openid urn:matrix:client:api:*").is_none(),
+            "no device scope → None"
+        );
+        assert!(device_from_scope("").is_none());
     }
 
     #[test]
