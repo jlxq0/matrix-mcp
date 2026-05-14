@@ -29,6 +29,12 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    # CDLA-Permissive-2.0 is used by webpki-roots (Mozilla CA bundle, pulled
+    # in transitively by reqwest+rustls). It's a permissive license written
+    # for "shared data" rather than code, mostly equivalent to MIT in effect
+    # for our use case: attribution required, no patent grant claims, no
+    # share-alike. https://cdla.dev/permissive-2-0/
+    "CDLA-Permissive-2.0",
     "AGPL-3.0",
     "AGPL-3.0-or-later",
 ]
