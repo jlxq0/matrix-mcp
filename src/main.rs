@@ -106,7 +106,7 @@ fn build_router(cfg: Config, auth_state: AuthState, clients: MatrixClientCache) 
         .layer(middleware::from_fn_with_state(auth_state, bearer_auth));
 
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/health", get(health))
         .route(
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
@@ -116,7 +116,7 @@ fn build_router(cfg: Config, auth_state: AuthState, clients: MatrixClientCache) 
         .with_state(cfg)
 }
 
-async fn healthz() -> impl IntoResponse {
+async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
@@ -322,12 +322,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn healthz_remains_public() {
+    async fn health_remains_public() {
         let app = router(test_config("https://auth.example", "https://res.example"));
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/healthz")
+                    .uri("/health")
                     .body(Body::empty())
                     .unwrap(),
             )
