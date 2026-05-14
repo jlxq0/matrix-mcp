@@ -166,10 +166,17 @@ impl MasIntrospectionClient {
             return Ok(Some(hit));
         }
 
+        // `X-MAS-Supports-Device-Id: 1` opts into MAS's separate `device_id`
+        // field in the introspection response. Without it, MAS embeds the
+        // device id back into the `scope` string as a
+        // `urn:matrix:org.matrix.msc2967.client:device:<id>` token and
+        // leaves `device_id` unset. The header is a documented MAS
+        // extension and is what Synapse-as-introspector sends too.
         let response = self
             .http
             .post(&self.introspection_url)
             .basic_auth(&self.client_id, Some(&self.client_secret))
+            .header("X-MAS-Supports-Device-Id", "1")
             .form(&[("token", token)])
             .send()
             .await?;
