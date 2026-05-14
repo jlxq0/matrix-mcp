@@ -21,6 +21,12 @@ const ENV_RESOURCE_URL: &str = "MATRIX_MCP_RESOURCE_URL";
 const ENV_AUTH_SERVER_URL: &str = "MATRIX_MCP_AUTHORIZATION_SERVER";
 /// Bind address, defaults to `0.0.0.0:3000` for container deployment.
 const ENV_BIND_ADDR: &str = "MATRIX_MCP_BIND_ADDR";
+/// OAuth client id we authenticate with against MAS's introspection endpoint.
+/// Issued out-of-band (pre-registered or via `DCR`).
+const ENV_INTROSPECTION_CLIENT_ID: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_ID";
+/// OAuth client secret paired with the id above. Loaded from 1Password via
+/// `ExternalSecret` in production.
+const ENV_INTROSPECTION_CLIENT_SECRET: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_SECRET";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -32,6 +38,26 @@ pub struct Config {
     pub authorization_server: String,
     /// TCP bind address.
     pub bind_addr: SocketAddr,
+    /// Optional introspection credentials. `None` is the Phase 0/1.1 mode
+    /// where we haven't wired auth yet; from Phase 1.2 onward `from_env`
+    /// requires them.
+    pub introspection: Option<IntrospectionCredentials>,
+}
+
+#[derive(Clone)]
+pub struct IntrospectionCredentials {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+// Manual Debug to avoid leaking the client secret into logs.
+impl std::fmt::Debug for IntrospectionCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntrospectionCredentials")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Config {
@@ -50,7 +76,15 @@ impl Config {
             resource_url,
             authorization_server,
             bind_addr,
+            introspection: None,
         })
+    }
+
+    /// Builder-style: attach introspection credentials.
+    #[must_use]
+    pub fn with_introspection(mut self, creds: IntrospectionCredentials) -> Self {
+        self.introspection = Some(creds);
+        self
     }
 
     /// Load from environment variables. Missing required vars are fatal at
@@ -62,7 +96,16 @@ impl Config {
         let bind_addr_str = std::env::var(ENV_BIND_ADDR).unwrap_or_else(|_| "0.0.0.0:3000".into());
         let bind_addr = SocketAddr::from_str(&bind_addr_str)
             .with_context(|| format!("invalid {ENV_BIND_ADDR}: {bind_addr_str}"))?;
-        Self::new(resource_url, authorization_server, bind_addr)
+        let client_id = require_env(ENV_INTROSPECTION_CLIENT_ID)?;
+        let client_secret = require_env(ENV_INTROSPECTION_CLIENT_SECRET)?;
+        Ok(
+            Self::new(resource_url, authorization_server, bind_addr)?.with_introspection(
+                IntrospectionCredentials {
+                    client_id,
+                    client_secret,
+                },
+            ),
+        )
     }
 }
 
