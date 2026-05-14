@@ -49,6 +49,13 @@ rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
 matrix-sdk = { version = "0.17", default-features = false, features = [
     "e2e-encryption",
     "sqlite",
+    # `bundled-sqlite` statically links sqlite into the binary. The
+    # distroless `cc-debian12:nonroot` runtime doesn't ship
+    # libsqlite3.so.0, and adding it would mean switching to a fatter
+    # base image. Bundling adds ~700 KiB and one extra compile of
+    # sqlite (already cached after the first build), which is a fine
+    # trade for keeping the runtime image at ~25 MiB.
+    "bundled-sqlite",
     "markdown",
 ] }
 # `ruma-events` types we pull off the SDK's room timelines (e.g.
