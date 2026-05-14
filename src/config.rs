@@ -8,6 +8,7 @@
 //! way to keep both invariants.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
@@ -32,6 +33,16 @@ const ENV_INTROSPECTION_CLIENT_SECRET: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_S
 /// every call — there is exactly one homeserver per matrix-mcp instance
 /// (currently `example.com` → `https://matrix.example.com`).
 const ENV_HOMESERVER_URL: &str = "MATRIX_MCP_HOMESERVER_URL";
+/// Root directory for per-user encrypted Matrix stores. In production
+/// this points at a PVC mount (Longhorn); each user gets a subdirectory
+/// named `sha256(mxid)[..32]`.
+const ENV_STORE_DIR: &str = "MATRIX_MCP_STORE_DIR";
+/// Pepper used to derive per-user store-cipher keys via
+/// `HKDF-SHA256(salt=mxid, ikm=pepper)`. Stored in 1Password, loaded as
+/// a Kubernetes Secret. Compromise of this single value compromises
+/// every user's on-disk crypto store, so it's the Option-A passphrase
+/// model's whole trust anchor — handled with care.
+const ENV_STORE_PEPPER: &str = "MATRIX_MCP_STORE_PEPPER";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -50,6 +61,33 @@ pub struct Config {
     /// where we haven't wired auth yet; from Phase 1.2 onward `from_env`
     /// requires them.
     pub introspection: Option<IntrospectionCredentials>,
+    /// Phase-3 E2EE persistent state config. `None` means this binary
+    /// was built or configured without E2EE (e.g. unit tests, Phase 1/2
+    /// smoke deploys); in production `from_env` requires it.
+    pub store: Option<StoreConfig>,
+}
+
+#[derive(Clone)]
+pub struct StoreConfig {
+    /// Root directory for per-user encrypted `SQLite` stores. Each mxid
+    /// gets a subdirectory `sha256(mxid)[..32]/`.
+    pub root: PathBuf,
+    /// 32+ byte secret used as HKDF input keying material. The per-user
+    /// store-cipher passphrase is `HKDF-SHA256(salt=mxid, ikm=pepper,
+    /// info="matrix-mcp-store-cipher v1")`. Held in a `String` rather
+    /// than a zeroize-on-drop wrapper because matrix-sdk's
+    /// `SqliteStoreConfig::passphrase` already takes `&str`; we'd lose
+    /// the wrapper at that boundary anyway.
+    pub pepper: String,
+}
+
+impl std::fmt::Debug for StoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreConfig")
+            .field("root", &self.root)
+            .field("pepper", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -89,6 +127,7 @@ impl Config {
             bind_addr,
             homeserver_url,
             introspection: None,
+            store: None,
         })
     }
 
@@ -96,6 +135,15 @@ impl Config {
     #[must_use]
     pub fn with_introspection(mut self, creds: IntrospectionCredentials) -> Self {
         self.introspection = Some(creds);
+        self
+    }
+
+    /// Builder-style: attach E2EE store config. Required in production
+    /// `from_env` boot; optional in tests where no real matrix-sdk
+    /// client is built.
+    #[must_use]
+    pub fn with_store(mut self, store: StoreConfig) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -111,6 +159,15 @@ impl Config {
             .with_context(|| format!("invalid {ENV_BIND_ADDR}: {bind_addr_str}"))?;
         let client_id = require_env(ENV_INTROSPECTION_CLIENT_ID)?;
         let client_secret = require_env(ENV_INTROSPECTION_CLIENT_SECRET)?;
+        let store_root = PathBuf::from(require_env(ENV_STORE_DIR)?);
+        let pepper = require_env(ENV_STORE_PEPPER)?;
+        if pepper.len() < 32 {
+            anyhow::bail!(
+                "{ENV_STORE_PEPPER} must be at least 32 bytes of high-entropy material \
+                 (got {len} bytes). Generate one with `openssl rand -hex 32`.",
+                len = pepper.len()
+            );
+        }
         Ok(Self::new(
             resource_url,
             authorization_server,
@@ -120,6 +177,10 @@ impl Config {
         .with_introspection(IntrospectionCredentials {
             client_id,
             client_secret,
+        })
+        .with_store(StoreConfig {
+            root: store_root,
+            pepper,
         }))
     }
 }
