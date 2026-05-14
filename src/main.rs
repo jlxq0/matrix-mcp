@@ -1,25 +1,36 @@
 //! `matrix-mcp` — Remote MCP server exposing Matrix to claude.ai.
 //!
-//! Phase 0 = skeleton. This binary boots an Axum HTTP server on `:3000` with
-//! a single `/healthz` endpoint. No Matrix, no OAuth, no MCP yet. Subsequent
-//! phases stack on top: see `docs/plan.md`.
+//! Phase 1.1: OAuth 2.0 Protected Resource Metadata + a `/mcp` endpoint
+//! that returns 401 with a `WWW-Authenticate` header, so claude.ai's
+//! discovery flow finds our MAS. No token validation yet; that lands in
+//! phase 1.2. See `docs/plan.md` for the phase roadmap.
 
-use std::net::SocketAddr;
+mod config;
+mod mcp;
+mod oauth_metadata;
 
 use anyhow::Result;
-use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
+use axum::Router;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use crate::config::Config;
+use crate::mcp::mcp_handler;
+use crate::oauth_metadata::protected_resource_metadata;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    let addr: SocketAddr = "0.0.0.0:3000".parse()?;
-    let app = build_router();
+    let cfg = Config::from_env()?;
+    let bind_addr = cfg.bind_addr;
+    let app = build_router(cfg);
 
-    let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "matrix-mcp listening");
+    let listener = TcpListener::bind(bind_addr).await?;
+    info!(%bind_addr, "matrix-mcp listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -28,10 +39,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_router() -> Router {
+fn build_router(cfg: Config) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata),
+        )
+        .route("/mcp", get(mcp_handler).post(mcp_handler))
         .layer(TraceLayer::new_for_http())
+        .with_state(cfg)
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -44,7 +61,6 @@ fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("matrix_mcp=info,tower_http=info,axum=info,info"));
 
-    // JSON in production (sent to Loki via Alloy); pretty in dev.
     let json_layer = std::env::var("MATRIX_MCP_LOG_FORMAT").as_deref() == Ok("json");
     let registry = tracing_subscriber::registry().with(env_filter);
     if json_layer {
@@ -72,22 +88,32 @@ async fn shutdown_signal() {
     }
 }
 
-// Tests use .unwrap() liberally on infallible Request::builder() chains
-// and on response body extraction; allowing here keeps the production
-// `unwrap_used = deny` lint strict while not turning the tests into
-// error-handling theatre.
+// Tests use .unwrap()/.expect() liberally on infallible Request::builder()
+// chains and on response-body extraction; allowing here keeps the production
+// lints strict while not turning the tests into error-handling theatre.
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::net::SocketAddr;
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
     use super::*;
 
+    fn test_config() -> Config {
+        Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            SocketAddr::from(([0, 0, 0, 0], 3000)),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn healthz_returns_ok() {
-        let app = build_router();
+        let app = build_router(test_config());
         let response = app
             .oneshot(
                 Request::builder()
@@ -107,11 +133,36 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_404() {
-        let app = build_router();
+        let app = build_router(test_config());
         let response = app
             .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_metadata_route_wired() {
+        let app = build_router(test_config());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/oauth-protected-resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mcp_route_returns_401() {
+        let app = build_router(test_config());
+        let response = app
+            .oneshot(Request::builder().uri("/mcp").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
