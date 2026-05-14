@@ -9,7 +9,7 @@ repository = "https://github.com/jlxq0/matrix-mcp"
 publish = false
 
 [dependencies]
-tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
 axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
@@ -19,6 +19,20 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "2.0"
+# HTTP client for talking to MAS. rustls-only — no system OpenSSL needed,
+# slimmer distroless image. JSON feature for ergonomic response parsing.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# SHA-256 of access tokens for cache keys — never store the raw token as a
+# hashmap key, even in-process, to reduce blast radius of a memory dump.
+sha2 = "0.10"
+# Constant-time string comparison for auth headers, kept simple by leaning on
+# subtle's idioms. Used by the bearer extractor.
+subtle = "2.6"
+
+[dev-dependencies]
+# Mock HTTP server for MAS introspection tests. Used by `cargo test` only;
+# never linked into the release binary.
+wiremock = "0.6"
 
 [profile.release]
 # Optimise for binary size + decent perf; we're an HTTP server, not a CPU
