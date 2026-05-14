@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local dev artifacts
+*.log
+/var/
+/data/
+/tmp-*
+.env
+.env.local
+.envrc
+
+# Test outputs
+*.profraw
+coverage/
+
+# Container build leftovers
+.docker-cache/
