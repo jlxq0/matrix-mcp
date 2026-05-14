@@ -69,6 +69,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         cfg.resource_url.clone(),
         creds.client_id,
         creds.client_secret,
+        cfg.server_name.clone(),
     )?;
     let auth_state = AuthState {
         config: cfg.clone(),
@@ -194,6 +195,7 @@ mod tests {
             resource,
             auth_server,
             homeserver,
+            "example.test",
             SocketAddr::from(([0, 0, 0, 0], 3000)),
         )
         .unwrap()
@@ -210,6 +212,7 @@ mod tests {
             cfg.resource_url.clone(),
             creds.client_id,
             creds.client_secret,
+            cfg.server_name.clone(),
         )
         .unwrap();
         // Tests use a throwaway temp dir + pepper for the E2EE store;
@@ -228,7 +231,8 @@ mod tests {
     fn active_introspection_body() -> Value {
         json!({
             "active": true,
-            "sub": "@alice:example.com",
+            "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+            "username": "alice",
             "aud": "https://res.example",
             "device_id": "matrix-mcp-test-device",
             "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
@@ -376,7 +380,8 @@ mod tests {
         // The whoami tool returned a structured result containing mxid + device_id.
         let result = &body["result"];
         let structured = &result["structuredContent"];
-        assert_eq!(structured["mxid"], "@alice:example.com", "body: {body}");
+        // server_name in test_config_with_homeserver is "example.test"
+        assert_eq!(structured["mxid"], "@alice:example.test", "body: {body}");
         assert_eq!(
             structured["device_id"], "matrix-mcp-test-device",
             "body: {body}"

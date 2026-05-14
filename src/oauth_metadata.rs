@@ -72,6 +72,7 @@ mod tests {
             "https://example.test",
             "https://auth.example.test",
             "https://matrix.example.test",
+            "example.test",
             SocketAddr::from(([0, 0, 0, 0], 3000)),
         )
         .unwrap()
