@@ -26,6 +26,7 @@ use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::auth::AccessToken;
 use crate::mas::AuthenticatedIdentity;
@@ -279,10 +280,29 @@ impl MatrixMcpService {
             .ok_or_else(|| ErrorData::internal_error("no user_id on client", None))?
             .to_owned();
         let encryption = client.encryption();
-        let user_identity = encryption
-            .get_user_identity(&me)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("get_user_identity: {e}"), None))?;
+
+        // OAuth-restored matrix-sdk sessions don't always populate
+        // the local OlmMachine with the user's cross-signing identity
+        // — `get_user_identity` then returns None even though the
+        // master key exists on the homeserver. `request_user_identity`
+        // forces a /keys/query against the homeserver and refreshes
+        // the cached identity. Fall back to `get_user_identity` in
+        // case `request_user_identity` returned None due to a
+        // transient query error; that path will still pick up an
+        // already-cached identity if one is present.
+        let user_identity = match encryption.request_user_identity(&me).await {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => encryption
+                .get_user_identity(&me)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("get_user_identity: {e}"), None))?,
+            Err(e) => {
+                warn!(error = %e, "request_user_identity failed; trying cached");
+                encryption.get_user_identity(&me).await.map_err(|e| {
+                    ErrorData::internal_error(format!("get_user_identity: {e}"), None)
+                })?
+            }
+        };
         let user_has_master_key = user_identity.is_some();
 
         let device_id = client.device_id().map(ToOwned::to_owned);
