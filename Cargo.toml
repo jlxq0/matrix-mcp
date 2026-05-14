@@ -9,8 +9,12 @@ repository = "https://github.com/jlxq0/matrix-mcp"
 publish = false
 
 [dependencies]
-tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "rt", "signal", "net", "time"] }
 axum = "0.7"
+# `http` is re-exported by axum/rmcp but we use `http::request::Parts` directly
+# in the tool layer (rmcp injects it into `RequestContext.extensions`), so a
+# top-level dep keeps the import path stable.
+http = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
@@ -28,6 +32,10 @@ sha2 = "0.10"
 # Constant-time string comparison for auth headers, kept simple by leaning on
 # subtle's idioms. Used by the bearer extractor.
 subtle = "2.6"
+# Official MCP Rust SDK. `transport-streamable-http-server` umbrella enables
+# session manager + http transport + worker bits we need to mount the service
+# via `axum::Router::nest_service("/mcp", ...)`.
+rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
 
 [dev-dependencies]
 # Mock HTTP server for MAS introspection tests. Used by `cargo test` only;
