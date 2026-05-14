@@ -59,9 +59,7 @@ impl ProtectedResourceMetadata {
                 // token to it. Without this, the token is "deviceless"
                 // and matrix-sdk can't use it for E2EE (no vodozemac
                 // identity to attach, no cross-signing target).
-                format!(
-                    "urn:matrix:org.matrix.msc2967.client:device:{MATRIX_MCP_DEVICE_ID}"
-                ),
+                format!("urn:matrix:org.matrix.msc2967.client:device:{MATRIX_MCP_DEVICE_ID}"),
             ],
         }
     }
@@ -149,8 +147,9 @@ mod tests {
         // Device-binding scope: without this in the metadata, claude.ai
         // requests a deviceless token and E2EE breaks. Regression lock.
         assert!(
-            scopes.iter().any(|s| s
-                == "urn:matrix:org.matrix.msc2967.client:device:MATRIXMCPCONNECTOR"),
+            scopes
+                .iter()
+                .any(|s| s == "urn:matrix:org.matrix.msc2967.client:device:MATRIXMCPCONNECTOR"),
             "device scope missing in {json}"
         );
     }
