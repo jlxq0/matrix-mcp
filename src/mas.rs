@@ -393,6 +393,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_respects_short_token_exp() {
+        // Token-exp shorter than MAX_CACHE_TTL → cache TTL clamps to exp.
+        // We give the token exp=now+1s, then wait 2s, then introspect again
+        // and expect MAS to be hit a SECOND time (cache miss).
+        let mock = server().await;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let body = json!({
+            "active": true,
+            "sub": "@julian:kampong.social",
+            "aud": "https://matrix-mcp.example.test",
+            "exp": now + 1,
+        });
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            // Two introspects with a 2s gap should hit MAS BOTH times because
+            // the cache entry expired in between.
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        let client = client_against(&mock.uri());
+        let first = client.introspect("short-lived").await.unwrap();
+        assert!(first.is_some(), "first call must succeed");
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        let second = client.introspect("short-lived").await.unwrap();
+        assert!(second.is_some(), "second call must re-fetch");
+        // The .expect(2) assertion on the mock verifies MAS was hit twice;
+        // if the cache wrongly kept the entry past `exp`, MAS would only see 1.
+    }
+
+    #[tokio::test]
+    async fn negative_result_not_cached() {
+        // An inactive token must NOT be cached as a denial: a freshly-valid
+        // token presented immediately after should not inherit the deny.
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            // Two introspects with the same token → MAS must be hit both times
+            // when the first returned inactive.
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"active": false})))
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        let client = client_against(&mock.uri());
+        let first = client.introspect("xxx").await.unwrap();
+        let second = client.introspect("xxx").await.unwrap();
+        assert!(first.is_none());
+        assert!(second.is_none());
+        // Mock's .expect(2) enforces no-caching of negative results.
+    }
+
+    #[tokio::test]
     async fn upstream_5xx_surfaces_as_error() {
         let mock = server().await;
         Mock::given(method("POST"))
