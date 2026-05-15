@@ -441,8 +441,24 @@ pub async fn recover(
                 outcome::OK,
                 SetupExtras::default(),
             );
-            // Force a /keys/query so the user-identity cache reflects
-            // the new self-signature on the next verify_status call.
+            // After importing the private cross-signing keys via
+            // `recover()`, matrix-sdk does NOT automatically upload a
+            // signature for this device — we have to ask. When the
+            // matrix-mcp device's ed25519 key has changed (e.g. after
+            // a store reset post audit #1), the previously-uploaded
+            // signature no longer covers the new key, so verify_status
+            // keeps reporting cross_signed=false until we push a fresh
+            // one. `bootstrap_cross_signing(None)` is the SDK's
+            // idempotent helper: if private keys are missing it
+            // creates+uploads them; if private keys are present it
+            // signs this device and uploads the signature.
+            if let Err(e) = client.encryption().bootstrap_cross_signing(None).await {
+                warn!(error = %e, "bootstrap_cross_signing after recover failed; \
+                                   device may remain unsigned until the next sync");
+            }
+            // Then force a /keys/query so the local user-identity cache
+            // reflects the freshly-uploaded signature for the next
+            // verify_status call.
             if let Some(me) = client.user_id() {
                 let _ = client.encryption().request_user_identity(me).await;
             }
