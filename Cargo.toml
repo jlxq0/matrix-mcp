@@ -17,6 +17,11 @@ axum-extra = { version = "0.9", features = ["cookie"] }
 # PKCE: the `code_challenge` is `base64url(sha256(code_verifier))`. We use
 # the `URL_SAFE_NO_PAD` engine. SHA-256 already comes via `sha2`.
 base64 = "0.22"
+# Prometheus metrics: counters, histograms, gauges + a text encoder.
+# Exposed on a separate cluster-internal listener (port 9090) so the
+# public Service doesn't surface our metrics endpoint. Alloy scrapes
+# via the pod IP using prometheus.io/scrape annotations.
+prometheus = "0.13"
 # `http` is re-exported by axum/rmcp but we use `http::request::Parts` directly
 # in the tool layer (rmcp injects it into `RequestContext.extensions`), so a
 # top-level dep keeps the import path stable.

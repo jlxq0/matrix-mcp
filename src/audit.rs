@@ -92,7 +92,8 @@ pub const fn error_class(err: &ErrorData) -> &'static str {
 }
 
 /// Emit a `tool_call` audit event. Call at the END of every tool
-/// body, on both success and error paths.
+/// body, on both success and error paths. Also bumps the matching
+/// Prometheus counter + histogram (low-cardinality labels only).
 pub fn tool_call(
     tool: &'static str,
     mxid: &str,
@@ -102,6 +103,7 @@ pub fn tool_call(
     event_count: Option<usize>,
     err_class: Option<&'static str>,
 ) {
+    let elapsed = started.elapsed();
     info!(
         target: "matrix_mcp::audit",
         event = "tool_call",
@@ -109,26 +111,31 @@ pub fn tool_call(
         mxid,
         room_id,
         outcome,
-        latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         event_count,
         error_class = err_class,
     );
+    crate::metrics::record_tool_call(tool, outcome, elapsed);
 }
 
 /// Emit an `introspect` audit event from the auth middleware path.
+/// Also bumps the matching Prometheus counter + histogram.
 pub fn introspect(token_hash: &str, outcome: &'static str, started: Instant, mxid: Option<&str>) {
+    let elapsed = started.elapsed();
     info!(
         target: "matrix_mcp::audit",
         event = "introspect",
         token_hash,
         mxid,
         outcome,
-        latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
     );
+    crate::metrics::record_introspect(outcome, elapsed);
 }
 
 /// Emit a `/setup`-flow event. Used for login init, callback,
-/// recovery import outcome, and error cases.
+/// recovery import outcome, and error cases. Also bumps the
+/// matching Prometheus counter.
 pub fn setup_event(
     step: &'static str,
     mxid: Option<&str>,
@@ -145,6 +152,7 @@ pub fn setup_event(
         rooms_failed = extras.rooms_failed,
         error_class = extras.error_class,
     );
+    crate::metrics::record_setup_event(step, outcome);
 }
 
 #[derive(Default, Clone, Copy)]
