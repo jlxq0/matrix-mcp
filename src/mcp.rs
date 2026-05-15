@@ -24,6 +24,7 @@ use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::OwnedMxcUri;
 use matrix_sdk::ruma::OwnedRoomId;
 use matrix_sdk::ruma::api::Direction;
+use matrix_sdk::ruma::api::client::search::search_events;
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::room::message::{
     ImageMessageEventContent, MessageType, RoomMessageEventContent,
@@ -287,6 +288,50 @@ pub struct RoomMembersResult {
     /// Total number of joined members in the room. If
     /// `members.len() < total`, the response was truncated by the
     /// `limit` parameter.
+    pub total: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchMessagesParams {
+    /// Full-text query string forwarded to the homeserver's search index.
+    pub query: String,
+    /// Optional Matrix room id to scope the search, e.g. `!abc:example.com`.
+    /// When absent the homeserver searches across all joined rooms.
+    pub room_id: Option<String>,
+    /// Maximum number of results to return. Defaults to 20, capped at 100.
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+}
+
+const fn default_search_limit() -> u32 {
+    20
+}
+
+/// A single result returned by `search_messages`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SearchHit {
+    pub event_id: Option<String>,
+    pub room_id: String,
+    pub sender: Option<String>,
+    pub origin_server_ts: Option<u64>,
+    /// Homeserver-computed relevance score; higher means closer match.
+    /// `null` when the homeserver did not return a rank.
+    pub rank: Option<f64>,
+    /// Plaintext message body extracted from the event content.
+    ///
+    /// `null` for E2EE rooms: the homeserver-side `/_matrix/client/v3/search`
+    /// runs against the stored ciphertext blob and cannot decrypt it, so no
+    /// readable body is available here. Use `read_recent_messages` in the
+    /// specific room (where the SDK decrypts locally) to retrieve the actual
+    /// content.
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SearchMessagesResult {
+    pub results: Vec<SearchHit>,
+    /// Homeserver-reported approximate total number of matching events.
+    /// Falls back to `results.len()` when the homeserver omits the count.
     pub total: u64,
 }
 
@@ -1473,6 +1518,125 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &result,
+        );
+        result
+    }
+
+    /// Search Matrix room history using the homeserver's full-text search
+    /// index (`POST /_matrix/client/v3/search`). Results are ordered by
+    /// relevance (homeserver-computed rank). For E2EE rooms the homeserver
+    /// only has access to the encrypted ciphertext, so `body` is always
+    /// `null` in those hits — use `read_recent_messages` to read decrypted
+    /// content from a specific E2EE room.
+    #[tool(description = "Search Matrix room history by full-text query. \
+                       Scope to one room with room_id or search across all joined rooms. \
+                       body is null for E2EE rooms (homeserver cannot decrypt ciphertext).")]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn search_messages(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SearchMessagesParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let (result, hit_count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+
+            // Cap the requested limit at 100 to avoid oversized responses.
+            let limit = params.limit.min(100) as usize;
+
+            // Build the Criteria for the room_events search category.
+            let mut criteria = search_events::v3::Criteria::new(params.query.clone());
+            criteria.order_by = Some(search_events::v3::OrderBy::Rank);
+
+            // When a room_id is provided, scope the search to that room only.
+            if let Some(ref rid_str) = params.room_id {
+                let room_id: OwnedRoomId = rid_str.parse().map_err(|e| {
+                    ErrorData::invalid_params(format!("invalid room_id {rid_str}: {e}"), None)
+                })?;
+                criteria.filter.rooms = Some(vec![room_id]);
+            }
+
+            let mut categories = search_events::v3::Categories::new();
+            categories.room_events = Some(criteria);
+            let response = client
+                .send(search_events::v3::Request::new(categories))
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("search: {e}"), None))?;
+
+            let room_events = response.search_categories.room_events;
+            // Homeserver-reported approximate total (may be absent).
+            let server_total: Option<u64> = room_events.count.map(u64::from);
+
+            // Map each SearchResult to a SearchHit. Audit envelope only —
+            // query terms and hit bodies are never written to the audit log.
+            let hits: Vec<SearchHit> = room_events
+                .results
+                .into_iter()
+                .take(limit)
+                .map(|sr| {
+                    // Deserialize the raw event JSON to extract top-level fields.
+                    let raw_val: serde_json::Value = sr
+                        .result
+                        .as_ref()
+                        .and_then(|raw| raw.deserialize_as().ok())
+                        .unwrap_or(serde_json::Value::Null);
+
+                    let event_id = raw_val
+                        .get("event_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+                    let room_id_str = raw_val
+                        .get("room_id")
+                        .and_then(|v| v.as_str())
+                        .map_or_else(String::new, ToOwned::to_owned);
+                    let sender = raw_val
+                        .get("sender")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+                    let origin_server_ts = raw_val
+                        .get("origin_server_ts")
+                        .and_then(serde_json::Value::as_u64);
+
+                    // content.body is present only for plaintext m.room.message
+                    // events. For E2EE rooms the homeserver stores the ciphertext
+                    // blob — `content.body` is absent or contains encrypted bytes.
+                    let body = raw_val
+                        .get("content")
+                        .and_then(|c| c.get("body"))
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+
+                    SearchHit {
+                        event_id,
+                        room_id: room_id_str,
+                        sender,
+                        origin_server_ts,
+                        rank: sr.rank,
+                        body,
+                    }
+                })
+                .collect();
+
+            let total = server_total.unwrap_or(hits.len() as u64);
+            let count = hits.len();
+            let res = structured_result(&SearchMessagesResult {
+                results: hits,
+                total,
+            });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        emit_tool_audit(
+            "search_messages",
+            &mxid_for_audit,
+            room_id_for_audit.as_deref(),
+            started,
+            Some(hit_count),
             &result,
         );
         result
