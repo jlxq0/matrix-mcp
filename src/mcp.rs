@@ -73,9 +73,8 @@ impl MatrixMcpService {
         let token = token_from_ctx(ctx).ok_or_else(missing_token_err)?;
         let id = identity_from_ctx(ctx).ok_or_else(missing_identity_err)?;
         let bearer_hash = audit::token_hash(&token.0);
-        let sub = id.sub.as_deref();
         self.rate_limiter
-            .check(&bearer_hash, sub, category)
+            .check(&bearer_hash, Some(id.mas_subject.as_str()), category)
             .map_err(|_| {
                 ErrorData::new(
                     rmcp::model::ErrorCode(audit::RATE_LIMITED_CODE),
