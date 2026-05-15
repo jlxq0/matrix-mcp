@@ -130,17 +130,22 @@ underneath is correct.
 
 ## Phase 10 — battle-proofing
 
-- [ ] 10.1 Integration tests with testcontainers: spin up Synapse +
+- [x] 10.1 Integration tests with testcontainers: spin up Synapse +
        MAS + Postgres in containers. Run the full claude.ai-shaped
        flow (DCR, authorize, token, introspect, mcp/init,
        tools/call) end-to-end. Behind `--features=integration`.
+       Scaffolding + smoke test shipped; full stack wiring in INTEGRATION.md. <!-- completed 2026-05-15 -->
 - [ ] 10.2 Load test: 100 tool calls/min sustained for 10 min,
        record p50/p95/p99, observed memory + CPU footprint.
+       Skeleton in scripts/qa/load.sh.
 - [ ] 10.3 Disaster recovery dry-run: rotate pepper (destructive
        for users; document procedure), rotate
        `MAS_MATRIX_MCP_CLIENT_SECRET`, simulate PVC loss.
-- [ ] 10.4 Performance baseline doc in `docs/operations.md`:
+       Procedures in scripts/qa/dr-pepper-rotation.md + dr-pvc-loss.md.
+- [x] 10.4 Performance baseline doc in `docs/operations.md`:
        memory-per-active-user, sync rate, key-download time.
+       Honest estimates + "pending load test" notes added. <!-- completed 2026-05-15 -->
 - [ ] 10.5 Chaos test: pod kill mid-request, MAS down for 30s,
        Synapse 500s for 30s. Verify graceful degradation, no
        corrupted state.
+       Skeleton in scripts/qa/chaos-pod-kill.sh.

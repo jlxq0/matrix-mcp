@@ -8,6 +8,13 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/jlxq0/matrix-mcp"
 publish = false
 
+[features]
+# Enable full integration tests that spin up Postgres + MAS + Synapse via
+# testcontainers. Requires Docker to be running on the test machine.
+# Usage: cargo test --features=integration --test integration
+# Never enabled in CI's standard `cargo test` job.
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+
 [dependencies]
 tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "rt", "signal", "net", "time"] }
 axum = "0.7"
@@ -97,6 +104,14 @@ hex = "0.4"
 # a transitive dep (reqwest + matrix-sdk pull it in), so this just makes
 # the dependency explicit and keeps the import path stable.
 mime = "0.3"
+# Integration-test container orchestration (Phase 10.1). Optional so that
+# `cargo test` (no flags) never pulls in Docker-dependent code. Only compiled
+# when --features=integration is passed. `blocking` is required because the
+# testcontainers `Client` runs synchronously inside the test harness.
+# NOTE: must live here (not [dev-dependencies]) because Cargo does not allow
+# `optional = true` on dev-dependencies.
+testcontainers = { version = "0.23", features = ["blocking"], optional = true }
+testcontainers-modules = { version = "0.11", features = ["postgres"], optional = true }
 
 [dev-dependencies]
 # Mock HTTP server for MAS introspection tests. Used by `cargo test` only;
