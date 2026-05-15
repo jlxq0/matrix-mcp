@@ -54,6 +54,15 @@ const ENV_STORE_DIR: &str = "MATRIX_MCP_STORE_DIR";
 /// every user's on-disk crypto store, so it's the Option-A passphrase
 /// model's whole trust anchor — handled with care.
 const ENV_STORE_PEPPER: &str = "MATRIX_MCP_STORE_PEPPER";
+/// Per-identity read quota (per minute). Reads = `whoami`,
+/// `list_joined_rooms`, `read_recent_messages`, `verify_status`.
+const ENV_RATE_LIMIT_READS: &str = "MATRIX_MCP_RATE_LIMIT_READS_PER_MIN";
+/// Per-identity write quota (per minute). Writes = `send_text_message`
+/// + future side-effectful tools.
+const ENV_RATE_LIMIT_WRITES: &str = "MATRIX_MCP_RATE_LIMIT_WRITES_PER_MIN";
+
+const DEFAULT_RATE_LIMIT_READS: u32 = 60;
+const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -83,6 +92,10 @@ pub struct Config {
     /// was built or configured without E2EE (e.g. unit tests, Phase 1/2
     /// smoke deploys); in production `from_env` requires it.
     pub store: Option<StoreConfig>,
+    /// Per-minute read quota (Phase 6.1). 0 is rejected at parse time.
+    pub rate_limit_reads_per_min: u32,
+    /// Per-minute write quota (Phase 6.1). 0 is rejected at parse time.
+    pub rate_limit_writes_per_min: u32,
 }
 
 #[derive(Clone)]
@@ -159,6 +172,8 @@ impl Config {
             homeserver_url,
             introspection: None,
             store: None,
+            rate_limit_reads_per_min: DEFAULT_RATE_LIMIT_READS,
+            rate_limit_writes_per_min: DEFAULT_RATE_LIMIT_WRITES,
         })
     }
 
@@ -212,6 +227,10 @@ impl Config {
             bind_addr,
         )?;
         cfg.metrics_bind_addr = metrics_bind_addr;
+        cfg.rate_limit_reads_per_min =
+            parse_rate_limit(ENV_RATE_LIMIT_READS, DEFAULT_RATE_LIMIT_READS)?;
+        cfg.rate_limit_writes_per_min =
+            parse_rate_limit(ENV_RATE_LIMIT_WRITES, DEFAULT_RATE_LIMIT_WRITES)?;
         Ok(cfg
             .with_introspection(IntrospectionCredentials {
                 client_id,
@@ -233,6 +252,19 @@ fn validate_url(url: &str, key: &str) -> Result<()> {
         anyhow::bail!("{key} must be an absolute http(s) URL, got: {url}");
     }
     Ok(())
+}
+
+fn parse_rate_limit(key: &str, default: u32) -> Result<u32> {
+    let Ok(raw) = std::env::var(key) else {
+        return Ok(default);
+    };
+    let n: u32 = raw
+        .parse()
+        .with_context(|| format!("{key} must be a positive integer, got `{raw}`"))?;
+    if n == 0 {
+        anyhow::bail!("{key} must be > 0 (use a large value like 100000 to effectively disable)");
+    }
+    Ok(n)
 }
 
 fn strip_trailing_slash(mut url: String) -> String {

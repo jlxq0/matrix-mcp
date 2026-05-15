@@ -19,6 +19,7 @@ mod matrix_client;
 mod mcp;
 mod metrics;
 mod oauth_metadata;
+mod rate_limit;
 mod setup;
 
 use std::sync::Arc;
@@ -44,6 +45,7 @@ use crate::mas::MasIntrospectionClient;
 use crate::matrix_client::MatrixClientCache;
 use crate::mcp::MatrixMcpService;
 use crate::oauth_metadata::protected_resource_metadata;
+use crate::rate_limit::Limiter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -100,7 +102,13 @@ fn build_app(cfg: Config) -> Result<Router> {
     )?;
     let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
     let setup_state = setup::SetupState::new(cfg.clone(), mas, clients.clone());
-    Ok(build_router(cfg, auth_state, clients, setup_state))
+    let limiter = Arc::new(
+        Limiter::new(cfg.rate_limit_reads_per_min, cfg.rate_limit_writes_per_min).context(
+            "rate-limit quotas must be > 0; check MATRIX_MCP_RATE_LIMIT_{READS,WRITES}_PER_MIN",
+        )?,
+    );
+    rate_limit::spawn_janitor(Arc::clone(&limiter));
+    Ok(build_router(cfg, auth_state, clients, setup_state, limiter))
 }
 
 fn build_router(
@@ -108,6 +116,7 @@ fn build_router(
     auth_state: AuthState,
     clients: MatrixClientCache,
     setup_state: setup::SetupState,
+    limiter: Arc<Limiter>,
 ) -> Router {
     // rmcp's StreamableHttpService is a tower::Service that handles all the
     // MCP transport details (initialize, tools/list, tools/call, SSE
@@ -123,7 +132,7 @@ fn build_router(
         allowed_hosts.push(h);
     }
     let mcp_service = StreamableHttpService::new(
-        move || Ok(MatrixMcpService::new(clients.clone())),
+        move || Ok(MatrixMcpService::new(clients.clone(), Arc::clone(&limiter))),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
@@ -262,11 +271,15 @@ mod tests {
         };
         let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
         let setup_state = setup::SetupState::new(cfg.clone(), mas.clone(), clients.clone());
+        // Wide-open limiter for tests — we don't exercise rate-limit
+        // behaviour here; dedicated tests live in `rate_limit::tests`.
+        let limiter = Arc::new(crate::rate_limit::Limiter::new(100_000, 100_000).unwrap());
         build_router(
             cfg.clone(),
             AuthState { config: cfg, mas },
             clients,
             setup_state,
+            limiter,
         )
     }
 
