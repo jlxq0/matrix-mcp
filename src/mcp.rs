@@ -15,11 +15,15 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use matrix_sdk::Room;
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
 use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::OwnedRoomId;
 use matrix_sdk::ruma::api::Direction;
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
 use std::time::Instant;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -44,6 +48,10 @@ use crate::rate_limit::{Category, Limiter};
 pub struct MatrixMcpService {
     clients: MatrixClientCache,
     rate_limiter: Arc<Limiter>,
+    /// Maximum attachment size in bytes that `download_attachment` will
+    /// fetch. Checked against the event's declared `info.size` before
+    /// any media I/O occurs.
+    download_max_bytes: u64,
     tool_router: ToolRouter<Self>,
 }
 
@@ -54,10 +62,15 @@ impl std::fmt::Debug for MatrixMcpService {
 }
 
 impl MatrixMcpService {
-    pub fn new(clients: MatrixClientCache, rate_limiter: Arc<Limiter>) -> Self {
+    pub fn new(
+        clients: MatrixClientCache,
+        rate_limiter: Arc<Limiter>,
+        download_max_bytes: u64,
+    ) -> Self {
         Self {
             clients,
             rate_limiter,
+            download_max_bytes,
             tool_router: Self::tool_router(),
         }
     }
@@ -363,6 +376,30 @@ pub struct VerifyStatusResult {
     pub user_has_master_key: bool,
     /// Human-readable hint about what's needed next, if anything.
     pub message: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DownloadAttachmentParams {
+    /// Matrix room id containing the attachment event,
+    /// e.g. `!abc:example.com`.
+    pub room_id: String,
+    /// Event id of the `m.room.message` event whose `msgtype` is one of
+    /// `m.file`, `m.image`, `m.audio`, or `m.video`.
+    pub event_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DownloadAttachmentResult {
+    /// MIME type reported by the event's `info.mimetype` field,
+    /// or `"application/octet-stream"` if the event didn't set one.
+    pub content_type: String,
+    /// Number of bytes in the decoded attachment.
+    pub size_bytes: u64,
+    /// Base64-encoded (standard alphabet, no line breaks) file contents.
+    pub body_base64: String,
+    /// Original filename from the event (`filename` field, falling back
+    /// to `body`), or `null` if the event type doesn't carry one.
+    pub filename: Option<String>,
 }
 
 // NOTE: an earlier draft (v0.0.10) exposed a `recover_with_key` MCP
@@ -1072,6 +1109,180 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &result,
+        );
+        result
+    }
+
+    /// Fetch and return the binary content of an attachment event
+    /// (`m.file`, `m.image`, `m.audio`, or `m.video`) as a base64
+    /// string. The SDK handles decryption transparently for E2EE rooms.
+    /// Attachments whose declared size exceeds the configured cap
+    /// (default 5 MiB; `MATRIX_MCP_DOWNLOAD_MAX_BYTES`) are rejected
+    /// before any media I/O occurs.
+    #[tool(
+        description = "Download an attachment from a Matrix room event and return it as base64."
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn download_attachment(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DownloadAttachmentParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid room_id {}: {e}", params.room_id),
+                    None,
+                )
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+
+            let event_id: OwnedEventId = params.event_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid event_id {}: {e}", params.event_id),
+                    None,
+                )
+            })?;
+
+            // Fetch (and transparently decrypt for E2EE rooms) the event.
+            let tle = room
+                .event(&event_id, None)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("fetch event: {e}"), None))?;
+
+            // Deserialize the (possibly decrypted) event JSON so we can
+            // pattern-match on `content.msgtype`. For E2EE events the SDK
+            // has already decrypted the payload, so `.raw()` always yields
+            // the inner plaintext regardless of room encryption.
+            let raw_value: serde_json::Value = tle
+                .raw()
+                .deserialize_as()
+                .unwrap_or(serde_json::Value::Null);
+
+            let msg_content = raw_value
+                .get("content")
+                .and_then(|c| serde_json::from_value::<RoomMessageEventContent>(c.clone()).ok())
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        "event content is not a room message (not m.room.message)",
+                        None,
+                    )
+                })?;
+
+            // Extract the media source, optional mimetype, declared size,
+            // and filename depending on the msgtype. Only m.file, m.image,
+            // m.audio, and m.video are accepted.
+            let (source, mimetype, declared_size, filename): (
+                MediaSource,
+                Option<String>,
+                Option<u64>,
+                Option<String>,
+            ) = match msg_content.msgtype {
+                MessageType::File(f) => {
+                    let mime = f.info.as_ref().and_then(|i| i.mimetype.clone());
+                    let sz = f.info.as_ref().and_then(|i| i.size).map(u64::from);
+                    let fname = Some(f.filename().to_owned());
+                    (f.source, mime, sz, fname)
+                }
+                MessageType::Image(img) => {
+                    let mime = img.info.as_ref().and_then(|i| i.mimetype.clone());
+                    let sz = img.info.as_ref().and_then(|i| i.size).map(u64::from);
+                    let fname = Some(img.filename().to_owned());
+                    (img.source, mime, sz, fname)
+                }
+                MessageType::Audio(a) => {
+                    let mime = a.info.as_ref().and_then(|i| i.mimetype.clone());
+                    let sz = a.info.as_ref().and_then(|i| i.size).map(u64::from);
+                    let fname = Some(a.filename().to_owned());
+                    (a.source, mime, sz, fname)
+                }
+                MessageType::Video(v) => {
+                    let mime = v.info.as_ref().and_then(|i| i.mimetype.clone());
+                    let sz = v.info.as_ref().and_then(|i| i.size).map(u64::from);
+                    let fname = Some(v.filename().to_owned());
+                    (v.source, mime, sz, fname)
+                }
+                other => {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "event msgtype '{}' is not a downloadable attachment;                              must be m.file, m.image, m.audio, or m.video",
+                            other.msgtype()
+                        ),
+                        None,
+                    ));
+                }
+            };
+
+            // Size-cap check before any network I/O.
+            if let Some(declared) = declared_size
+                && declared > self.download_max_bytes
+            {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "attachment declared size {declared} bytes exceeds \
+                         the cap of {} bytes (MATRIX_MCP_DOWNLOAD_MAX_BYTES)",
+                        self.download_max_bytes
+                    ),
+                    None,
+                ));
+            }
+
+            // Fetch (and for E2EE, decrypt) the media bytes.
+            // `use_cache = false` so we always get a fresh copy;
+            // the SDK media cache is an optimisation for display,
+            // not for this export path.
+            let bytes = client
+                .media()
+                .get_media_content(
+                    &MediaRequestParameters {
+                        source,
+                        format: MediaFormat::File,
+                    },
+                    false,
+                )
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("media download: {e}"), None))?;
+
+            // Post-download size check — protects against missing or
+            // incorrect info.size in the event.
+            let size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if size_bytes > self.download_max_bytes {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "attachment actual size {size_bytes} bytes exceeds the                          configured cap of {} bytes",
+                        self.download_max_bytes
+                    ),
+                    None,
+                ));
+            }
+
+            let body_base64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes);
+            let content_type =
+                mimetype.unwrap_or_else(|| "application/octet-stream".to_owned());
+
+            structured_result(&DownloadAttachmentResult {
+                content_type,
+                size_bytes,
+                body_base64,
+                filename,
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "download_attachment",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(1),
             &result,
         );
         result
