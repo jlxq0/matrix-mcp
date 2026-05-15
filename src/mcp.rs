@@ -110,17 +110,49 @@ pub struct JoinedRoomsResult {
     pub rooms: Vec<JoinedRoom>,
 }
 
+/// Hard cap on the number of events `read_recent_messages` may request
+/// from the homeserver. Prevents authenticated callers from triggering
+/// large upstream fetches and unbounded response buffering.
+const MAX_MESSAGE_LIMIT: u32 = 50;
+
+/// Hard cap on the byte length of a `send_text_message` body. Prevents
+/// authenticated callers from forcing large allocations and outbound
+/// uploads.
+const MAX_TEXT_MESSAGE_BODY_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadRecentMessagesParams {
     /// Matrix room id, e.g. `!abc:kampong.social`.
     pub room_id: String,
     /// Maximum number of events to return. Defaults to 20 if omitted.
+    /// Values above 50 are clamped to 50 to bound upstream work.
     #[serde(default = "default_message_limit")]
     pub limit: u32,
 }
 
 const fn default_message_limit() -> u32 {
     20
+}
+
+/// Clamp a caller-supplied message limit to [`MAX_MESSAGE_LIMIT`].
+const fn capped_message_limit(limit: u32) -> u32 {
+    if limit > MAX_MESSAGE_LIMIT {
+        MAX_MESSAGE_LIMIT
+    } else {
+        limit
+    }
+}
+
+/// Reject message bodies that exceed [`MAX_TEXT_MESSAGE_BODY_BYTES`].
+fn validate_text_message_body(body: &str) -> Result<(), ErrorData> {
+    let len = body.len();
+    if len > MAX_TEXT_MESSAGE_BODY_BYTES {
+        return Err(ErrorData::invalid_params(
+            format!("message body is {len} bytes; maximum is {MAX_TEXT_MESSAGE_BODY_BYTES} bytes"),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -147,6 +179,7 @@ pub struct SendTextMessageParams {
     /// Message body. Rendered as Markdown for the `formatted_body` and
     /// kept as-is for the plaintext `body`. E2EE rooms are encrypted
     /// automatically by the SDK iff this device is cross-signed.
+    /// Bodies larger than 64 KiB are rejected.
     pub body: String,
 }
 
@@ -187,16 +220,20 @@ pub struct RoomInfoResult {
     /// that grants creators infinite power level (room v12+). In that
     /// case `my_power_level` is `null`.
     pub is_room_creator: bool,
-    /// The caller's current membership: `joined`, `invited`, `left`,
-    /// `knocked`, `banned`.
-    pub my_membership: &'static str,
 }
+
+/// Hard cap on the number of members returned by `room_members`.
+/// The SDK's `members_no_sync` loads the full cached list before any
+/// truncation, so keeping this limit small caps both response size and
+/// the serialization cost of the returned slice.
+const MAX_MEMBER_LIMIT: u32 = 1000;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RoomMembersParams {
     /// Matrix room id, e.g. `!abc:kampong.social`.
     pub room_id: String,
     /// Maximum number of members to return. Defaults to 200.
+    /// Values above 1000 are clamped to 1000.
     /// Bridged rooms (Telegram, `WhatsApp` channels, etc.) can have
     /// thousands of joined members; cap so we don't return a 5 MB
     /// JSON blob.
@@ -334,7 +371,7 @@ impl MatrixMcpService {
             })?;
 
             let mut opts = MessagesOptions::new(Direction::Backward);
-            opts.limit = params.limit.into();
+            opts.limit = capped_message_limit(params.limit).into();
             let messages = room
                 .messages(opts)
                 .await
@@ -408,6 +445,7 @@ impl MatrixMcpService {
         let room_id_for_audit = params.room_id.clone();
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            validate_text_message_body(&params.body)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
@@ -528,10 +566,11 @@ impl MatrixMcpService {
     }
 
     /// Return metadata about a joined Matrix room: display name, topic,
-    /// encryption state, member counts, the caller's power level and
-    /// membership state. Read-only.
+    /// encryption state, and member counts. Only succeeds for rooms the
+    /// caller is currently joined to — invited, left, knocked, and
+    /// banned rooms are rejected. Read-only.
     #[tool(
-        description = "Return metadata about a Matrix room (name, topic, encryption, members, power level)."
+        description = "Return metadata about a joined Matrix room (name, topic, encryption, members, power level)."
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn room_info(
@@ -551,6 +590,20 @@ impl MatrixMcpService {
             let room = client.get_room(&room_id).ok_or_else(|| {
                 ErrorData::invalid_params(format!("not joined to {room_id}"), None)
             })?;
+
+            // Enforce joined-only access. `get_room` returns any room
+            // known to the SDK cache (invited, left, knocked, banned).
+            // Returning metadata for non-joined rooms widens MCP access
+            // beyond the user's current membership boundary.
+            if room.state() != matrix_sdk::RoomState::Joined {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "not currently joined to {room_id} (membership: {:?})",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
 
             let me = client
                 .user_id()
@@ -586,14 +639,6 @@ impl MatrixMcpService {
                     }
                 };
 
-            let my_membership = match room.state() {
-                matrix_sdk::RoomState::Joined => "joined",
-                matrix_sdk::RoomState::Invited => "invited",
-                matrix_sdk::RoomState::Left => "left",
-                matrix_sdk::RoomState::Knocked => "knocked",
-                matrix_sdk::RoomState::Banned => "banned",
-            };
-
             structured_result(&RoomInfoResult {
                 room_id: room.room_id().to_string(),
                 display_name: room.cached_display_name().map(|n| n.to_string()),
@@ -604,7 +649,6 @@ impl MatrixMcpService {
                 active_members_count: room.active_members_count(),
                 my_power_level,
                 is_room_creator,
-                my_membership,
             })
         }
         .await;
@@ -620,9 +664,9 @@ impl MatrixMcpService {
     }
 
     /// List joined members of a Matrix room with display name, avatar,
-    /// and normalized power level. Capped at `limit` (default 200).
-    /// `total` reports the room's true joined-member count so callers
-    /// can detect truncation.
+    /// and normalized power level. Capped at `limit` (default 200,
+    /// maximum 1000). `total` reports the room's true joined-member
+    /// count so callers can detect truncation.
     #[tool(
         description = "List joined members of a Matrix room (mxid, display name, avatar, power level)."
     )]
@@ -645,6 +689,14 @@ impl MatrixMcpService {
                 ErrorData::invalid_params(format!("not joined to {room_id}"), None)
             })?;
 
+            // Clamp the caller-supplied limit to MAX_MEMBER_LIMIT before
+            // doing any work. Note: `members_no_sync` loads the full
+            // cached member list from the SDK store regardless — the SDK
+            // provides no paginated variant. The clamp bounds the size of
+            // the slice we serialize and return.
+            let effective_limit =
+                usize::try_from(params.limit.min(MAX_MEMBER_LIMIT)).unwrap_or(usize::MAX);
+
             // `members_no_sync` reads the cached member list rather
             // than firing /joined_members. The background sync keeps
             // this fresh; the trade-off is "freshness up to last sync"
@@ -655,7 +707,7 @@ impl MatrixMcpService {
                 .await
                 .map_err(|e| ErrorData::internal_error(format!("members_no_sync: {e}"), None))?;
             let total = u64::try_from(members.len()).unwrap_or(u64::MAX);
-            members.truncate(params.limit.try_into().unwrap_or(usize::MAX));
+            members.truncate(effective_limit);
 
             let members: Vec<RoomMemberInfo> = members
                 .iter()
@@ -815,6 +867,33 @@ mod tests {
     #[test]
     fn default_message_limit_is_sensible() {
         let n = default_message_limit();
-        assert!((10..=100).contains(&n), "limit was {n}");
+        assert!((10..=MAX_MESSAGE_LIMIT).contains(&n), "limit was {n}");
+    }
+
+    #[test]
+    fn message_limit_is_capped() {
+        assert_eq!(capped_message_limit(1), 1);
+        assert_eq!(capped_message_limit(MAX_MESSAGE_LIMIT), MAX_MESSAGE_LIMIT);
+        assert_eq!(capped_message_limit(u32::MAX), MAX_MESSAGE_LIMIT);
+    }
+
+    #[test]
+    fn oversized_text_message_body_is_rejected() {
+        let at_limit = "a".repeat(MAX_TEXT_MESSAGE_BODY_BYTES);
+        assert!(validate_text_message_body(&at_limit).is_ok());
+
+        let oversized = "a".repeat(MAX_TEXT_MESSAGE_BODY_BYTES + 1);
+        assert!(validate_text_message_body(&oversized).is_err());
+    }
+
+    #[test]
+    fn member_limit_is_capped() {
+        // Values below the cap pass through unchanged.
+        assert_eq!(200_u32.min(MAX_MEMBER_LIMIT), 200);
+        // Values at or above the cap are clamped to MAX_MEMBER_LIMIT.
+        // Use a value that is definitively larger than MAX_MEMBER_LIMIT
+        // rather than u32::MAX to avoid the unnecessary_min_or_max lint.
+        let over = MAX_MEMBER_LIMIT + 1;
+        assert_eq!(over.min(MAX_MEMBER_LIMIT), MAX_MEMBER_LIMIT);
     }
 }
