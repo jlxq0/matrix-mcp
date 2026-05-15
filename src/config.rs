@@ -22,10 +22,22 @@ const ENV_RESOURCE_URL: &str = "MATRIX_MCP_RESOURCE_URL";
 const ENV_AUTH_SERVER_URL: &str = "MATRIX_MCP_AUTHORIZATION_SERVER";
 /// Bind address, defaults to `0.0.0.0:3000` for container deployment.
 const ENV_BIND_ADDR: &str = "MATRIX_MCP_BIND_ADDR";
-/// Separate bind for the cluster-internal `/metrics` endpoint. Default
-/// `0.0.0.0:9090`. Kept off the public Service via deployment manifests
-/// (containerPort is exposed; Service.ports doesn't include it).
+/// Separate bind for the cluster-internal `/metrics` endpoint.
+///
+/// Default resolution order (defence-in-depth — never binds `0.0.0.0`
+/// unless an operator explicitly sets this var):
+///
+/// 1. If `MATRIX_MCP_METRICS_BIND_ADDR` is set, use that value verbatim.
+/// 2. If `POD_IP` is set (injected by the K8s downward API), bind to
+///    `{POD_IP}:9090` — reachable by Alloy via the pod IP annotation but
+///    not broadly reachable from sibling pods on other nodes.
+/// 3. Otherwise (local dev, no K8s), fall back to `127.0.0.1:9090`.
 const ENV_METRICS_BIND_ADDR: &str = "MATRIX_MCP_METRICS_BIND_ADDR";
+/// Kubernetes downward-API pod IP. Injected via `fieldRef: status.podIP` in
+/// the deployment manifest. Used to derive the metrics bind address so the
+/// listener is reachable by Alloy (which targets the pod IP) but not broadly
+/// accessible across all pod-network peers.
+const ENV_POD_IP: &str = "POD_IP";
 /// OAuth client id we authenticate with against MAS's introspection endpoint.
 /// Issued out-of-band (pre-registered or via `DCR`).
 const ENV_INTROSPECTION_CLIENT_ID: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_ID";
@@ -167,7 +179,7 @@ impl Config {
             resource_url,
             authorization_server,
             bind_addr,
-            metrics_bind_addr: SocketAddr::from(([0, 0, 0, 0], 9090)),
+            metrics_bind_addr: SocketAddr::from(([127, 0, 0, 1], 9090)),
             server_name,
             homeserver_url,
             introspection: None,
@@ -204,10 +216,15 @@ impl Config {
         let bind_addr_str = std::env::var(ENV_BIND_ADDR).unwrap_or_else(|_| "0.0.0.0:3000".into());
         let bind_addr = SocketAddr::from_str(&bind_addr_str)
             .with_context(|| format!("invalid {ENV_BIND_ADDR}: {bind_addr_str}"))?;
-        let metrics_bind_addr_str =
-            std::env::var(ENV_METRICS_BIND_ADDR).unwrap_or_else(|_| "0.0.0.0:9090".into());
-        let metrics_bind_addr = SocketAddr::from_str(&metrics_bind_addr_str)
-            .with_context(|| format!("invalid {ENV_METRICS_BIND_ADDR}: {metrics_bind_addr_str}"))?;
+        // Resolve the metrics bind address — never defaults to 0.0.0.0.
+        // Preference order:
+        //   1. MATRIX_MCP_METRICS_BIND_ADDR (operator override, parsed as-is)
+        //   2. POD_IP:9090 (downward-API injection in K8s — Alloy targets this)
+        //   3. 127.0.0.1:9090 (local dev fallback; no K8s)
+        let explicit_addr = std::env::var(ENV_METRICS_BIND_ADDR).ok();
+        let pod_ip = std::env::var(ENV_POD_IP).ok();
+        let metrics_bind_addr =
+            resolve_metrics_bind_addr(explicit_addr.as_deref(), pod_ip.as_deref())?;
         let client_id = require_env(ENV_INTROSPECTION_CLIENT_ID)?;
         let client_secret = require_env(ENV_INTROSPECTION_CLIENT_SECRET)?;
         let store_root = PathBuf::from(require_env(ENV_STORE_DIR)?);
@@ -241,6 +258,28 @@ impl Config {
                 pepper,
             }))
     }
+}
+
+/// Resolve the metrics listener bind address from the environment inputs.
+///
+/// Priority order (defence-in-depth — never returns `0.0.0.0` by default):
+///
+/// 1. `explicit_addr` — the value of `MATRIX_MCP_METRICS_BIND_ADDR` if set.
+///    Parsed verbatim; allows an operator to override with any address.
+/// 2. `pod_ip` — the value of `POD_IP` (K8s downward-API injection). When
+///    present, binds to `{pod_ip}:9090`. Alloy can still reach it via the pod
+///    IP annotation, but the listener is not visible on every pod-network peer.
+/// 3. Fallback — `127.0.0.1:9090`. Used in local dev where no K8s is present.
+fn resolve_metrics_bind_addr(
+    explicit_addr: Option<&str>,
+    pod_ip: Option<&str>,
+) -> Result<SocketAddr> {
+    let addr_str: String = explicit_addr.map_or_else(
+        || pod_ip.map_or_else(|| "127.0.0.1:9090".to_owned(), |ip| format!("{ip}:9090")),
+        str::to_owned,
+    );
+    SocketAddr::from_str(&addr_str)
+        .with_context(|| format!("invalid {ENV_METRICS_BIND_ADDR}: {addr_str}"))
 }
 
 fn require_env(key: &str) -> Result<String> {
@@ -369,5 +408,60 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.resource_url, "http://localhost:3000");
         assert_eq!(cfg.homeserver_url, "http://localhost:8008");
+    }
+
+    // --- metrics bind address resolution ---
+
+    #[test]
+    fn metrics_bind_defaults_to_loopback_without_pod_ip() {
+        // No MATRIX_MCP_METRICS_BIND_ADDR, no POD_IP → loopback fallback.
+        let addr = resolve_metrics_bind_addr(None, None).unwrap();
+        assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 9090)));
+    }
+
+    #[test]
+    fn metrics_bind_uses_pod_ip_when_present() {
+        // POD_IP set, no explicit override → bind to pod IP.
+        let addr = resolve_metrics_bind_addr(None, Some("10.42.3.7")).unwrap();
+        assert_eq!(addr, SocketAddr::from(([10, 42, 3, 7], 9090)));
+    }
+
+    #[test]
+    fn metrics_bind_explicit_overrides_pod_ip() {
+        // Explicit MATRIX_MCP_METRICS_BIND_ADDR wins over POD_IP.
+        let addr = resolve_metrics_bind_addr(Some("0.0.0.0:9091"), Some("10.42.3.7")).unwrap();
+        assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 9091)));
+    }
+
+    #[test]
+    fn metrics_bind_explicit_without_pod_ip() {
+        // Explicit addr, no POD_IP.
+        let addr = resolve_metrics_bind_addr(Some("192.168.1.5:9090"), None).unwrap();
+        assert_eq!(addr, SocketAddr::from(([192, 168, 1, 5], 9090)));
+    }
+
+    #[test]
+    fn metrics_bind_invalid_explicit_addr_is_an_error() {
+        let err = resolve_metrics_bind_addr(Some("not-an-addr"), None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid"), "error was: {msg}");
+    }
+
+    #[test]
+    fn config_new_metrics_default_is_loopback() {
+        // Config::new is used by tests / local dev — must default to loopback.
+        let cfg = Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            "https://matrix.example.test",
+            "example.test",
+            bind(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.metrics_bind_addr,
+            SocketAddr::from(([127, 0, 0, 1], 9090)),
+            "Config::new must default to loopback, not 0.0.0.0"
+        );
     }
 }
