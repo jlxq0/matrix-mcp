@@ -317,6 +317,42 @@ pub struct RedactMessageResult {
     pub event_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JoinRoomParams {
+    /// Either a room id (`!abc:server`) or a canonical alias
+    /// (`#name:server`). matrix-mcp passes the value through to
+    /// `join_room_by_id_or_alias`.
+    pub room_id_or_alias: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct JoinRoomResult {
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LeaveRoomParams {
+    pub room_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct LeaveRoomResult {
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InviteUserParams {
+    pub room_id: String,
+    /// MXID to invite, e.g. `@alice:kampong.social`.
+    pub mxid: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct InviteUserResult {
+    pub room_id: String,
+    pub mxid: String,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct VerifyStatusResult {
     /// True if this matrix-mcp device has been cross-signed by the
@@ -1017,6 +1053,134 @@ impl MatrixMcpService {
         .await;
         emit_tool_audit(
             "redact_message",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Join a Matrix room by id or canonical alias. Returns the
+    /// canonical room id after the join. If the homeserver bounces
+    /// the join (invite-only, banned, etc.) an `internal_error` is
+    /// returned.
+    #[tool(description = "Join a Matrix room by id or alias.")]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn join_room(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<JoinRoomParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id_or_alias.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let target: &matrix_sdk::ruma::RoomOrAliasId =
+                params.room_id_or_alias.as_str().try_into().map_err(|e| {
+                    ErrorData::invalid_params(
+                        format!("invalid room id or alias {}: {e}", params.room_id_or_alias),
+                        None,
+                    )
+                })?;
+            let room = client
+                .join_room_by_id_or_alias(target, &[])
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("join_room: {e}"), None))?;
+            structured_result(&JoinRoomResult {
+                room_id: room.room_id().to_string(),
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "join_room",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Leave a Matrix room. Idempotent at the spec level — leaving
+    /// a room you're not in is a homeserver-decided 200-or-error.
+    #[tool(description = "Leave a Matrix room.")]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn leave_room(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<LeaveRoomParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            room.leave()
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("leave: {e}"), None))?;
+            structured_result(&LeaveRoomResult {
+                room_id: room_id.to_string(),
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "leave_room",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Invite an MXID to a Matrix room you're a member of. The
+    /// homeserver enforces ACLs (your power level vs. `invite`).
+    #[tool(description = "Invite a Matrix user to a room.")]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn invite_user(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<InviteUserParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let user_id: matrix_sdk::ruma::OwnedUserId = params.mxid.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid mxid {}: {e}", params.mxid), None)
+            })?;
+            room.invite_user_by_id(&user_id)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("invite_user_by_id: {e}"), None))?;
+            structured_result(&InviteUserResult {
+                room_id: room_id.to_string(),
+                mxid: user_id.to_string(),
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "invite_user",
             &mxid_for_audit,
             Some(&room_id_for_audit),
             started,
