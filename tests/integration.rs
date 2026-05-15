@@ -72,12 +72,12 @@ use testcontainers_modules::postgres::Postgres;
 /// deliberately when updating MAS in production; doing so here first gives
 /// you a preview of any API changes before they hit the cluster.
 ///
-/// Latest release: check https://github.com/element-hq/matrix-authentication-service/releases
+/// Latest release: check <https://github.com/element-hq/matrix-authentication-service/releases>
 const MAS_IMAGE: &str = "ghcr.io/element-hq/matrix-authentication-service";
 const MAS_TAG: &str = "v0.13.0";
 
 /// Synapse image tag. Pinned to the same series used in our Gruyere cluster.
-/// Check: https://hub.docker.com/r/matrixdotorg/synapse/tags
+/// Check: <https://hub.docker.com/r/matrixdotorg/synapse/tags>
 const SYNAPSE_IMAGE: &str = "docker.io/matrixdotorg/synapse";
 const SYNAPSE_TAG: &str = "v1.129.0";
 
@@ -86,14 +86,15 @@ const SYNAPSE_TAG: &str = "v1.129.0";
 /// Minimal Postgres container with `matrix_mcp_test` as the database,
 /// and a separate schema for MAS and Synapse.
 fn postgres_container() -> ContainerRequest<Postgres> {
+    // `testcontainers-modules::postgres::Postgres` ships its own
+    // default WaitFor strategy ("database system is ready to accept
+    // connections") — we don't need to add one. Returning the
+    // builder via `Into<ContainerRequest<_>>` keeps the type contract.
     Postgres::default()
         .with_db_name("matrix_mcp_test")
         .with_user("matrix_mcp_test")
         .with_password("testpassword")
-        // Wait until Postgres signals it is ready to accept connections.
-        .with_wait_for(WaitFor::message_on_stderr(
-            "database system is ready to accept connections",
-        ))
+        .into()
 }
 
 /// MAS container pointed at the Postgres database exposed on `pg_host:pg_port`.
@@ -103,13 +104,13 @@ fn postgres_container() -> ContainerRequest<Postgres> {
 /// the simplest approach is to mount a minimal `config.yaml` via a bind
 /// mount or config file injected as an env var — testcontainers supports
 /// both. This stub uses environment variables for the flat settings that
-/// MAS reads from the environment (DATABASE_URL, etc.).
+/// MAS reads from the environment (`DATABASE_URL`, etc.).
 ///
 /// TODO: Fill in the full MAS config mounting once the stack wiring is
 /// validated. The config must include:
 /// - `database.url` — `postgres://matrix_mcp_test:testpassword@{pg_host}:{pg_port}/matrix_mcp_test`
 /// - `clients` section with a pre-registered client for matrix-mcp's
-///   introspection credential (client_id + client_secret)
+///   introspection credential (`client_id` + `client_secret`)
 /// - `matrix.homeserver` pointing at the Synapse container
 /// - `matrix.server_name` = "localhost"
 fn mas_container(pg_host: &str, pg_port: u16) -> ContainerRequest<GenericImage> {
@@ -167,6 +168,7 @@ fn synapse_container(mas_host: &str, mas_port: u16) -> ContainerRequest<GenericI
 /// If this fails, the Docker daemon is not running or the Postgres image
 /// cannot be pulled.
 #[test]
+#[allow(clippy::expect_used)] // test fn — panicking on failure is correct
 fn postgres_container_starts() {
     let container = postgres_container()
         .start()
@@ -182,7 +184,7 @@ fn postgres_container_starts() {
 }
 
 /// Happy-path integration test: bearer token introspection → whoami →
-/// list_joined_rooms.
+/// `list_joined_rooms`.
 ///
 /// Full stack: Postgres + MAS + Synapse + matrix-mcp (in-process).
 ///
@@ -209,12 +211,15 @@ fn postgres_container_starts() {
 /// scenario against a real cluster.
 #[test]
 #[ignore = "TODO: wire MAS + Synapse config injection (see INTEGRATION.md)"]
+#[allow(clippy::expect_used)] // test fn — panicking on failure is correct
+#[allow(clippy::no_effect_underscore_binding)] // placeholders for future wiring
 fn happy_path_whoami_and_list_rooms() {
     // ── 1. Postgres ─────────────────────────────────────────────────────────
-    let _pg = postgres_container()
+    // _pg keeps the container alive via RAII; it IS used below for port query.
+    let pg = postgres_container()
         .start()
         .expect("Postgres container failed to start");
-    let pg_port = _pg.get_host_port_ipv4(5432).expect("Postgres port");
+    let pg_port = pg.get_host_port_ipv4(5432).expect("Postgres port");
 
     // ── 2. MAS ──────────────────────────────────────────────────────────────
     // TODO: inject a real config file via .with_copy_to() or .with_mount()
@@ -223,23 +228,25 @@ fn happy_path_whoami_and_list_rooms() {
     //   - clients[] with id="matrix-mcp-test", secret="test-secret"
     //   - matrix.server_name = "localhost"
     //   - matrix.homeserver = http://localhost:{syn_port}
-    let _mas = mas_container("host.docker.internal", pg_port)
+    // mas keeps the container alive via RAII; it IS used below for port query.
+    let mas = mas_container("host.docker.internal", pg_port)
         .start()
         .expect("MAS container failed to start");
-    let mas_port = _mas.get_host_port_ipv4(8080).expect("MAS port");
+    let mas_port = mas.get_host_port_ipv4(8080).expect("MAS port");
 
     // ── 3. Synapse ───────────────────────────────────────────────────────────
     // TODO: inject homeserver.yaml with msc3861 block pointing at mas_port.
-    let _syn = synapse_container("host.docker.internal", mas_port)
+    // syn keeps the container alive via RAII; it IS used below for port query.
+    let syn = synapse_container("host.docker.internal", mas_port)
         .start()
         .expect("Synapse container failed to start");
-    let syn_port = _syn.get_host_port_ipv4(8008).expect("Synapse port");
+    let syn_port = syn.get_host_port_ipv4(8008).expect("Synapse port");
 
     // ── 4. Register test user via MAS admin API ──────────────────────────────
     // POST http://localhost:{mas_port}/api/admin/v1/users
     // Body: { "username": "testuser", "password": "testpass", ... }
     // TODO: issue the HTTP request once MAS is running.
-    let _test_mxid = format!("@testuser:localhost");
+    let _test_mxid = "@testuser:localhost".to_string();
 
     // ── 5. Issue access token for testuser via MAS token endpoint ────────────
     // POST http://localhost:{mas_port}/oauth2/token
@@ -321,8 +328,10 @@ fn invalid_bearer_returns_401() {
     // ```
     //
     // TODO: pick approach A or B and implement.
+    // _placeholder is a typed stub so the HashMap import stays exercised
+    // until the real implementation fills this in.
+    #[allow(clippy::no_effect_underscore_binding)]
     let _placeholder: HashMap<String, String> = HashMap::new();
-    assert!(true, "placeholder — implement in follow-up");
 }
 
 /// Verify that the integration feature gate compiles cleanly and that the
@@ -330,19 +339,20 @@ fn invalid_bearer_returns_401() {
 /// This test always passes; it exists to catch feature-gate compile errors
 /// before any container infrastructure is needed.
 #[test]
+#[allow(clippy::no_effect_underscore_binding)] // compile-check stubs only
 fn feature_gate_compiles() {
     // Just importing the containers at the top of this file is enough.
     // If testcontainers or testcontainers-modules are missing or mis-gated,
     // the import at the top of this file will fail at compile time.
     let _pg_default_port: u16 = 5432;
-    let _mas_image: &str = MAS_IMAGE;
+    let mas_image: &str = MAS_IMAGE;
     let _syn_image: &str = SYNAPSE_IMAGE;
     // Verify Duration is accessible (used by wait-for helpers).
-    let _timeout = Duration::from_secs(120);
+    let _timeout = Duration::from_mins(2);
     // Verify GenericImage is constructable without starting it.
     let _img = GenericImage::new("alpine", "latest");
     assert_eq!(
-        _mas_image,
+        mas_image,
         "ghcr.io/element-hq/matrix-authentication-service"
     );
 }
