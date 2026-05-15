@@ -22,6 +22,10 @@ const ENV_RESOURCE_URL: &str = "MATRIX_MCP_RESOURCE_URL";
 const ENV_AUTH_SERVER_URL: &str = "MATRIX_MCP_AUTHORIZATION_SERVER";
 /// Bind address, defaults to `0.0.0.0:3000` for container deployment.
 const ENV_BIND_ADDR: &str = "MATRIX_MCP_BIND_ADDR";
+/// Separate bind for the cluster-internal `/metrics` endpoint. Default
+/// `0.0.0.0:9090`. Kept off the public Service via deployment manifests
+/// (containerPort is exposed; Service.ports doesn't include it).
+const ENV_METRICS_BIND_ADDR: &str = "MATRIX_MCP_METRICS_BIND_ADDR";
 /// OAuth client id we authenticate with against MAS's introspection endpoint.
 /// Issued out-of-band (pre-registered or via `DCR`).
 const ENV_INTROSPECTION_CLIENT_ID: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_ID";
@@ -59,8 +63,11 @@ pub struct Config {
     pub resource_url: String,
     /// Authorization server (issuer). No trailing slash, same reason.
     pub authorization_server: String,
-    /// TCP bind address.
+    /// TCP bind address for the public API (rmcp + setup + health + .well-known).
     pub bind_addr: SocketAddr,
+    /// TCP bind for the cluster-internal metrics endpoint. Kept off
+    /// the public Service so the metrics blob isn't internet-visible.
+    pub metrics_bind_addr: SocketAddr,
     /// Matrix homeserver base URL (no trailing slash). Phase-2+ tools talk
     /// to `{homeserver_url}/_matrix/client/...`.
     pub homeserver_url: String,
@@ -147,6 +154,7 @@ impl Config {
             resource_url,
             authorization_server,
             bind_addr,
+            metrics_bind_addr: SocketAddr::from(([0, 0, 0, 0], 9090)),
             server_name,
             homeserver_url,
             introspection: None,
@@ -181,6 +189,10 @@ impl Config {
         let bind_addr_str = std::env::var(ENV_BIND_ADDR).unwrap_or_else(|_| "0.0.0.0:3000".into());
         let bind_addr = SocketAddr::from_str(&bind_addr_str)
             .with_context(|| format!("invalid {ENV_BIND_ADDR}: {bind_addr_str}"))?;
+        let metrics_bind_addr_str =
+            std::env::var(ENV_METRICS_BIND_ADDR).unwrap_or_else(|_| "0.0.0.0:9090".into());
+        let metrics_bind_addr = SocketAddr::from_str(&metrics_bind_addr_str)
+            .with_context(|| format!("invalid {ENV_METRICS_BIND_ADDR}: {metrics_bind_addr_str}"))?;
         let client_id = require_env(ENV_INTROSPECTION_CLIENT_ID)?;
         let client_secret = require_env(ENV_INTROSPECTION_CLIENT_SECRET)?;
         let store_root = PathBuf::from(require_env(ENV_STORE_DIR)?);
@@ -192,21 +204,23 @@ impl Config {
                 len = pepper.len()
             );
         }
-        Ok(Self::new(
+        let mut cfg = Self::new(
             resource_url,
             authorization_server,
             homeserver_url,
             server_name,
             bind_addr,
-        )?
-        .with_introspection(IntrospectionCredentials {
-            client_id,
-            client_secret,
-        })
-        .with_store(StoreConfig {
-            root: store_root,
-            pepper,
-        }))
+        )?;
+        cfg.metrics_bind_addr = metrics_bind_addr;
+        Ok(cfg
+            .with_introspection(IntrospectionCredentials {
+                client_id,
+                client_secret,
+            })
+            .with_store(StoreConfig {
+                root: store_root,
+                pepper,
+            }))
     }
 }
 

@@ -17,6 +17,7 @@ mod config;
 mod mas;
 mod matrix_client;
 mod mcp;
+mod metrics;
 mod oauth_metadata;
 mod setup;
 
@@ -47,16 +48,33 @@ use crate::oauth_metadata::protected_resource_metadata;
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    metrics::init();
     let cfg = Config::from_env()?;
     let bind_addr = cfg.bind_addr;
+    let metrics_bind_addr = cfg.metrics_bind_addr;
     let app = build_app(cfg)?;
 
     let listener = TcpListener::bind(bind_addr).await?;
-    info!(%bind_addr, "matrix-mcp listening");
+    info!(%bind_addr, "matrix-mcp listening (public)");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Internal-only metrics listener. Distinct port so the public
+    // Service can omit it; Alloy scrapes via the pod IP. No auth on
+    // this listener — exposure is controlled by NetworkPolicy +
+    // the Service not exposing the port.
+    let metrics_listener = TcpListener::bind(metrics_bind_addr).await?;
+    info!(%metrics_bind_addr, "matrix-mcp metrics listening (internal)");
+    let metrics_app = Router::new().route("/metrics", get(metrics::metrics_handler));
+
+    tokio::select! {
+        result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+            result?;
+        }
+        result = axum::serve(metrics_listener, metrics_app)
+            .with_graceful_shutdown(shutdown_signal()) => {
+            result?;
+        }
+        () = shutdown_signal() => {}
+    }
 
     Ok(())
 }
