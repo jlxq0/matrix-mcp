@@ -11,6 +11,12 @@ publish = false
 [dependencies]
 tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "rt", "signal", "net", "time"] }
 axum = "0.7"
+# `axum-extra` for typed Cookie / CookieJar extractors in the /setup web
+# flow. `Form` is also re-exported here in case we need it later.
+axum-extra = { version = "0.9", features = ["cookie"] }
+# PKCE: the `code_challenge` is `base64url(sha256(code_verifier))`. We use
+# the `URL_SAFE_NO_PAD` engine. SHA-256 already comes via `sha2`.
+base64 = "0.22"
 # `http` is re-exported by axum/rmcp but we use `http::request::Parts` directly
 # in the tool layer (rmcp injects it into `RequestContext.extensions`), so a
 # top-level dep keeps the import path stable.
