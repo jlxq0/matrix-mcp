@@ -85,13 +85,16 @@ impl AudField {
 /// user/device — only what the tool layer needs to act.
 ///
 /// `device_id` and `raw_scope` are unread today; the `whoami` tool added in
-/// phase 1.3 starts reading both.
+/// phase 1.3 starts reading both. `sub` (MAS-internal user ULID) is used
+/// by the rate limiter (Phase 6.1) as a per-user bucket key — stable
+/// across token rotations and never sent to claude.ai.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct AuthenticatedIdentity {
     pub mxid: String,
     pub device_id: Option<String>,
     pub raw_scope: Option<String>,
+    pub sub: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -248,6 +251,7 @@ impl MasIntrospectionClient {
             mxid,
             device_id,
             raw_scope: body.scope.clone(),
+            sub: body.sub.clone(),
         };
 
         self.cache_insert(key, &identity, body.exp);

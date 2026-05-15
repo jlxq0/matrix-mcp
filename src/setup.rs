@@ -296,6 +296,10 @@ pub async fn recover(
         mxid: session.mxid.clone(),
         device_id: Some(crate::oauth_metadata::MATRIX_MCP_DEVICE_ID.to_owned()),
         raw_scope: None,
+        // /setup is browser-driven; we never went through MAS
+        // introspection for this caller. Rate limiter falls back to
+        // bearer-hash only when `sub` is None.
+        sub: None,
     };
     let client = match state
         .clients

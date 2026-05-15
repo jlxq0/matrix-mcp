@@ -34,6 +34,7 @@ use crate::audit::{self, outcome};
 use crate::auth::AccessToken;
 use crate::mas::AuthenticatedIdentity;
 use crate::matrix_client::MatrixClientCache;
+use crate::rate_limit::{Category, Limiter};
 
 /// The MCP service. Per-session state is a reference to the shared
 /// `MatrixClientCache`. The per-request identity + token come from
@@ -42,6 +43,7 @@ use crate::matrix_client::MatrixClientCache;
 #[derive(Clone)]
 pub struct MatrixMcpService {
     clients: MatrixClientCache,
+    rate_limiter: Arc<Limiter>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -52,11 +54,35 @@ impl std::fmt::Debug for MatrixMcpService {
 }
 
 impl MatrixMcpService {
-    pub fn new(clients: MatrixClientCache) -> Self {
+    pub fn new(clients: MatrixClientCache, rate_limiter: Arc<Limiter>) -> Self {
         Self {
             clients,
+            rate_limiter,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Check the rate-limit buckets for the caller. On denial, returns
+    /// an `ErrorData` with the stable `RATE_LIMITED_CODE` so callers +
+    /// audit + metrics all see the same shape.
+    fn rate_limit_check(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        category: Category,
+    ) -> Result<(), ErrorData> {
+        let token = token_from_ctx(ctx).ok_or_else(missing_token_err)?;
+        let id = identity_from_ctx(ctx).ok_or_else(missing_identity_err)?;
+        let bearer_hash = audit::token_hash(&token.0);
+        let sub = id.sub.as_deref();
+        self.rate_limiter
+            .check(&bearer_hash, sub, category)
+            .map_err(|_| {
+                ErrorData::new(
+                    rmcp::model::ErrorCode(audit::RATE_LIMITED_CODE),
+                    "rate limit exceeded — try again in a minute".to_owned(),
+                    None,
+                )
+            })
     }
 }
 
@@ -162,6 +188,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let result = (|| {
+            self.rate_limit_check(&ctx, Category::Read)?;
             let id = identity_from_ctx(&ctx).ok_or_else(missing_identity_err)?;
             structured_result(&WhoamiResult {
                 mxid: id.mxid,
@@ -184,6 +211,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let (result, room_count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let rooms: Vec<JoinedRoom> = client.joined_rooms().iter().map(summarize_room).collect();
             let count = rooms.len();
@@ -218,6 +246,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let (result, event_count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
@@ -300,6 +329,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
@@ -344,6 +374,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let me = client
                 .user_id()
@@ -485,7 +516,17 @@ fn emit_tool_audit(
 ) {
     let (outcome, err_class) = match result {
         Ok(_) => (outcome::OK, None),
-        Err(e) => (outcome::ERROR, Some(audit::error_class(e))),
+        Err(e) => {
+            let class = audit::error_class(e);
+            // Map the in-band rate-limit error to the matching outcome
+            // so dashboards can distinguish "429-ish" from real errors.
+            let outcome_str = if e.code.0 == audit::RATE_LIMITED_CODE {
+                outcome::RATE_LIMITED
+            } else {
+                outcome::ERROR
+            };
+            (outcome_str, Some(class))
+        }
     };
     audit::tool_call(
         tool,

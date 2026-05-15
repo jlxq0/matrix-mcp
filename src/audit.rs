@@ -58,6 +58,9 @@ pub mod outcome {
     pub const UNAUTHORIZED: &str = "unauthorized";
     pub const ACTIVE: &str = "active";
     pub const INACTIVE: &str = "inactive";
+    /// Tool denied because the per-identity quota was exceeded
+    /// (Phase 6.1).
+    pub const RATE_LIMITED: &str = "rate_limited";
 }
 
 /// First 16 hex chars of `sha256(bearer)`. Used as a stable
@@ -76,6 +79,14 @@ pub fn token_hash(token: &str) -> String {
 /// key — keep cardinality LOW. Specific error messages stay out of
 /// audit logs; they go to the operational `warn!`/`error!` stream
 /// instead.
+/// JSON-RPC server-error code we use to signal "this caller exceeded
+/// their per-minute quota". The JSON-RPC 2.0 spec reserves -32768 to
+/// -32000 for server errors; everything outside that block is free for
+/// application-defined codes. We pick a stable in-band code so audit
+/// classification + downstream MCP clients can distinguish rate-limit
+/// from other 5xx-ish failures.
+pub const RATE_LIMITED_CODE: i32 = -32029;
+
 #[must_use]
 pub const fn error_class(err: &ErrorData) -> &'static str {
     // `ErrorCode` is a thin newtype around `i32` — see rmcp's
@@ -87,6 +98,7 @@ pub const fn error_class(err: &ErrorData) -> &'static str {
         -32601 => "method_not_found",
         -32602 => "invalid_params",
         -32603 => "internal",
+        RATE_LIMITED_CODE => "rate_limited",
         _ => "other",
     }
 }
