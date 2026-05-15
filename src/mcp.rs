@@ -192,6 +192,47 @@ pub struct RoomInfoResult {
     pub my_membership: &'static str,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoomMembersParams {
+    /// Matrix room id, e.g. `!abc:kampong.social`.
+    pub room_id: String,
+    /// Maximum number of members to return. Defaults to 200.
+    /// Bridged rooms (Telegram, `WhatsApp` channels, etc.) can have
+    /// thousands of joined members; cap so we don't return a 5 MB
+    /// JSON blob.
+    #[serde(default = "default_member_limit")]
+    pub limit: u32,
+}
+
+const fn default_member_limit() -> u32 {
+    200
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RoomMemberInfo {
+    pub mxid: String,
+    /// The member's chosen display name, or `null` if they haven't set
+    /// one (in which case the localpart of the mxid is a reasonable
+    /// fallback for UIs).
+    pub display_name: Option<String>,
+    /// Avatar as an `mxc://server/mediaid` URI, or `null` if unset.
+    pub avatar_url: Option<String>,
+    /// Power level normalized to 0–100 against the highest power level
+    /// in the room (so the room creator typically reads as 100,
+    /// regardless of whether they raised the cap above 100). Negative
+    /// values are passed through verbatim.
+    pub power_level: i64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RoomMembersResult {
+    pub members: Vec<RoomMemberInfo>,
+    /// Total number of joined members in the room. If
+    /// `members.len() < total`, the response was truncated by the
+    /// `limit` parameter.
+    pub total: u64,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct VerifyStatusResult {
     /// True if this matrix-mcp device has been cross-signed by the
@@ -573,6 +614,84 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &result,
+        );
+        result
+    }
+
+    /// List joined members of a Matrix room with display name, avatar,
+    /// and normalized power level. Capped at `limit` (default 200).
+    /// `total` reports the room's true joined-member count so callers
+    /// can detect truncation.
+    #[tool(
+        description = "List joined members of a Matrix room (mxid, display name, avatar, power level)."
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_members(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomMembersParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let (result, member_count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+
+            // `members_no_sync` reads the cached member list rather
+            // than firing /joined_members. The background sync keeps
+            // this fresh; the trade-off is "freshness up to last sync"
+            // vs "an extra round-trip per call". Take the cached read
+            // — the same trade-off `list_joined_rooms` makes.
+            let mut members = room
+                .members_no_sync(matrix_sdk::RoomMemberships::JOIN)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("members_no_sync: {e}"), None))?;
+            let total = u64::try_from(members.len()).unwrap_or(u64::MAX);
+            members.truncate(params.limit.try_into().unwrap_or(usize::MAX));
+
+            let members: Vec<RoomMemberInfo> = members
+                .iter()
+                .map(|m| RoomMemberInfo {
+                    mxid: m.user_id().to_string(),
+                    display_name: m.display_name().map(ToOwned::to_owned),
+                    avatar_url: m.avatar_url().map(ToString::to_string),
+                    // `normalized_power_level` returns the same
+                    // `UserPowerLevel` enum as `for_user`. Map Int(n)
+                    // to n, Infinite (v12+ creator) to i64::MAX as a
+                    // sentinel — the per-member API doesn't have a
+                    // sibling bool for creator-ness, and this scales
+                    // the data the way clients expect ("very high").
+                    power_level: match m.normalized_power_level() {
+                        matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Int(n) => {
+                            i64::from(n)
+                        }
+                        matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Infinite => {
+                            i64::MAX
+                        }
+                        _ => 0,
+                    },
+                })
+                .collect();
+            let count = members.len();
+            let res = structured_result(&RoomMembersResult { members, total });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        emit_tool_audit(
+            "room_members",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(member_count),
             &result,
         );
         result
