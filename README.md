@@ -1,86 +1,93 @@
 # matrix-mcp
 
-A remote [MCP](https://modelcontextprotocol.io) server that exposes a
-[Matrix](https://matrix.org) homeserver to [claude.ai](https://claude.ai)
-as a custom connector.
+A remote [MCP](https://modelcontextprotocol.io) server that gives
+[claude.ai](https://claude.ai) read/write access to a self-hosted
+[Matrix](https://matrix.org) homeserver – including E2EE rooms.
 
-**Status:** Phase 0 — repo skeleton. Not deployed. Not functional yet.
-See [`docs/plan.md`](docs/plan.md) for the roadmap.
+**Status:** v0.1.0, deployed at `matrix-mcp.kampong.social` for `kampong.social` users.
 
-## What this is
+## What it does
 
-Claude.ai supports custom MCP connectors over OAuth. This server is the
-bridge between Claude and a self-hosted Matrix homeserver: Claude
-authenticates via the homeserver's [OIDC issuer](https://matrix-org.github.io/matrix-authentication-service/),
-the server holds a per-user Matrix client (with E2EE), and exposes a small
-set of tools (`list_rooms`, `read_room`, `send_message`, …) that let an
-LLM-driven workflow read and write chat on your behalf.
+Claude authenticates via the homeserver's OIDC issuer
+([MAS](https://matrix-org.github.io/matrix-authentication-service/)).
+The server holds a per-user Matrix client (with full E2EE via
+`matrix-rust-sdk`) and exposes 17 tools: list rooms, read messages,
+send messages, search history, manage membership, download attachments,
+and more.
 
-Designed for one homeserver at a time — initially `kampong.social`.
+Designed for a single homeserver at a time. Currently hardwired to
+`kampong.social`.
 
-## Design choices
+## As a user
 
-- **Language:** Rust
-- **Matrix SDK:** [`matrix-rust-sdk`](https://github.com/matrix-org/matrix-rust-sdk)
-  for native MSC4186 sliding sync, OAuth/MSC3861 client, and vodozemac
-  crypto
-- **MCP transport:** Streamable HTTP (`/mcp` endpoint)
-- **Auth:** Bearer tokens issued by the homeserver's MAS, validated via
-  introspection
-- **Storage:** SQLite per user, encrypted at rest via `matrix-sdk`'s
-  `StoreCipher`
-- **Deployment target:** Kubernetes (Gruyere cluster), distroless
-  container, PSS-restricted namespace
+Visit `https://matrix-mcp.kampong.social/setup` once to unlock E2EE,
+then add `https://matrix-mcp.kampong.social/mcp` as a custom connector
+in claude.ai. See [docs/onboarding.md](docs/onboarding.md).
 
-See [`docs/architecture.md`](docs/architecture.md) and
-[`docs/security.md`](docs/security.md) for the full design.
+## As an operator
 
-## Local development
+See [docs/installation.md](docs/installation.md) to deploy against your
+own MAS + Synapse. Environment variables are in [docs/operations.md](docs/operations.md).
+
+## Development
 
 Requires Rust 1.85+ (`edition = "2024"`).
 
 ```sh
+# start the server (all env vars optional in dev)
+cargo run
+
+# health check
+curl http://127.0.0.1:3000/health
+```
+
+Minimum env for a real local run against a test MAS:
+
+```sh
+export MATRIX_MCP_RESOURCE_URL=http://localhost:3000
+export MATRIX_MCP_AUTHORIZATION_SERVER=http://localhost:8080
+export MATRIX_MCP_HOMESERVER_URL=http://localhost:8008
+export MATRIX_MCP_SERVER_NAME=localhost
+export MATRIX_MCP_INTROSPECTION_CLIENT_ID=matrix-mcp
+export MATRIX_MCP_INTROSPECTION_CLIENT_SECRET=dev-secret
+export MATRIX_MCP_STORE_DIR=/tmp/matrix-mcp-dev
+export MATRIX_MCP_STORE_PEPPER=$(openssl rand -hex 32)
 cargo run
 ```
 
-Server boots on `http://0.0.0.0:3000`. Phase 0 only exposes `/healthz`.
+### CI checks
 
 ```sh
-curl http://127.0.0.1:3000/healthz
-# ok
-```
-
-### Testing
-
-```sh
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo audit
 ```
 
-CI runs on every PR: `fmt`, `clippy`, `test`, `cargo audit` (CVE check),
-`cargo deny` (license + advisory + ban check), and a `docker build`
-dry-run.
+CI runs all of the above plus a `docker build` dry-run on every PR.
 
 ### Container
 
 ```sh
 docker build -t matrix-mcp:dev .
-docker run --rm -p 3000:3000 matrix-mcp:dev
+docker run --rm -p 3000:3000 -e MATRIX_MCP_RESOURCE_URL=... matrix-mcp:dev
 ```
 
-The image is multi-stage: Rust 1.85 builder → distroless `cc-debian12:nonroot`
-runtime. Final size ≈ 25–35 MiB.
+Multi-stage build: Rust builder → distroless `cc-debian12:nonroot`. Final image ~25–35 MiB.
+
+## Docs
+
+| File | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Component diagrams, OAuth dance, sync loop, storage layout |
+| [docs/security.md](docs/security.md) | Threat model, mitigations, residual risk |
+| [docs/onboarding.md](docs/onboarding.md) | User setup walkthrough |
+| [docs/installation.md](docs/installation.md) | Operator deployment guide (k8s, docker-compose) |
+| [docs/operations.md](docs/operations.md) | Debug recipes, pepper rotation, secret rotation |
+| [docs/api-reference.md](docs/api-reference.md) | All 17 MCP tools, params, return shapes |
+| [docs/decisions.md](docs/decisions.md) | Architecture decision records |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE).
-
-Matches Matrix ecosystem convention; ensures forks stay open.
-
-## Not for general use yet
-
-This is early-stage code. There is no public deployment. The repo is
-private until the security posture has been reviewed and the threat
-model is documented. See [`docs/security.md`](docs/security.md) for
-what the threat model will say.
+[AGPL-3.0-or-later](LICENSE). Matches Matrix ecosystem convention.
