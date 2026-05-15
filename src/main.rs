@@ -20,6 +20,7 @@ mod mcp;
 mod metrics;
 mod oauth_metadata;
 mod rate_limit;
+mod session;
 mod setup;
 
 use std::sync::Arc;
@@ -30,9 +31,7 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -134,9 +133,12 @@ fn build_router(
     if let Some(h) = resource_host {
         allowed_hosts.push(h);
     }
+    // Mitigation A + B (audit finding #13): use a CappedSessionManager that
+    // applies a 60 s idle TTL (down from rmcp's 300 s default) and hard-caps
+    // the global session count at session::MAX_SESSIONS (256).
     let mcp_service = StreamableHttpService::new(
         move || Ok(MatrixMcpService::new(clients.clone(), Arc::clone(&limiter))),
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(session::CappedSessionManager::new()),
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
 
