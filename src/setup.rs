@@ -72,6 +72,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use crate::audit::{self, SetupExtras, outcome};
 use crate::config::Config;
 use crate::mas::MasIntrospectionClient;
 use crate::matrix_client::MatrixClientCache;
@@ -231,10 +232,25 @@ pub async fn callback(
             }
             let cookie = build_session_cookie(&session_id);
             debug!(mxid = %mxid, "setup session created");
+            audit::setup_event(
+                "setup_callback",
+                Some(&mxid),
+                outcome::OK,
+                SetupExtras::default(),
+            );
             (jar.add(cookie), Redirect::to("/setup/form")).into_response()
         }
         Err(e) => {
             warn!(error = %e, "setup token exchange failed");
+            audit::setup_event(
+                "setup_callback",
+                None,
+                outcome::ERROR,
+                SetupExtras {
+                    error_class: Some("token_exchange"),
+                    ..SetupExtras::default()
+                },
+            );
             error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("Failed to complete sign-in: {e:#}"),
@@ -255,6 +271,11 @@ pub struct RecoverForm {
     pub recovery_key: String,
 }
 
+// 100+ lines because the recover handler is intrinsically multi-step
+// (auth → key import → audit → spawn back-fill task → cookie invalidate
+// → success page). Splitting just to satisfy clippy would make the
+// flow harder to follow. The handler stays inline.
+#[allow(clippy::too_many_lines)]
 pub async fn recover(
     State(state): State<SetupState>,
     jar: CookieJar,
@@ -292,6 +313,12 @@ pub async fn recover(
 
     match client.encryption().recovery().recover(&key).await {
         Ok(()) => {
+            audit::setup_event(
+                "setup_recover",
+                Some(&session.mxid),
+                outcome::OK,
+                SetupExtras::default(),
+            );
             // Force a /keys/query so the user-identity cache reflects
             // the new self-signature on the next verify_status call.
             if let Some(me) = client.user_id() {
@@ -345,6 +372,21 @@ pub async fn recover(
                     failed,
                     "key-backup history download complete"
                 );
+                audit::setup_event(
+                    "setup_history_download",
+                    Some(&mxid_for_log),
+                    if failed == 0 {
+                        outcome::OK
+                    } else {
+                        outcome::ERROR
+                    },
+                    SetupExtras {
+                        rooms_total: Some(total),
+                        rooms_succeeded: Some(succeeded),
+                        rooms_failed: Some(failed),
+                        error_class: None,
+                    },
+                );
             });
 
             // Invalidate the session cookie so reload doesn't replay.
@@ -359,6 +401,15 @@ pub async fn recover(
         }
         Err(e) => {
             warn!(mxid = %session.mxid, error = %e, "recovery import failed");
+            audit::setup_event(
+                "setup_recover",
+                Some(&session.mxid),
+                outcome::ERROR,
+                SetupExtras {
+                    error_class: Some("recovery_import"),
+                    ..SetupExtras::default()
+                },
+            );
             error_page(
                 StatusCode::BAD_REQUEST,
                 &format!(

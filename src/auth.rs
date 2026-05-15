@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
+use crate::audit::{self, outcome};
 use crate::config::Config;
 use crate::mas::{AuthenticatedIdentity, MasIntrospectionClient};
 use crate::oauth_metadata::www_authenticate_header;
@@ -46,9 +47,12 @@ pub async fn bearer_auth(
         return unauthorized(&state.config.resource_url);
     };
 
+    let started = std::time::Instant::now();
+    let token_hash = audit::token_hash(&token);
     match state.mas.introspect(&token).await {
         Ok(Some(identity)) => {
             debug!(mxid = %identity.mxid, "authenticated request");
+            audit::introspect(&token_hash, outcome::ACTIVE, started, Some(&identity.mxid));
             // Stash both the identity and the raw OAuth token on the request
             // extensions. rmcp's streamable-http tower layer wraps the
             // request's `Parts` (including our extensions) into the tool
@@ -64,10 +68,12 @@ pub async fn bearer_auth(
         }
         Ok(None) => {
             debug!("token rejected by MAS introspection");
+            audit::introspect(&token_hash, outcome::INACTIVE, started, None);
             unauthorized(&state.config.resource_url)
         }
         Err(e) => {
             warn!(error = %e, "MAS introspection failure");
+            audit::introspect(&token_hash, outcome::ERROR, started, None);
             internal_error()
         }
     }
