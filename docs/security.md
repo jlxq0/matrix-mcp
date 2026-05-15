@@ -72,8 +72,10 @@ logged-in users**. This is fundamental to the design — server-side E2EE
 #### Operational
 - Pod is **single replica** in Phase 4 (state is per-pod). Multi-replica
   needs `CrossProcessLockConfig` in matrix-rust-sdk — deferred.
-- Container image is digest-pinned per the existing cluster norm.
-- Renovate watches the image tag.
+- Container base images are digest-pinned in the Dockerfile (`rust:1.93-bookworm` and
+  `gcr.io/distroless/cc-debian12:nonroot`). Third-party GitHub Actions in `ci.yml` are
+  pinned to full commit SHAs. Renovate watches both for updates.
+- CI action SHAs and image digests were resolved 2026-05-15; update when Renovate bumps them.
 
 ### Mitigations deferred
 
