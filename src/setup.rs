@@ -297,6 +297,56 @@ pub async fn recover(
             if let Some(me) = client.user_id() {
                 let _ = client.encryption().request_user_identity(me).await;
             }
+
+            // Pull historical megolm sessions from server-side key
+            // backup so /messages on E2EE rooms can decrypt history.
+            // matrix-sdk does NOT auto-fetch from backup; we have to
+            // ask per room. Done in a spawned task so the user gets
+            // the success page immediately — back-fill happens in the
+            // background.
+            let mxid_for_log = session.mxid.clone();
+            let client_for_download = client.clone();
+            tokio::spawn(async move {
+                let rooms = client_for_download.joined_rooms();
+                let mut total = 0usize;
+                let mut succeeded = 0usize;
+                let mut failed = 0usize;
+                for room in &rooms {
+                    if !room.encryption_state().is_encrypted() {
+                        continue;
+                    }
+                    total += 1;
+                    let room_id = room.room_id().to_owned();
+                    match client_for_download
+                        .encryption()
+                        .backups()
+                        .download_room_keys_for_room(&room_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            succeeded += 1;
+                            debug!(mxid = %mxid_for_log, %room_id, "backed-up keys downloaded");
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            warn!(
+                                mxid = %mxid_for_log,
+                                %room_id,
+                                error = %e,
+                                "failed to download room keys from backup"
+                            );
+                        }
+                    }
+                }
+                tracing::info!(
+                    mxid = %mxid_for_log,
+                    total_encrypted_rooms = total,
+                    succeeded,
+                    failed,
+                    "key-backup history download complete"
+                );
+            });
+
             // Invalidate the session cookie so reload doesn't replay.
             {
                 let mut sessions = state.sessions.write().await;
@@ -516,8 +566,13 @@ code { background:#222; padding:0 0.3em; border-radius:3px; }
 <p>Cross-signing private keys imported. matrix-mcp will self-sign its
 device on the next sync (≤30 s). Head back to claude.ai and call
 <code>verify_status</code> — it should now report
-<code>cross_signed: true</code>. After that, E2EE rooms become
-readable.</p>
+<code>cross_signed: true</code>.</p>
+<p>Historical message decryption: matrix-mcp is now downloading your
+megolm session backup in the background — one request per encrypted
+room. For a busy account this can take a minute or two. Re-running
+<code>read_recent_messages</code> on the same room a minute later
+should show previously-undecryptable history as
+<code>status: decrypted</code>.</p>
 <p>You can close this tab.</p>
 </body></html>"#;
 
