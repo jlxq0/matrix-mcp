@@ -153,8 +153,16 @@ pub async fn login(State(state): State<SetupState>) -> Response {
     };
 
     let redirect_uri = format!("{}/setup/callback", state.config.resource_url);
+    // MAS quirk: every OAuth endpoint is under `/oauth2/*` EXCEPT
+    // `/authorize`, which sits at the issuer root. Confirmed against
+    // the live discovery document — authorization_endpoint is the
+    // odd one out. TODO(setup): fetch
+    // /.well-known/openid-configuration once at startup and cache
+    // the endpoint URLs from `authorization_endpoint` /
+    // `token_endpoint` so a future MAS path tweak doesn't 404 us
+    // again.
     let authorize_url = format!(
-        "{auth}/oauth2/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}\
+        "{auth}/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}\
          &code_challenge={challenge}&code_challenge_method=S256&state={state_tok}\
          &scope=openid+urn%3Amatrix%3Aorg.matrix.msc2967.client%3Aapi%3A%2A",
         auth = state.config.authorization_server,
