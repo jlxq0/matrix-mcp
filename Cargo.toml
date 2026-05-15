@@ -26,6 +26,10 @@ base64 = "0.22"
 # We only emit the text format from TextEncoder, never the protobuf
 # wire format, so the feature is dead weight.
 prometheus = { version = "0.13", default-features = false }
+# Token-bucket rate limiting (Phase 6.1). Per-identity buckets keyed on
+# `sha256(bearer)[..16]` and on MAS `sub` (ULID). Read/write quotas are
+# configurable via env; defaults 60/min reads, 30/min writes.
+governor = "0.7"
 # `http` is re-exported by axum/rmcp but we use `http::request::Parts` directly
 # in the tool layer (rmcp injects it into `RequestContext.extensions`), so a
 # top-level dep keeps the import path stable.
