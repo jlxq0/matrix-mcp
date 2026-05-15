@@ -70,6 +70,7 @@ use rand::{Rng, thread_rng};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::audit::{self, SetupExtras, outcome};
@@ -83,8 +84,24 @@ use crate::matrix_client::MatrixClientCache;
 const SESSION_COOKIE: &str = "__Host-matrix_mcp_setup";
 #[allow(clippy::duration_suboptimal_units)] // clippy suggests from_mins; unstable on 1.93.
 const PKCE_TTL: Duration = Duration::from_secs(300);
+/// Maximum number of OAuth PKCE states retained at once. The /setup/login
+/// endpoint is intentionally public, so this hard cap bounds memory usage and
+/// keeps pruning work constant-time with respect to attacker traffic.
+const PKCE_MAX_PENDING: usize = 256;
 #[allow(clippy::duration_suboptimal_units)]
 const SESSION_TTL: Duration = Duration::from_secs(1800);
+/// Maximum number of setup sessions retained at once. Sessions are created on
+/// the OAuth callback (after a successful MAS authentication), so this cap is
+/// reachable only by authenticated users; 64 is ample for any real workload.
+const SESSIONS_MAX_PENDING: usize = 64;
+/// Maximum number of encrypted rooms for which key-backup downloads are
+/// attempted after a successful recovery. Caps background network + store work
+/// for users with a very large room list.
+const KEY_BACKUP_MAX_ROOMS: usize = 200;
+/// Per-room timeout for key-backup download so a single slow room cannot stall
+/// the whole backfill task.
+#[allow(clippy::duration_suboptimal_units)] // from_secs(15) is clearer than from_mins here
+const KEY_BACKUP_ROOM_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Shared state for the /setup handlers. Cheap to clone — Arc inside.
 #[derive(Clone)]
@@ -129,6 +146,15 @@ pub async fn index() -> impl IntoResponse {
 }
 
 pub async fn login(State(state): State<SetupState>) -> Response {
+    // Check config before allocating any PKCE state so misconfigured
+    // deployments don't leak entries into the bounded map.
+    let Some(creds) = state.config.introspection.as_ref() else {
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "matrix-mcp has no introspection credentials configured; /setup is unavailable.",
+        );
+    };
+
     let verifier = random_alnum(64);
     let challenge_bytes = Sha256::digest(verifier.as_bytes());
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge_bytes);
@@ -136,22 +162,25 @@ pub async fn login(State(state): State<SetupState>) -> Response {
 
     {
         let mut guard = state.pkce_states.write().await;
-        prune_expired_pkce(&mut guard);
-        guard.insert(
+        if !insert_pending_pkce(
+            &mut guard,
             state_token.clone(),
             PendingPkce {
                 verifier,
                 created_at: Instant::now(),
             },
-        );
+        ) {
+            warn!(
+                pending_pkce = guard.len(),
+                max_pending_pkce = PKCE_MAX_PENDING,
+                "rejecting setup login because pending PKCE state map is full"
+            );
+            return error_page(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many setup sign-in attempts are pending. Wait a few minutes and try again.",
+            );
+        }
     }
-
-    let Some(creds) = state.config.introspection.as_ref() else {
-        return error_page(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "matrix-mcp has no introspection credentials configured; /setup is unavailable.",
-        );
-    };
 
     let redirect_uri = format!("{}/setup/callback", state.config.resource_url);
     // MAS quirk: every OAuth endpoint is under `/oauth2/*` EXCEPT
@@ -220,15 +249,25 @@ pub async fn callback(
             let session_id = random_alnum(48);
             {
                 let mut guard = state.sessions.write().await;
-                prune_expired_sessions(&mut guard);
-                guard.insert(
+                if !insert_pending_session(
+                    &mut guard,
                     session_id.clone(),
                     SetupSession {
                         mxid: mxid.clone(),
                         access_token,
                         created_at: Instant::now(),
                     },
-                );
+                ) {
+                    warn!(
+                        pending_sessions = guard.len(),
+                        max_pending_sessions = SESSIONS_MAX_PENDING,
+                        "rejecting setup callback because session map is full"
+                    );
+                    return error_page(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Too many active setup sessions. Wait 30 minutes and try again.",
+                    );
+                }
             }
             let cookie = build_session_cookie(&session_id);
             debug!(mxid = %mxid, "setup session created");
@@ -335,36 +374,66 @@ pub async fn recover(
             // ask per room. Done in a spawned task so the user gets
             // the success page immediately — back-fill happens in the
             // background.
+            //
+            // Bounded to KEY_BACKUP_MAX_ROOMS rooms with a per-room
+            // timeout of KEY_BACKUP_ROOM_TIMEOUT to cap background
+            // network and store work even for users with a very large
+            // room list.
             let mxid_for_log = session.mxid.clone();
             let client_for_download = client.clone();
             tokio::spawn(async move {
-                let rooms = client_for_download.joined_rooms();
+                let all_rooms = client_for_download.joined_rooms();
+                let encrypted_rooms: Vec<_> = all_rooms
+                    .iter()
+                    .filter(|r| r.encryption_state().is_encrypted())
+                    .collect();
+
+                let total_encrypted = encrypted_rooms.len();
+                if total_encrypted > KEY_BACKUP_MAX_ROOMS {
+                    warn!(
+                        mxid = %mxid_for_log,
+                        total_encrypted_rooms = total_encrypted,
+                        cap = KEY_BACKUP_MAX_ROOMS,
+                        "capped key-backup download to {KEY_BACKUP_MAX_ROOMS} rooms; \
+                         user has {total_encrypted} encrypted rooms"
+                    );
+                }
+
                 let mut total = 0usize;
                 let mut succeeded = 0usize;
                 let mut failed = 0usize;
-                for room in &rooms {
-                    if !room.encryption_state().is_encrypted() {
-                        continue;
-                    }
+                for room in encrypted_rooms.iter().take(KEY_BACKUP_MAX_ROOMS) {
                     total += 1;
                     let room_id = room.room_id().to_owned();
-                    match client_for_download
-                        .encryption()
-                        .backups()
-                        .download_room_keys_for_room(&room_id)
-                        .await
-                    {
-                        Ok(()) => {
+                    let result = timeout(KEY_BACKUP_ROOM_TIMEOUT, async {
+                        client_for_download
+                            .encryption()
+                            .backups()
+                            .download_room_keys_for_room(&room_id)
+                            .await
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {
                             succeeded += 1;
                             debug!(mxid = %mxid_for_log, %room_id, "backed-up keys downloaded");
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             failed += 1;
                             warn!(
                                 mxid = %mxid_for_log,
                                 %room_id,
                                 error = %e,
                                 "failed to download room keys from backup"
+                            );
+                        }
+                        Err(_elapsed) => {
+                            failed += 1;
+                            warn!(
+                                mxid = %mxid_for_log,
+                                %room_id,
+                                timeout_secs = KEY_BACKUP_ROOM_TIMEOUT.as_secs(),
+                                "timed out downloading room keys from backup"
                             );
                         }
                     }
@@ -434,6 +503,46 @@ async fn current_session(state: &SetupState, jar: &CookieJar) -> Option<SetupSes
     let mut guard = state.sessions.write().await;
     prune_expired_sessions(&mut guard);
     guard.get(&session_id).cloned()
+}
+
+/// Insert a new pending PKCE entry, enforcing the hard cap.
+///
+/// Returns `true` on success. If the map is at or above `PKCE_MAX_PENDING`,
+/// expired entries are pruned first; if it's still full after pruning,
+/// the insert is rejected and `false` is returned.
+fn insert_pending_pkce(
+    map: &mut HashMap<String, PendingPkce>,
+    state_token: String,
+    pending: PendingPkce,
+) -> bool {
+    if map.len() >= PKCE_MAX_PENDING {
+        prune_expired_pkce(map);
+    }
+    if map.len() >= PKCE_MAX_PENDING {
+        return false;
+    }
+    map.insert(state_token, pending);
+    true
+}
+
+/// Insert a new pending session entry, enforcing the hard cap.
+///
+/// Returns `true` on success. If the map is at or above `SESSIONS_MAX_PENDING`,
+/// expired entries are pruned first; if it's still full after pruning,
+/// the insert is rejected and `false` is returned.
+fn insert_pending_session(
+    map: &mut HashMap<String, SetupSession>,
+    session_id: String,
+    session: SetupSession,
+) -> bool {
+    if map.len() >= SESSIONS_MAX_PENDING {
+        prune_expired_sessions(map);
+    }
+    if map.len() >= SESSIONS_MAX_PENDING {
+        return false;
+    }
+    map.insert(session_id, session);
+    true
 }
 
 fn prune_expired_pkce(map: &mut HashMap<String, PendingPkce>) {
@@ -624,9 +733,9 @@ device on the next sync (≤30 s). Head back to claude.ai and call
 <code>cross_signed: true</code>.</p>
 <p>Historical message decryption: matrix-mcp is now downloading your
 megolm session backup in the background — one request per encrypted
-room. For a busy account this can take a minute or two. Re-running
-<code>read_recent_messages</code> on the same room a minute later
-should show previously-undecryptable history as
+room, up to 200 rooms. For a busy account this can take a minute or
+two. Re-running <code>read_recent_messages</code> on the same room a
+minute later should show previously-undecryptable history as
 <code>status: decrypted</code>.</p>
 <p>You can close this tab.</p>
 </body></html>"#;
@@ -736,5 +845,151 @@ mod tests {
         let challenge_bytes = Sha256::digest(verifier.as_bytes());
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge_bytes);
         assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    // --- Fix A: PKCE map cap tests ---
+
+    #[test]
+    fn pkce_insert_rejects_when_cap_is_full() {
+        let mut map = HashMap::new();
+        // Fill to exactly the cap with fresh (non-expired) entries.
+        for i in 0..PKCE_MAX_PENDING {
+            assert!(
+                insert_pending_pkce(
+                    &mut map,
+                    format!("state-{i}"),
+                    PendingPkce {
+                        verifier: "x".into(),
+                        created_at: Instant::now(),
+                    },
+                ),
+                "insert #{i} should succeed"
+            );
+        }
+        assert_eq!(map.len(), PKCE_MAX_PENDING);
+
+        // One more must be rejected.
+        assert!(
+            !insert_pending_pkce(
+                &mut map,
+                "overflow".into(),
+                PendingPkce {
+                    verifier: "x".into(),
+                    created_at: Instant::now(),
+                },
+            ),
+            "insert beyond cap should return false"
+        );
+        assert_eq!(map.len(), PKCE_MAX_PENDING);
+        assert!(!map.contains_key("overflow"));
+    }
+
+    #[test]
+    fn pkce_insert_prunes_expired_entries_before_enforcing_cap() {
+        let expired_at = Instant::now()
+            .checked_sub(PKCE_TTL + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let mut map = HashMap::new();
+        // Fill with entries that are all past the TTL.
+        for i in 0..PKCE_MAX_PENDING {
+            map.insert(
+                format!("stale-{i}"),
+                PendingPkce {
+                    verifier: "x".into(),
+                    created_at: expired_at,
+                },
+            );
+        }
+        assert_eq!(map.len(), PKCE_MAX_PENDING);
+
+        // A fresh insert should succeed: prune clears all stale entries first.
+        assert!(
+            insert_pending_pkce(
+                &mut map,
+                "fresh".into(),
+                PendingPkce {
+                    verifier: "x".into(),
+                    created_at: Instant::now(),
+                },
+            ),
+            "insert should succeed after pruning expired entries"
+        );
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("fresh"));
+    }
+
+    // --- Fix A: sessions map cap tests ---
+
+    #[test]
+    fn session_insert_rejects_when_cap_is_full() {
+        let mut map = HashMap::new();
+        // Fill to exactly the cap with fresh sessions.
+        for i in 0..SESSIONS_MAX_PENDING {
+            assert!(
+                insert_pending_session(
+                    &mut map,
+                    format!("sid-{i}"),
+                    SetupSession {
+                        mxid: format!("@user{i}:example.com"),
+                        access_token: "tok".into(),
+                        created_at: Instant::now(),
+                    },
+                ),
+                "session insert #{i} should succeed"
+            );
+        }
+        assert_eq!(map.len(), SESSIONS_MAX_PENDING);
+
+        // One more must be rejected.
+        assert!(
+            !insert_pending_session(
+                &mut map,
+                "overflow".into(),
+                SetupSession {
+                    mxid: "@overflow:example.com".into(),
+                    access_token: "tok".into(),
+                    created_at: Instant::now(),
+                },
+            ),
+            "session insert beyond cap should return false"
+        );
+        assert_eq!(map.len(), SESSIONS_MAX_PENDING);
+        assert!(!map.contains_key("overflow"));
+    }
+
+    #[test]
+    fn session_insert_prunes_expired_entries_before_enforcing_cap() {
+        let expired_at = Instant::now()
+            .checked_sub(SESSION_TTL + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let mut map = HashMap::new();
+        // Fill with entries that are all past the TTL.
+        for i in 0..SESSIONS_MAX_PENDING {
+            map.insert(
+                format!("stale-{i}"),
+                SetupSession {
+                    mxid: format!("@stale{i}:example.com"),
+                    access_token: "tok".into(),
+                    created_at: expired_at,
+                },
+            );
+        }
+        assert_eq!(map.len(), SESSIONS_MAX_PENDING);
+
+        // A fresh insert should succeed: prune clears all stale entries first.
+        assert!(
+            insert_pending_session(
+                &mut map,
+                "fresh".into(),
+                SetupSession {
+                    mxid: "@fresh:example.com".into(),
+                    access_token: "tok".into(),
+                    created_at: Instant::now(),
+                },
+            ),
+            "session insert should succeed after pruning expired entries"
+        );
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("fresh"));
     }
 }
