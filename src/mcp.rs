@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::audit::{self, outcome};
+use crate::audit_room;
 use crate::auth::AccessToken;
 use crate::mas::AuthenticatedIdentity;
 use crate::matrix_client::MatrixClientCache;
@@ -492,6 +493,19 @@ pub struct InviteUserResult {
     pub mxid: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetAuditRoomParams {
+    /// Canonical Matrix room id (`!room:server`) to receive audit notices.
+    /// You must already be joined to this room.
+    pub room_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SetAuditRoomResult {
+    /// The room id that was stored as the audit destination.
+    pub room_id: String,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct VerifyStatusResult {
     /// True if this matrix-mcp device has been cross-signed by the
@@ -779,6 +793,14 @@ impl MatrixMcpService {
             None,
             &result,
         );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "send_text_message",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
         result
     }
 
@@ -1194,6 +1216,14 @@ impl MatrixMcpService {
             None,
             &result,
         );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "mark_read",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
         result
     }
 
@@ -1247,6 +1277,14 @@ impl MatrixMcpService {
             None,
             &result,
         );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "send_reaction",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
         result
     }
 
@@ -1298,6 +1336,14 @@ impl MatrixMcpService {
             None,
             &result,
         );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "redact_message",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
         result
     }
 
@@ -1631,6 +1677,14 @@ impl MatrixMcpService {
             None,
             &result,
         );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "send_image_from_url",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
         result
     }
 
@@ -1794,6 +1848,14 @@ impl MatrixMcpService {
             None,
             &result,
         );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "join_room",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
         result
     }
 
@@ -1834,6 +1896,14 @@ impl MatrixMcpService {
             None,
             &result,
         );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "leave_room",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
         result
     }
 
@@ -1878,6 +1948,72 @@ impl MatrixMcpService {
             None,
             &result,
         );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "invite_user",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
+
+    /// Designate the audit room for self-audit `m.notice` events.
+    ///
+    /// Every subsequent write tool call will send a short `m.notice` event into
+    /// this room summarising the tool name, target room, and outcome.
+    ///
+    /// The room id is stored in your Matrix global account data under
+    /// the custom key `m.audit_room` so it persists across sessions.
+    ///
+    /// **Opt-in only** — no notices are emitted until you call this tool.
+    #[tool(description = "Set the audit room for self-audit m.notice events. \
+                          After this call every write tool emits a short notice \
+                          (tool name + target room + outcome) into the audit room. \
+                          Stored in your Matrix account data; persists across sessions.")]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn set_audit_room(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetAuditRoomParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: matrix_sdk::ruma::OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let _room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            audit_room::set_audit_room(&client, room_id.as_ref())
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("set_audit_room: {e}"), None))?;
+            structured_result(&SetAuditRoomResult {
+                room_id: room_id.to_string(),
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "set_audit_room",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "set_audit_room",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
         result
     }
 }
@@ -2035,6 +2171,45 @@ pub fn identity_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<Authenticat
 pub fn token_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<AccessToken> {
     let parts = ctx.extensions.get::<http::request::Parts>()?;
     parts.extensions.get::<AccessToken>().cloned()
+}
+
+/// Fire-and-forget: send an `m.notice` audit event into the user's
+/// designated audit room (if any). Spawns a background task so failures
+/// cannot block the actual tool response.
+///
+/// Skips the notice when the result is a rate-limit denial (the write
+/// never actually executed).
+async fn emit_write_notice(
+    result: &Result<rmcp::model::CallToolResult, ErrorData>,
+    clients: &MatrixClientCache,
+    ctx: &RequestContext<RoleServer>,
+    tool: &'static str,
+    room_id: Option<&str>,
+) {
+    if let Err(e) = result
+        && e.code.0 == audit::RATE_LIMITED_CODE
+    {
+        return;
+    }
+    let Some(id) = identity_from_ctx(ctx) else {
+        return;
+    };
+    let Some(token) = token_from_ctx(ctx) else {
+        return;
+    };
+    let Ok(client) = clients.for_user(&id, &token.0).await else {
+        return;
+    };
+    let outcome_str = if result.is_ok() {
+        outcome::OK
+    } else {
+        outcome::ERROR
+    };
+    let target = room_id.map(str::to_owned);
+    let client_inner: matrix_sdk::Client = (*client).clone();
+    tokio::spawn(async move {
+        audit_room::emit_notice(client_inner, tool, target, outcome_str).await;
+    });
 }
 
 /// Audit-log a finished tool call. Looks at the result to decide the
