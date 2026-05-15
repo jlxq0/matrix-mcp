@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, info_span, warn};
 
 /// Maximum age of a cached introspection result. Bounded so revocations
 /// propagate in at most this window even if a token's own `exp` is later.
@@ -174,22 +174,45 @@ impl MasIntrospectionClient {
             return Ok(Some(hit));
         }
 
+        // Build a span for the MAS round-trip. Attributes are envelope-only:
+        // only the outcome and latency; never the token itself (only its hash).
+        let token_hash_prefix = {
+            let h = key;
+            format!("{:02x}{:02x}{:02x}{:02x}", h[0], h[1], h[2], h[3])
+        };
+        let span = info_span!(
+            "mas.introspect",
+            token_hash = %token_hash_prefix,
+            outcome = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+        );
+        let started = std::time::Instant::now();
+
         // `X-MAS-Supports-Device-Id: 1` opts into MAS's separate `device_id`
         // field in the introspection response. Without it, MAS embeds the
         // device id back into the `scope` string as a
         // `urn:matrix:org.matrix.msc2967.client:device:<id>` token and
         // leaves `device_id` unset. The header is a documented MAS
         // extension and is what Synapse-as-introspector sends too.
-        let response = self
-            .http
-            .post(&self.introspection_url)
-            .basic_auth(&self.client_id, Some(&self.client_secret))
-            .header("X-MAS-Supports-Device-Id", "1")
-            .form(&[("token", token)])
-            .send()
-            .await?;
+        let response = async {
+            self.http
+                .post(&self.introspection_url)
+                .basic_auth(&self.client_id, Some(&self.client_secret))
+                .header("X-MAS-Supports-Device-Id", "1")
+                .form(&[("token", token)])
+                .send()
+                .await
+        }
+        .instrument(span.clone())
+        .await?;
+
+        span.record(
+            "latency_ms",
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
 
         if !response.status().is_success() {
+            span.record("outcome", "upstream_error");
             return Err(IntrospectionError::Upstream {
                 status: response.status().as_u16(),
             });
@@ -198,6 +221,7 @@ impl MasIntrospectionClient {
         let body: IntrospectionResponse = response.json().await?;
 
         if !body.active {
+            span.record("outcome", "inactive");
             return Ok(None);
         }
         // RFC 8707 resource indicator validation: when `aud` is present,
@@ -241,6 +265,7 @@ impl MasIntrospectionClient {
         // scope content to avoid leaking capability details.
         if !has_matrix_scope(body.scope.as_deref()) {
             warn!("MAS token missing required Matrix C-S API scope; rejecting");
+            span.record("outcome", "no_matrix_scope");
             return Ok(None);
         }
 
@@ -290,6 +315,7 @@ impl MasIntrospectionClient {
 
         self.cache_insert(key, &identity, body.exp);
 
+        span.record("outcome", "ok");
         Ok(Some(identity))
     }
 

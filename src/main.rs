@@ -23,6 +23,7 @@ mod oauth_metadata;
 mod rate_limit;
 mod session;
 mod setup;
+mod telemetry;
 
 use std::sync::Arc;
 
@@ -212,8 +213,14 @@ fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("matrix_mcp=info,tower_http=info,axum=info,info"));
 
+    // Optional OTLP layer — present only when OTEL_EXPORTER_OTLP_ENDPOINT is
+    // set. Returns None in local dev / CI so there is no behaviour change.
+    let otel_layer = telemetry::try_build_otel_layer();
+
     let json_layer = std::env::var("MATRIX_MCP_LOG_FORMAT").as_deref() == Ok("json");
-    let registry = tracing_subscriber::registry().with(env_filter);
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(otel_layer);
     if json_layer {
         registry.with(fmt::layer().json()).init();
     } else {

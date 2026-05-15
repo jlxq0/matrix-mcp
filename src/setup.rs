@@ -73,7 +73,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, info_span, warn};
 
 use crate::audit::{self, SetupExtras, outcome};
 use crate::config::Config;
@@ -159,6 +159,11 @@ pub async fn index() -> impl IntoResponse {
 }
 
 pub async fn login(State(state): State<SetupState>) -> Response {
+    let span = info_span!(
+        "setup.step",
+        step = "login",
+        outcome = tracing::field::Empty
+    );
     // Check config before allocating any PKCE state so misconfigured
     // deployments don't leak entries into the bounded map.
     let Some(creds) = state.config.introspection.as_ref() else {
@@ -215,6 +220,7 @@ pub async fn login(State(state): State<SetupState>) -> Response {
         state_tok = url_encode(&state_token),
     );
 
+    span.record("outcome", "ok");
     Redirect::temporary(&authorize_url).into_response()
 }
 
@@ -231,6 +237,12 @@ pub async fn callback(
     Query(params): Query<CallbackParams>,
     jar: CookieJar,
 ) -> Response {
+    let span = info_span!(
+        "setup.step",
+        step = "callback",
+        mxid = tracing::field::Empty,
+        outcome = tracing::field::Empty
+    );
     if let Some(err) = &params.error {
         let desc = params.error_description.as_deref().unwrap_or("");
         return error_page(
@@ -289,6 +301,8 @@ pub async fn callback(
             }
             let cookie = build_session_cookie(&session_id);
             debug!(mxid = %mxid, "setup session created");
+            span.record("mxid", mxid.as_str());
+            span.record("outcome", "ok");
             audit::setup_event(
                 "setup_callback",
                 Some(&mxid),
@@ -299,6 +313,7 @@ pub async fn callback(
         }
         Err(e) => {
             warn!(error = %e, "setup token exchange failed");
+            span.record("outcome", "error");
             audit::setup_event(
                 "setup_callback",
                 None,
@@ -344,6 +359,13 @@ pub async fn recover(
         return Redirect::to("/setup").into_response();
     };
 
+    let span = info_span!(
+        "setup.step",
+        step = "recover",
+        mxid = %session.mxid,
+        outcome = tracing::field::Empty,
+    );
+
     // CSRF check: compare the submitted token against the session-bound
     // token in constant time to avoid timing side-channels.
     let token_matches = session
@@ -354,6 +376,7 @@ pub async fn recover(
         == 1;
     if !token_matches {
         warn!(mxid = %session.mxid, "setup_recover: CSRF token mismatch");
+        span.record("outcome", "denied");
         audit::setup_event(
             "setup_recover",
             Some(&session.mxid),
@@ -371,6 +394,7 @@ pub async fn recover(
 
     let key = form.recovery_key.trim().to_owned();
     if key.is_empty() {
+        span.record("outcome", "error");
         return error_page(
             StatusCode::BAD_REQUEST,
             "Recovery key was empty. Paste it from your password manager and try again.",
@@ -399,6 +423,7 @@ pub async fn recover(
 
     match client.encryption().recovery().recover(&key).await {
         Ok(()) => {
+            span.record("outcome", "ok");
             audit::setup_event(
                 "setup_recover",
                 Some(&session.mxid),
@@ -424,86 +449,98 @@ pub async fn recover(
             // room list.
             let mxid_for_log = session.mxid.clone();
             let client_for_download = client.clone();
-            tokio::spawn(async move {
-                let all_rooms = client_for_download.joined_rooms();
-                let encrypted_rooms: Vec<_> = all_rooms
-                    .iter()
-                    .filter(|r| r.encryption_state().is_encrypted())
-                    .collect();
+            let download_span = info_span!(
+                "setup.step",
+                step = "key_backup_download",
+                mxid = %mxid_for_log,
+                outcome = tracing::field::Empty,
+            );
+            let download_span_for_record = download_span.clone();
+            tokio::spawn(
+                async move {
+                    let all_rooms = client_for_download.joined_rooms();
+                    let encrypted_rooms: Vec<_> = all_rooms
+                        .iter()
+                        .filter(|r| r.encryption_state().is_encrypted())
+                        .collect();
 
-                let total_encrypted = encrypted_rooms.len();
-                if total_encrypted > KEY_BACKUP_MAX_ROOMS {
-                    warn!(
-                        mxid = %mxid_for_log,
-                        total_encrypted_rooms = total_encrypted,
-                        cap = KEY_BACKUP_MAX_ROOMS,
-                        "capped key-backup download to {KEY_BACKUP_MAX_ROOMS} rooms; \
-                         user has {total_encrypted} encrypted rooms"
-                    );
-                }
+                    let total_encrypted = encrypted_rooms.len();
+                    if total_encrypted > KEY_BACKUP_MAX_ROOMS {
+                        warn!(
+                            mxid = %mxid_for_log,
+                            total_encrypted_rooms = total_encrypted,
+                            cap = KEY_BACKUP_MAX_ROOMS,
+                            "capped key-backup download to {KEY_BACKUP_MAX_ROOMS} rooms; \
+                             user has {total_encrypted} encrypted rooms"
+                        );
+                    }
 
-                let mut total = 0usize;
-                let mut succeeded = 0usize;
-                let mut failed = 0usize;
-                for room in encrypted_rooms.iter().take(KEY_BACKUP_MAX_ROOMS) {
-                    total += 1;
-                    let room_id = room.room_id().to_owned();
-                    let result = timeout(KEY_BACKUP_ROOM_TIMEOUT, async {
-                        client_for_download
-                            .encryption()
-                            .backups()
-                            .download_room_keys_for_room(&room_id)
-                            .await
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(())) => {
-                            succeeded += 1;
-                            debug!(mxid = %mxid_for_log, %room_id, "backed-up keys downloaded");
-                        }
-                        Ok(Err(e)) => {
-                            failed += 1;
-                            warn!(
-                                mxid = %mxid_for_log,
-                                %room_id,
-                                error = %e,
-                                "failed to download room keys from backup"
-                            );
-                        }
-                        Err(_elapsed) => {
-                            failed += 1;
-                            warn!(
-                                mxid = %mxid_for_log,
-                                %room_id,
-                                timeout_secs = KEY_BACKUP_ROOM_TIMEOUT.as_secs(),
-                                "timed out downloading room keys from backup"
-                            );
+                    let mut total = 0usize;
+                    let mut succeeded = 0usize;
+                    let mut failed = 0usize;
+                    for room in encrypted_rooms.iter().take(KEY_BACKUP_MAX_ROOMS) {
+                        total += 1;
+                        let room_id = room.room_id().to_owned();
+                        let result = timeout(KEY_BACKUP_ROOM_TIMEOUT, async {
+                            client_for_download
+                                .encryption()
+                                .backups()
+                                .download_room_keys_for_room(&room_id)
+                                .await
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(())) => {
+                                succeeded += 1;
+                                debug!(mxid = %mxid_for_log, %room_id, "backed-up keys downloaded");
+                            }
+                            Ok(Err(e)) => {
+                                failed += 1;
+                                warn!(
+                                    mxid = %mxid_for_log,
+                                    %room_id,
+                                    error = %e,
+                                    "failed to download room keys from backup"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                failed += 1;
+                                warn!(
+                                    mxid = %mxid_for_log,
+                                    %room_id,
+                                    timeout_secs = KEY_BACKUP_ROOM_TIMEOUT.as_secs(),
+                                    "timed out downloading room keys from backup"
+                                );
+                            }
                         }
                     }
-                }
-                tracing::info!(
-                    mxid = %mxid_for_log,
-                    total_encrypted_rooms = total,
-                    succeeded,
-                    failed,
-                    "key-backup history download complete"
-                );
-                audit::setup_event(
-                    "setup_history_download",
-                    Some(&mxid_for_log),
-                    if failed == 0 {
+                    let dl_outcome = if failed == 0 {
                         outcome::OK
                     } else {
                         outcome::ERROR
-                    },
-                    SetupExtras {
-                        rooms_total: Some(total),
-                        rooms_succeeded: Some(succeeded),
-                        rooms_failed: Some(failed),
-                        error_class: None,
-                    },
-                );
-            });
+                    };
+                    download_span_for_record.record("outcome", dl_outcome);
+                    tracing::info!(
+                        mxid = %mxid_for_log,
+                        total_encrypted_rooms = total,
+                        succeeded,
+                        failed,
+                        "key-backup history download complete"
+                    );
+                    audit::setup_event(
+                        "setup_history_download",
+                        Some(&mxid_for_log),
+                        dl_outcome,
+                        SetupExtras {
+                            rooms_total: Some(total),
+                            rooms_succeeded: Some(succeeded),
+                            rooms_failed: Some(failed),
+                            error_class: None,
+                        },
+                    );
+                }
+                .instrument(download_span),
+            );
 
             // Invalidate the session cookie so reload doesn't replay.
             {
@@ -522,6 +559,7 @@ pub async fn recover(
         }
         Err(e) => {
             warn!(mxid = %session.mxid, error = %e, "recovery import failed");
+            span.record("outcome", "error");
             audit::setup_event(
                 "setup_recover",
                 Some(&session.mxid),

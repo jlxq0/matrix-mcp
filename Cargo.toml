@@ -38,6 +38,15 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry tracing export (Phase 5.5). Wired via `tracing-opentelemetry`
+# as an additional Layer in `init_tracing()`. Active only when
+# `OTEL_EXPORTER_OTLP_ENDPOINT` is set — no-op / zero overhead otherwise.
+# NOTE: tracing-opentelemetry 0.32 requires opentelemetry 0.31 (off-by-one
+# version skew in the crate ecosystem — do not bump independently).
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
