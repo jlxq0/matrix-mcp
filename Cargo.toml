@@ -93,6 +93,10 @@ hkdf = "0.12"
 # Hex-encoding the SHA-256 of the mxid for the on-disk store directory
 # name (avoid putting raw `@user:host` chars on the filesystem).
 hex = "0.4"
+# MIME type parsing for upload content-type validation. `mime` is already
+# a transitive dep (reqwest + matrix-sdk pull it in), so this just makes
+# the dependency explicit and keeps the import path stable.
+mime = "0.3"
 
 [dev-dependencies]
 # Mock HTTP server for MAS introspection tests. Used by `cargo test` only;

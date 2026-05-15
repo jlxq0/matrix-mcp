@@ -138,6 +138,7 @@ fn build_router(
     // (for dev), 127.0.0.1 / ::1, plus the host of our resource_url
     // (production public hostname).
     let resource_host = parse_host(&cfg.resource_url);
+    let upload_max_bytes = cfg.upload_max_bytes;
     let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
     if let Some(h) = resource_host {
         allowed_hosts.push(h);
@@ -151,6 +152,7 @@ fn build_router(
                 clients.clone(),
                 Arc::clone(&limiter),
                 download_max_bytes,
+                upload_max_bytes,
             ))
         },
         Arc::new(session::CappedSessionManager::new()),
