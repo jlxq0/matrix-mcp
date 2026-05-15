@@ -18,10 +18,10 @@ underneath is correct.
 
 ## Phase 5 — observability foundation
 
-- [ ] 5.1 Tool-call audit log: envelope-only structured JSON to stdout.
+- [x] 5.1 Tool-call audit log: envelope-only structured JSON to stdout.
       Fields: ts, request_id, mxid, tool, room_id, outcome, latency_ms,
       error_class. **Never** message body, recovery key, bearer, room
-      content. Alloy ships to Loki.
+      content. Alloy ships to Loki. <!-- completed 2026-05-15 -->
 - [ ] 5.2 Prometheus `/metrics` endpoint on a separate port; never
       label by mxid/room_id/token. Counters: tool_calls_total{tool,
       outcome}; histograms: tool_latency_seconds{tool},
