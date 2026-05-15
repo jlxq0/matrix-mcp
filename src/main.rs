@@ -59,10 +59,14 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     info!(%bind_addr, "matrix-mcp listening (public)");
 
-    // Internal-only metrics listener. Distinct port so the public
-    // Service can omit it; Alloy scrapes via the pod IP. No auth on
-    // this listener — exposure is controlled by NetworkPolicy +
-    // the Service not exposing the port.
+    // Internal-only metrics listener. Distinct port so the public Service
+    // can omit it; Alloy scrapes via the pod IP using the
+    // `prometheus.io/scrape` annotation. Bound to the pod IP via the K8s
+    // downward API (POD_IP env var) so even without NetworkPolicy the
+    // listener isn't broadly reachable from sibling pods — defence in depth
+    // rather than relying solely on Service/NetworkPolicy configuration.
+    // Falls back to 127.0.0.1 in local dev (no K8s). No auth on this
+    // listener — adding auth would require Alloy reconfiguration.
     let metrics_listener = TcpListener::bind(metrics_bind_addr).await?;
     info!(%metrics_bind_addr, "matrix-mcp metrics listening (internal)");
     let metrics_app = Router::new().route("/metrics", get(metrics::metrics_handler));
