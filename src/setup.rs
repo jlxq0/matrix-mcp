@@ -418,6 +418,17 @@ pub async fn recover(
         device_id,
         raw_scope: None,
     };
+    // Evict any existing cached client for this identity before
+    // building a fresh one. /setup is the rare case where the same
+    // (mas_subject, device_id) pair can present a brand-new access
+    // token (the user re-authed via /setup/login). The cache is keyed
+    // by identity, not by token, so without this eviction a stale
+    // client tied to a now-revoked token gets returned to the recovery
+    // flow, and every Matrix call 401s. Cheap: /setup is invoked
+    // once-per-rare-event.
+    if let Err(e) = state.clients.evict(&identity).await {
+        warn!(error = %e, "failed to evict cached client before /setup/recover");
+    }
     let client = match state
         .clients
         .for_user(&identity, &session.access_token)
@@ -441,22 +452,18 @@ pub async fn recover(
                 outcome::OK,
                 SetupExtras::default(),
             );
-            // After importing the private cross-signing keys via
-            // `recover()`, matrix-sdk does NOT automatically upload a
-            // signature for this device — we have to ask. When the
-            // matrix-mcp device's ed25519 key has changed (e.g. after
-            // a store reset post audit #1), the previously-uploaded
-            // signature no longer covers the new key, so verify_status
-            // keeps reporting cross_signed=false until we push a fresh
-            // one. `bootstrap_cross_signing(None)` is the SDK's
-            // idempotent helper: if private keys are missing it
-            // creates+uploads them; if private keys are present it
-            // signs this device and uploads the signature.
-            if let Err(e) = client.encryption().bootstrap_cross_signing(None).await {
-                warn!(error = %e, "bootstrap_cross_signing after recover failed; \
-                                   device may remain unsigned until the next sync");
-            }
-            // Then force a /keys/query so the local user-identity cache
+            // matrix-sdk's `recovery().recover()` already signs this
+            // device via `/keys/signatures/upload` as part of its
+            // import flow — see the SDK log line "Successfully signed
+            // our own device, the device is now verified". An earlier
+            // version of this code also called
+            // `bootstrap_cross_signing(None)` here, but that uploads
+            // *new* cross-signing public keys via the UIAA-protected
+            // `/keys/device_signing/upload` endpoint, which 401s when
+            // private keys are already imported. The redundant call
+            // was harmless (recover already signed) but noisy. Removed.
+            //
+            // Force a /keys/query so the local user-identity cache
             // reflects the freshly-uploaded signature for the next
             // verify_status call.
             if let Some(me) = client.user_id() {
