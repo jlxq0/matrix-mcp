@@ -112,39 +112,24 @@ impl MatrixClientCache {
         identity: &AuthenticatedIdentity,
         access_token: &str,
     ) -> Result<Arc<Client>> {
-        // Fast path: already cached. Bind the read guard tightly so it
-        // drops before any await — clippy::significant_drop_tightening.
+        // Fast path: already cached.
         {
             let guard = self.inner.read().await;
-            let owner_key = owner_key(identity)?;
-            if let Some(cached) = guard.get(&owner_key) {
+            if let Some(cached) = guard.get(&identity.mxid) {
                 return Ok(cached.client.clone());
             }
         }
 
-        // Slow path: take the write lock *before* building so that concurrent
-        // first callers for the same owner queue up here rather than all racing
-        // through build_cached. The second (and later) callers will hit the
-        // re-check below and return the already-built client without spawning
-        // a redundant sync task.
-        //
-        // Build time is bounded by the SQLite open + one SDK network round-trip
-        // (session restoration). Holding the write lock across that await is
-        // acceptable — first-use happens at most once per user per process
-        // lifetime, and concurrent callers for *different* owners are also
-        // serialized here, which is fine given the same frequency.
-        let owner_key = owner_key(identity)?;
+        // Slow path: take the write lock before building so concurrent
+        // first callers for the same mxid queue here and don't both spawn
+        // a sync task.
         let mut guard = self.inner.write().await;
-        if let Some(existing) = guard.get(&owner_key) {
-            // A concurrent caller already built the client while we waited for
-            // the write lock. Return the canonical entry.
+        if let Some(existing) = guard.get(&identity.mxid) {
             return Ok(existing.client.clone());
         }
-        let cached = self
-            .build_cached(identity, access_token, &owner_key)
-            .await?;
+        let cached = self.build_cached(identity, access_token).await?;
         let client = cached.client.clone();
-        guard.insert(owner_key, Arc::new(cached));
+        guard.insert(identity.mxid.clone(), Arc::new(cached));
         drop(guard);
         Ok(client)
     }
@@ -153,7 +138,6 @@ impl MatrixClientCache {
         &self,
         identity: &AuthenticatedIdentity,
         access_token: &str,
-        owner_key: &str,
     ) -> Result<CachedClient> {
         let user_id = UserId::parse(&identity.mxid)
             .with_context(|| format!("parse mxid: {}", identity.mxid))?;
@@ -165,12 +149,20 @@ impl MatrixClientCache {
                 anyhow::anyhow!("OAuth token has no device_id; refusing to build E2EE client")
             })?;
 
-        let store_path = self.user_store_dir(owner_key);
+        // Cache + store are keyed by MXID. Audit #1 changed this briefly to
+        // include MAS subject + device id; the change had the unintended
+        // side effect of giving every store-key change a fresh OlmMachine,
+        // which generated new ed25519 keys for the same device_id and
+        // tripped Synapse's "SigningKeyChanged" rejection. For our
+        // single-tenant example.com deployment the original mxid-only
+        // keying is the right trade: the multi-user-rename attack is purely
+        // theoretical here and not worth losing recovery for.
+        let store_path = self.user_store_dir(&user_id);
         tokio::fs::create_dir_all(&store_path)
             .await
             .with_context(|| format!("create store dir {}", store_path.display()))?;
 
-        let passphrase = derive_store_passphrase(&self.store.pepper, owner_key);
+        let passphrase = derive_store_passphrase(&self.store.pepper, &identity.mxid);
         let passphrase_fp = passphrase_fingerprint(&passphrase);
 
         info!(
@@ -222,42 +214,27 @@ impl MatrixClientCache {
         })
     }
 
-    fn user_store_dir(&self, owner_key: &str) -> PathBuf {
-        self.store.root.join(owner_dir_name(owner_key))
+    fn user_store_dir(&self, user_id: &UserId) -> PathBuf {
+        self.store.root.join(mxid_dir_name(user_id.as_str()))
     }
 
-    /// Drop the cached client for this identity, if any.
+    /// Drop the cached client for this mxid, if any.
     ///
     /// The dropped `CachedClient`'s `Drop` impl aborts its background
-    /// sync task. The next `for_user` call for the same `owner_key`
-    /// builds a fresh client + spawns a fresh sync. Used by the
-    /// `/setup` flow so a recovery dance with a freshly-issued OAuth
-    /// token doesn't get a stale client (whose `access_token` may
-    /// have been revoked when the user re-authed).
-    pub async fn evict(&self, identity: &AuthenticatedIdentity) -> Result<()> {
-        let key = owner_key(identity)?;
+    /// sync task. The next `for_user` call for the same mxid builds a
+    /// fresh client + spawns a fresh sync. Used by the `/setup` flow
+    /// so a recovery dance with a freshly-issued OAuth token doesn't
+    /// get a stale client (whose `access_token` may have been revoked
+    /// when the user re-authed).
+    pub async fn evict(&self, identity: &AuthenticatedIdentity) {
         let removed = {
             let mut guard = self.inner.write().await;
-            guard.remove(&key).is_some()
+            guard.remove(&identity.mxid).is_some()
         };
         if removed {
             debug!(mxid = %identity.mxid, "evicted cached matrix-sdk client");
         }
-        Ok(())
     }
-}
-
-/// Compose the resource-server ownership key from MAS's non-reassignable
-/// subject and the Matrix device id. The device id is included because the
-/// `matrix-sdk` `SQLite` crypto store is for one restored Matrix device.
-fn owner_key(identity: &AuthenticatedIdentity) -> Result<String> {
-    let device_id = identity.device_id.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("OAuth token has no device_id; refusing to build E2EE client")
-    })?;
-    Ok(format!(
-        "mas-sub:{} device:{device_id}",
-        identity.mas_subject
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -342,11 +319,11 @@ async fn sync_watchdog(weak: std::sync::Weak<Client>, mxid: String) {
     }
 }
 
-/// SHA-256 the owner key, hex-encode, take the first 32 chars. Stable and
+/// SHA-256 the mxid, hex-encode, take the first 32 chars. Stable and
 /// filesystem-safe.
-fn owner_dir_name(owner_key: &str) -> String {
+fn mxid_dir_name(mxid: &str) -> String {
     let mut h = Sha256::new();
-    h.update(owner_key.as_bytes());
+    h.update(mxid.as_bytes());
     let digest = h.finalize();
     hex::encode(&digest[..16]) // 16 bytes = 32 hex chars
 }
@@ -357,8 +334,8 @@ fn owner_dir_name(owner_key: &str) -> String {
 /// because the SDK's `passphrase` takes `&str`; using hex keeps the
 /// `&str` invariant clean (no embedded NUL / surrogate concerns) while
 /// preserving full 256-bit entropy.
-fn derive_store_passphrase(pepper: &str, owner_key: &str) -> String {
-    let hkdf = Hkdf::<Sha256>::new(Some(owner_key.as_bytes()), pepper.as_bytes());
+fn derive_store_passphrase(pepper: &str, mxid: &str) -> String {
+    let hkdf = Hkdf::<Sha256>::new(Some(mxid.as_bytes()), pepper.as_bytes());
     let mut okm = [0u8; 32];
     // HKDF-SHA256 OKM length up to 8160 bytes is infallible; 32 always
     // succeeds. Unwrap is justified — the only error is OOM-shaped.
@@ -382,9 +359,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn owner_dir_name_is_stable() {
-        let a = owner_dir_name("mas-sub:01JA device:DEVICE");
-        let b = owner_dir_name("mas-sub:01JA device:DEVICE");
+    fn mxid_dir_name_is_stable() {
+        let a = mxid_dir_name("@alice:example.com");
+        let b = mxid_dir_name("@alice:example.com");
         assert_eq!(a, b);
         assert_eq!(a.len(), 32, "expected 16 bytes hex-encoded");
         // The whole point: no `@` or `:` in the path component.
@@ -393,51 +370,34 @@ mod tests {
     }
 
     #[test]
-    fn owner_dir_name_differs_per_subject() {
-        let a = owner_dir_name("mas-sub:01JA device:DEVICE");
-        let b = owner_dir_name("mas-sub:01JB device:DEVICE");
+    fn mxid_dir_name_differs_per_user() {
+        let a = mxid_dir_name("@alice:example.com");
+        let b = mxid_dir_name("@other:example.com");
         assert_ne!(a, b);
     }
 
     #[test]
-    fn owner_key_ignores_reassignable_mxid() {
-        let first = AuthenticatedIdentity {
-            mas_subject: "01JA".to_owned(),
-            mxid: "@alice:example.test".to_owned(),
-            device_id: Some("DEVICE".to_owned()),
-            raw_scope: None,
-        };
-        let second = AuthenticatedIdentity {
-            mas_subject: "01JB".to_owned(),
-            mxid: "@alice:example.test".to_owned(),
-            device_id: Some("DEVICE".to_owned()),
-            raw_scope: None,
-        };
-        assert_ne!(owner_key(&first).unwrap(), owner_key(&second).unwrap());
-    }
-
-    #[test]
-    fn passphrase_is_deterministic_per_owner() {
+    fn passphrase_is_deterministic_per_mxid() {
         let pepper = "deadbeef".repeat(8); // 64 chars
-        let a = derive_store_passphrase(&pepper, "mas-sub:01JA device:DEVICE");
-        let b = derive_store_passphrase(&pepper, "mas-sub:01JA device:DEVICE");
+        let a = derive_store_passphrase(&pepper, "@alice:example.com");
+        let b = derive_store_passphrase(&pepper, "@alice:example.com");
         assert_eq!(a, b);
         // 32-byte OKM hex-encoded = 64 chars.
         assert_eq!(a.len(), 64);
     }
 
     #[test]
-    fn passphrase_differs_per_owner() {
+    fn passphrase_differs_per_mxid() {
         let pepper = "deadbeef".repeat(8);
-        let a = derive_store_passphrase(&pepper, "mas-sub:01JA device:DEVICE");
-        let b = derive_store_passphrase(&pepper, "mas-sub:01JB device:DEVICE");
+        let a = derive_store_passphrase(&pepper, "@a:example.com");
+        let b = derive_store_passphrase(&pepper, "@b:example.com");
         assert_ne!(a, b);
     }
 
     #[test]
     fn passphrase_differs_per_pepper() {
-        let a = derive_store_passphrase(&"a".repeat(64), "mas-sub:01JA device:DEVICE");
-        let b = derive_store_passphrase(&"b".repeat(64), "mas-sub:01JA device:DEVICE");
+        let a = derive_store_passphrase(&"a".repeat(64), "@alice:example.com");
+        let b = derive_store_passphrase(&"b".repeat(64), "@alice:example.com");
         assert_ne!(a, b);
     }
 
