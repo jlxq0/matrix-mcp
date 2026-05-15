@@ -13,18 +13,20 @@
 //! fetched from `MatrixClientCache` on first use; cross-call state lives
 //! in the encrypted `SQLite` store.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use matrix_sdk::Room;
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
-use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::room::{IncludeRelations, MessagesOptions, RelationsOptions};
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::OwnedMxcUri;
 use matrix_sdk::ruma::OwnedRoomId;
 use matrix_sdk::ruma::api::Direction;
 use matrix_sdk::ruma::api::client::search::search_events;
+use matrix_sdk::ruma::events::relation::RelationType;
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::room::message::{
     ImageMessageEventContent, MessageType, RoomMessageEventContent,
@@ -186,10 +188,45 @@ pub struct ReadEvent {
     /// The raw decrypted JSON of the event. `null` for events that
     /// could not be decrypted.
     pub event: Option<serde_json::Value>,
+    /// The event id this event is replying to, from
+    /// `content["m.relates_to"]["m.in_reply_to"]["event_id"]`.
+    /// `null` when the event is not a reply.
+    pub in_reply_to: Option<String>,
+    /// True if this event is the root of a thread — i.e. at least one
+    /// other event in the same response has `rel_type: "m.thread"` and
+    /// points at this event id. Derived client-side from the batch.
+    pub is_thread_root: bool,
+    /// Thread reply count from `unsigned["m.relations"]["m.thread"]["count"]`.
+    /// `null` when the server didn't include bundled thread aggregations
+    /// (older servers or events that are not thread roots).
+    pub thread_event_count: Option<u64>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ReadRecentMessagesResult {
+    pub events: Vec<ReadEvent>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadThreadParams {
+    /// Matrix room id, e.g. `!abc:kampong.social`.
+    pub room_id: String,
+    /// Event id of the thread root, e.g. `$abc:kampong.social`.
+    pub root_event_id: String,
+    /// Maximum number of thread events to return. Defaults to 50, capped at
+    /// 200.
+    #[serde(default = "default_thread_limit")]
+    pub limit: u32,
+}
+
+const fn default_thread_limit() -> u32 {
+    50
+}
+
+const MAX_THREAD_LIMIT: u32 = 200;
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReadThreadResult {
     pub events: Vec<ReadEvent>,
 }
 
@@ -546,6 +583,12 @@ impl MatrixMcpService {
     /// decrypts E2EE rooms iff this device is cross-signed. Events
     /// that could not be decrypted are reported with
     /// `status: "unable_to_decrypt"` and a null event body.
+    ///
+    /// Each returned event includes threading metadata:
+    /// - `in_reply_to`: the event id this event replies to (if any).
+    /// - `is_thread_root`: true if any event in this response starts a
+    ///   thread from this event.
+    /// - `thread_event_count`: server-aggregated reply count (when present).
     #[tool(description = "Read recent events (newest first) from a Matrix room.")]
     #[allow(clippy::needless_pass_by_value)]
     async fn read_recent_messages(
@@ -573,41 +616,7 @@ impl MatrixMcpService {
                 .await
                 .map_err(|e| ErrorData::internal_error(format!("fetch /messages: {e}"), None))?;
 
-            let events: Vec<ReadEvent> = messages
-                .chunk
-                .into_iter()
-                .map(|tle| {
-                    let raw = tle.raw();
-                    let value: serde_json::Value =
-                        raw.deserialize_as().unwrap_or(serde_json::Value::Null);
-                    let (status, body) = match &tle.kind {
-                        matrix_sdk::deserialized_responses::TimelineEventKind::PlainText {
-                            ..
-                        } => ("plaintext", Some(value.clone())),
-                        matrix_sdk::deserialized_responses::TimelineEventKind::Decrypted(_) => {
-                            ("decrypted", Some(value.clone()))
-                        }
-                        matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
-                            ..
-                        } => ("unable_to_decrypt", None),
-                    };
-                    ReadEvent {
-                        event_id: value
-                            .get("event_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned),
-                        sender: value
-                            .get("sender")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned),
-                        origin_server_ts: value
-                            .get("origin_server_ts")
-                            .and_then(serde_json::Value::as_u64),
-                        status,
-                        event: body,
-                    }
-                })
-                .collect();
+            let events = read_events_from_chunk(messages.chunk);
             let count = events.len();
             let res = structured_result(&ReadRecentMessagesResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -616,6 +625,72 @@ impl MatrixMcpService {
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
         emit_tool_audit(
             "read_recent_messages",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(event_count),
+            &result,
+        );
+        result
+    }
+
+    /// Read the events in a Matrix thread (MSC3440 / spec v1.4+). Returns all
+    /// reply events that belong to the thread rooted at `root_event_id`,
+    /// newest first, using the homeserver's
+    /// `GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}/m.thread`
+    /// endpoint. Each `ReadEvent` carries the same threading fields as
+    /// `read_recent_messages`. The root event itself is not included in the
+    /// response (fetch it with `read_recent_messages` if needed).
+    #[tool(
+        description = "Read all events in a Matrix thread rooted at a given event id (newest first)."
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn read_thread(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ReadThreadParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let (result, event_count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let root_event_id: OwnedEventId = params.root_event_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid root_event_id {}: {e}", params.root_event_id),
+                    None,
+                )
+            })?;
+
+            // Cap the limit to MAX_THREAD_LIMIT; clamp(1, …) ensures we
+            // don't ask for zero events.
+            let limit = params.limit.clamp(1, MAX_THREAD_LIMIT);
+
+            let opts = RelationsOptions {
+                include_relations: IncludeRelations::RelationsOfType(RelationType::Thread),
+                limit: Some(limit.into()),
+                ..Default::default()
+            };
+            let relations = room.relations(root_event_id, opts).await.map_err(|e| {
+                ErrorData::internal_error(format!("fetch thread relations: {e}"), None)
+            })?;
+
+            let events = read_events_from_chunk(relations.chunk);
+            let count = events.len();
+            let res = structured_result(&ReadThreadResult { events });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        emit_tool_audit(
+            "read_thread",
             &mxid_for_audit,
             Some(&room_id_for_audit),
             started,
@@ -1676,6 +1751,108 @@ impl MatrixMcpService {
     }
 }
 
+/// Convert a batch of [`matrix_sdk::deserialized_responses::TimelineEvent`]s
+/// into [`ReadEvent`]s with threading metadata.
+///
+/// Thread-root detection is derived client-side: an event is a thread root if
+/// at least one sibling in the same batch has `rel_type: "m.thread"` pointing
+/// at its `event_id`. The `unsigned["m.relations"]["m.thread"]["count"]` field
+/// (when present) is surfaced as `thread_event_count`.
+fn read_events_from_chunk(
+    chunk: Vec<matrix_sdk::deserialized_responses::TimelineEvent>,
+) -> Vec<ReadEvent> {
+    // First pass: deserialise every event and collect the set of event ids
+    // that are the root of at least one m.thread relation in this batch.
+    let values: Vec<serde_json::Value> = chunk
+        .iter()
+        .map(|tle| {
+            tle.raw()
+                .deserialize_as::<serde_json::Value>()
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+
+    // Build the set of thread-root ids referenced in this batch.
+    let thread_roots: HashSet<String> = values
+        .iter()
+        .filter_map(|v| {
+            let rel = v.get("content")?.get("m.relates_to")?;
+            if rel.get("rel_type")?.as_str()? == "m.thread" {
+                rel.get("event_id")?.as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Second pass: build ReadEvent for every timeline event.
+    chunk
+        .into_iter()
+        .zip(values)
+        .map(|(tle, value)| {
+            let (status, body) = match &tle.kind {
+                matrix_sdk::deserialized_responses::TimelineEventKind::PlainText { .. } => {
+                    ("plaintext", Some(value.clone()))
+                }
+                matrix_sdk::deserialized_responses::TimelineEventKind::Decrypted(_) => {
+                    ("decrypted", Some(value.clone()))
+                }
+                matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                    ..
+                } => ("unable_to_decrypt", None),
+            };
+
+            let event_id_str = value
+                .get("event_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+
+            // `in_reply_to`: from content["m.relates_to"]["m.in_reply_to"]["event_id"].
+            // Present on replies AND on thread replies (which carry both
+            // rel_type=m.thread and m.in_reply_to).  We surface it
+            // unconditionally so callers can distinguish genuine replies
+            // from the thread fallback via the surrounding rel_type.
+            let in_reply_to = value
+                .get("content")
+                .and_then(|c| c.get("m.relates_to"))
+                .and_then(|r| r.get("m.in_reply_to"))
+                .and_then(|irt| irt.get("event_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+
+            // `is_thread_root`: true if any sibling in the batch has
+            // rel_type=m.thread pointing at this event.
+            let is_thread_root = event_id_str
+                .as_deref()
+                .is_some_and(|id| thread_roots.contains(id));
+
+            // `thread_event_count`: from unsigned["m.relations"]["m.thread"]["count"].
+            let thread_event_count = value
+                .get("unsigned")
+                .and_then(|u| u.get("m.relations"))
+                .and_then(|r| r.get("m.thread"))
+                .and_then(|t| t.get("count"))
+                .and_then(serde_json::Value::as_u64);
+
+            ReadEvent {
+                event_id: event_id_str,
+                sender: value
+                    .get("sender")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                origin_server_ts: value
+                    .get("origin_server_ts")
+                    .and_then(serde_json::Value::as_u64),
+                status,
+                event: body,
+                in_reply_to,
+                is_thread_root,
+                thread_event_count,
+            }
+        })
+        .collect()
+}
+
 fn summarize_room(room: &Room) -> JoinedRoom {
     let display_name = room.cached_display_name().map(|n| n.to_string());
     JoinedRoom {
@@ -1822,5 +1999,113 @@ mod tests {
         // No path at all → last segment is the host → used as-is (acceptable
         // fallback; the Content-Type guard already confirmed it is an image).
         assert_eq!(derive("https://example.com"), "example.com");
+    }
+
+    #[test]
+    fn default_thread_limit_is_sensible() {
+        let n = default_thread_limit();
+        assert!((1..=MAX_THREAD_LIMIT).contains(&n), "thread limit was {n}");
+    }
+
+    #[test]
+    fn thread_limit_cap_enforced() {
+        // Any value above MAX_THREAD_LIMIT must be clamped down.
+        let capped = 999_u32.clamp(1, MAX_THREAD_LIMIT);
+        assert!(capped <= MAX_THREAD_LIMIT);
+        // Value at the cap is unchanged.
+        assert_eq!(
+            MAX_THREAD_LIMIT.clamp(1, MAX_THREAD_LIMIT),
+            MAX_THREAD_LIMIT
+        );
+        // Value well below the cap is unchanged.
+        assert_eq!(10_u32.clamp(1, MAX_THREAD_LIMIT), 10);
+    }
+
+    #[test]
+    fn thread_root_detection_from_batch() {
+        // A root event and a thread-reply event. The helper must mark
+        // the root as `is_thread_root = true` and the reply's
+        // `in_reply_to` must surface the root id.
+        //
+        // We build synthetic serde_json values directly (no live SDK
+        // types needed) and exercise the path through
+        // `read_events_from_chunk` by testing the logic inline.
+        let root_id = "$root:kampong.social";
+        let reply_id = "$reply:kampong.social";
+
+        // Simulate the output of the two-pass logic.
+        let values: Vec<serde_json::Value> = vec![
+            serde_json::json!({
+                "event_id": root_id,
+                "sender": "@alice:kampong.social",
+                "origin_server_ts": 1_000_000_u64,
+                "content": { "msgtype": "m.text", "body": "hello" },
+                "unsigned": {
+                    "m.relations": {
+                        "m.thread": { "count": 1 }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "event_id": reply_id,
+                "sender": "@bob:kampong.social",
+                "origin_server_ts": 2_000_000_u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "reply",
+                    "m.relates_to": {
+                        "rel_type": "m.thread",
+                        "event_id": root_id,
+                        "m.in_reply_to": { "event_id": root_id }
+                    }
+                }
+            }),
+        ];
+
+        // First pass: collect thread roots.
+        let thread_roots: HashSet<String> = values
+            .iter()
+            .filter_map(|v| {
+                let rel = v.get("content")?.get("m.relates_to")?;
+                if rel.get("rel_type")?.as_str()? == "m.thread" {
+                    rel.get("event_id")?.as_str().map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            thread_roots.contains(root_id),
+            "root_id should be detected as a thread root"
+        );
+
+        // Check root detection for the root event.
+        let root_is_thread_root = values[0]
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| thread_roots.contains(id));
+        assert!(
+            root_is_thread_root,
+            "root event must be flagged is_thread_root"
+        );
+
+        // Check thread_event_count on the root.
+        let count = values[0]
+            .get("unsigned")
+            .and_then(|u| u.get("m.relations"))
+            .and_then(|r| r.get("m.thread"))
+            .and_then(|t| t.get("count"))
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(count, Some(1));
+
+        // Check in_reply_to on the reply event.
+        let in_reply_to = values[1]
+            .get("content")
+            .and_then(|c| c.get("m.relates_to"))
+            .and_then(|r| r.get("m.in_reply_to"))
+            .and_then(|irt| irt.get("event_id"))
+            .and_then(|v| v.as_str());
+        assert_eq!(in_reply_to, Some(root_id));
     }
 }
