@@ -130,6 +130,10 @@ pub struct PendingPkce {
 pub struct SetupSession {
     pub mas_subject: String,
     pub mxid: String,
+    // Kept in the session for audit/logging context; /setup/recover
+    // deliberately hardcodes MATRIX_MCP_DEVICE_ID below so the recovery
+    // imports land in the same store claude.ai's tool calls use.
+    #[allow(dead_code)]
     pub device_id: Option<String>,
     pub access_token: String,
     pub created_at: Instant,
@@ -402,33 +406,27 @@ pub async fn recover(
     }
 
     // The /setup OAuth flow doesn't request a `device:...` scope, so MAS
-    // returns a token without a device_id. claude.ai's MCP-connector
-    // flow does request that scope and gets `MATRIXMCPCONNECTOR` back.
-    // Fall back to the same constant here so the cache key (mas_subject
-    // + device_id) lines up between /setup and /mcp — without this,
-    // /setup/recover writes the user's keys into a different store dir
-    // than /mcp reads from.
-    let device_id = session
-        .device_id
-        .clone()
-        .or_else(|| Some(crate::oauth_metadata::MATRIX_MCP_DEVICE_ID.to_owned()));
+    // Hardcode device_id to MATRIX_MCP_DEVICE_ID. The /setup OAuth flow
+    // doesn't request a `device:...` scope, so MAS may return either no
+    // device_id or a fresh per-session one. Either way we want this
+    // recovery to land in the SAME matrix-sdk store that claude.ai's
+    // MCP tool calls use (which always advertise device_id =
+    // MATRIXMCPCONNECTOR). Otherwise /setup imports keys into a
+    // different OlmMachine than /mcp reads from and verify_status keeps
+    // reporting cross_signed=false.
     let identity = crate::mas::AuthenticatedIdentity {
         mas_subject: session.mas_subject.clone(),
         mxid: session.mxid.clone(),
-        device_id,
+        device_id: Some(crate::oauth_metadata::MATRIX_MCP_DEVICE_ID.to_owned()),
         raw_scope: None,
     };
-    // Evict any existing cached client for this identity before
-    // building a fresh one. /setup is the rare case where the same
-    // (mas_subject, device_id) pair can present a brand-new access
-    // token (the user re-authed via /setup/login). The cache is keyed
-    // by identity, not by token, so without this eviction a stale
-    // client tied to a now-revoked token gets returned to the recovery
-    // flow, and every Matrix call 401s. Cheap: /setup is invoked
-    // once-per-rare-event.
-    if let Err(e) = state.clients.evict(&identity).await {
-        warn!(error = %e, "failed to evict cached client before /setup/recover");
-    }
+    // Evict any existing cached client for this mxid before building a
+    // fresh one. /setup is the rare case where the same identity can
+    // present a brand-new access token (the user re-authed via
+    // /setup/login). The cache is keyed by mxid, not by token, so
+    // without this eviction a stale client tied to a now-revoked token
+    // gets returned to the recovery flow and every Matrix call 401s.
+    state.clients.evict(&identity).await;
     let client = match state
         .clients
         .for_user(&identity, &session.access_token)
