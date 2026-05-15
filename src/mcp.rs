@@ -20,6 +20,8 @@ use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::OwnedRoomId;
 use matrix_sdk::ruma::api::Direction;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use std::time::Instant;
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -28,6 +30,7 @@ use rmcp::{ErrorData, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::audit::{self, outcome};
 use crate::auth::AccessToken;
 use crate::mas::AuthenticatedIdentity;
 use crate::matrix_client::MatrixClientCache;
@@ -156,11 +159,17 @@ impl MatrixMcpService {
         &self,
         ctx: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
-        let id = identity_from_ctx(&ctx).ok_or_else(missing_identity_err)?;
-        structured_result(&WhoamiResult {
-            mxid: id.mxid,
-            device_id: id.device_id,
-        })
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let result = (|| {
+            let id = identity_from_ctx(&ctx).ok_or_else(missing_identity_err)?;
+            structured_result(&WhoamiResult {
+                mxid: id.mxid,
+                device_id: id.device_id,
+            })
+        })();
+        emit_tool_audit("whoami", &mxid_for_audit, None, started, None, &result);
+        result
     }
 
     /// List the rooms the authenticated user has joined. Each entry
@@ -172,9 +181,26 @@ impl MatrixMcpService {
         &self,
         ctx: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
-        let client = self.client_for(&ctx).await?;
-        let rooms = client.joined_rooms().iter().map(summarize_room).collect();
-        structured_result(&JoinedRoomsResult { rooms })
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let (result, room_count) = async {
+            let client = self.client_for(&ctx).await?;
+            let rooms: Vec<JoinedRoom> = client.joined_rooms().iter().map(summarize_room).collect();
+            let count = rooms.len();
+            let res = structured_result(&JoinedRoomsResult { rooms });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        emit_tool_audit(
+            "list_joined_rooms",
+            &mxid_for_audit,
+            None,
+            started,
+            Some(room_count),
+            &result,
+        );
+        result
     }
 
     /// Read recent events from a Matrix room (newest first). The SDK
@@ -188,57 +214,75 @@ impl MatrixMcpService {
         ctx: RequestContext<RoleServer>,
         Parameters(params): Parameters<ReadRecentMessagesParams>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
-        let client = self.client_for(&ctx).await?;
-        let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
-            ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
-        })?;
-        let room = client
-            .get_room(&room_id)
-            .ok_or_else(|| ErrorData::invalid_params(format!("not joined to {room_id}"), None))?;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let (result, event_count) = async {
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
 
-        let mut opts = MessagesOptions::new(Direction::Backward);
-        opts.limit = params.limit.into();
-        let messages = room
-            .messages(opts)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("fetch /messages: {e}"), None))?;
+            let mut opts = MessagesOptions::new(Direction::Backward);
+            opts.limit = params.limit.into();
+            let messages = room
+                .messages(opts)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("fetch /messages: {e}"), None))?;
 
-        let events = messages
-            .chunk
-            .into_iter()
-            .map(|tle| {
-                let raw = tle.raw();
-                let value: serde_json::Value =
-                    raw.deserialize_as().unwrap_or(serde_json::Value::Null);
-                let (status, body) = match &tle.kind {
-                    matrix_sdk::deserialized_responses::TimelineEventKind::PlainText { .. } => {
-                        ("plaintext", Some(value.clone()))
+            let events: Vec<ReadEvent> = messages
+                .chunk
+                .into_iter()
+                .map(|tle| {
+                    let raw = tle.raw();
+                    let value: serde_json::Value =
+                        raw.deserialize_as().unwrap_or(serde_json::Value::Null);
+                    let (status, body) = match &tle.kind {
+                        matrix_sdk::deserialized_responses::TimelineEventKind::PlainText {
+                            ..
+                        } => ("plaintext", Some(value.clone())),
+                        matrix_sdk::deserialized_responses::TimelineEventKind::Decrypted(_) => {
+                            ("decrypted", Some(value.clone()))
+                        }
+                        matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                            ..
+                        } => ("unable_to_decrypt", None),
+                    };
+                    ReadEvent {
+                        event_id: value
+                            .get("event_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned),
+                        sender: value
+                            .get("sender")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned),
+                        origin_server_ts: value
+                            .get("origin_server_ts")
+                            .and_then(serde_json::Value::as_u64),
+                        status,
+                        event: body,
                     }
-                    matrix_sdk::deserialized_responses::TimelineEventKind::Decrypted(_) => {
-                        ("decrypted", Some(value.clone()))
-                    }
-                    matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
-                        ..
-                    } => ("unable_to_decrypt", None),
-                };
-                ReadEvent {
-                    event_id: value
-                        .get("event_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                    sender: value
-                        .get("sender")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                    origin_server_ts: value
-                        .get("origin_server_ts")
-                        .and_then(serde_json::Value::as_u64),
-                    status,
-                    event: body,
-                }
-            })
-            .collect();
-        structured_result(&ReadRecentMessagesResult { events })
+                })
+                .collect();
+            let count = events.len();
+            let res = structured_result(&ReadRecentMessagesResult { events });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        emit_tool_audit(
+            "read_recent_messages",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(event_count),
+            &result,
+        );
+        result
     }
 
     /// Send a text message to a Matrix room. The SDK renders the body
@@ -252,22 +296,37 @@ impl MatrixMcpService {
         ctx: RequestContext<RoleServer>,
         Parameters(params): Parameters<SendTextMessageParams>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
-        let client = self.client_for(&ctx).await?;
-        let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
-            ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
-        })?;
-        let room = client
-            .get_room(&room_id)
-            .ok_or_else(|| ErrorData::invalid_params(format!("not joined to {room_id}"), None))?;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
 
-        let content = RoomMessageEventContent::text_markdown(&params.body);
-        let response = room
-            .send(content)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("room.send: {e}"), None))?;
-        structured_result(&SendTextMessageResult {
-            event_id: response.response.event_id.to_string(),
-        })
+            let content = RoomMessageEventContent::text_markdown(&params.body);
+            let response = room
+                .send(content)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.send: {e}"), None))?;
+            structured_result(&SendTextMessageResult {
+                event_id: response.response.event_id.to_string(),
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "send_text_message",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &result,
+        );
+        result
     }
 
     /// Report whether this matrix-mcp device is verified (cross-signed)
@@ -282,68 +341,81 @@ impl MatrixMcpService {
         &self,
         ctx: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
-        let client = self.client_for(&ctx).await?;
-        let me = client
-            .user_id()
-            .ok_or_else(|| ErrorData::internal_error("no user_id on client", None))?
-            .to_owned();
-        let encryption = client.encryption();
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let result = async {
+            let client = self.client_for(&ctx).await?;
+            let me = client
+                .user_id()
+                .ok_or_else(|| ErrorData::internal_error("no user_id on client", None))?
+                .to_owned();
+            let encryption = client.encryption();
 
-        // OAuth-restored matrix-sdk sessions don't always populate
-        // the local `OlmMachine` with the user's cross-signing identity
-        // — `get_user_identity` then returns None even though the
-        // master key exists on the homeserver. `request_user_identity`
-        // forces a /keys/query against the homeserver and refreshes
-        // the cached identity. Fall back to `get_user_identity` in
-        // case `request_user_identity` returned None due to a
-        // transient query error; that path will still pick up an
-        // already-cached identity if one is present.
-        let user_identity = match encryption.request_user_identity(&me).await {
-            Ok(Some(id)) => Some(id),
-            Ok(None) => encryption
-                .get_user_identity(&me)
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("get_user_identity: {e}"), None))?,
-            Err(e) => {
-                warn!(error = %e, "request_user_identity failed; trying cached");
-                encryption.get_user_identity(&me).await.map_err(|e| {
+            // OAuth-restored matrix-sdk sessions don't always populate
+            // the local `OlmMachine` with the user's cross-signing identity
+            // — `get_user_identity` then returns None even though the
+            // master key exists on the homeserver. `request_user_identity`
+            // forces a /keys/query against the homeserver and refreshes
+            // the cached identity. Fall back to `get_user_identity` in
+            // case `request_user_identity` returned None due to a
+            // transient query error; that path will still pick up an
+            // already-cached identity if one is present.
+            let user_identity = match encryption.request_user_identity(&me).await {
+                Ok(Some(id)) => Some(id),
+                Ok(None) => encryption.get_user_identity(&me).await.map_err(|e| {
                     ErrorData::internal_error(format!("get_user_identity: {e}"), None)
-                })?
-            }
-        };
-        let user_has_master_key = user_identity.is_some();
+                })?,
+                Err(e) => {
+                    warn!(error = %e, "request_user_identity failed; trying cached");
+                    encryption.get_user_identity(&me).await.map_err(|e| {
+                        ErrorData::internal_error(format!("get_user_identity: {e}"), None)
+                    })?
+                }
+            };
+            let user_has_master_key = user_identity.is_some();
 
-        let device_id = client.device_id().map(ToOwned::to_owned);
-        let cross_signed = if let Some(did) = &device_id {
-            let device = encryption
-                .get_device(&me, did)
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("get_device: {e}"), None))?;
-            device.is_some_and(|d| d.is_cross_signed_by_owner())
-        } else {
-            false
-        };
+            let device_id = client.device_id().map(ToOwned::to_owned);
+            let cross_signed = if let Some(did) = &device_id {
+                let device = encryption
+                    .get_device(&me, did)
+                    .await
+                    .map_err(|e| ErrorData::internal_error(format!("get_device: {e}"), None))?;
+                device.is_some_and(|d| d.is_cross_signed_by_owner())
+            } else {
+                false
+            };
 
-        let message = if !user_has_master_key {
-            "No cross-signing identity found on the homeserver. Set up cross-signing in \
-             Element X first (Settings → Encryption → Set up secure backup), then visit \
-             https://matrix-mcp.example.com/setup to import the keys here."
-                .to_owned()
-        } else if cross_signed {
-            "matrix-mcp device is cross-signed; E2EE rooms are accessible.".to_owned()
-        } else {
-            "matrix-mcp device exists but isn't yet signed by your master key. Visit \
-             https://matrix-mcp.example.com/setup, sign in, and paste your Matrix \
-             Secret Storage recovery key — matrix-mcp will self-sign the device. No \
-             chat history, no emoji-compare with another device."
-                .to_owned()
-        };
+            let message = if !user_has_master_key {
+                "No cross-signing identity found on the homeserver. Set up cross-signing in \
+                 Element X first (Settings → Encryption → Set up secure backup), then visit \
+                 https://matrix-mcp.example.com/setup to import the keys here."
+                    .to_owned()
+            } else if cross_signed {
+                "matrix-mcp device is cross-signed; E2EE rooms are accessible.".to_owned()
+            } else {
+                "matrix-mcp device exists but isn't yet signed by your master key. Visit \
+                 https://matrix-mcp.example.com/setup, sign in, and paste your Matrix \
+                 Secret Storage recovery key — matrix-mcp will self-sign the device. No \
+                 chat history, no emoji-compare with another device."
+                    .to_owned()
+            };
 
-        structured_result(&VerifyStatusResult {
-            cross_signed,
-            user_has_master_key,
-            message,
-        })
+            structured_result(&VerifyStatusResult {
+                cross_signed,
+                user_has_master_key,
+                message,
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "verify_status",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &result,
+        );
+        result
     }
 }
 
@@ -398,6 +470,32 @@ pub fn identity_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<Authenticat
 pub fn token_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<AccessToken> {
     let parts = ctx.extensions.get::<http::request::Parts>()?;
     parts.extensions.get::<AccessToken>().cloned()
+}
+
+/// Audit-log a finished tool call. Looks at the result to decide the
+/// outcome class and pulls the JSON-RPC error code into a stable
+/// `error_class` string. Keeps audit emission DRY across every tool.
+fn emit_tool_audit(
+    tool: &'static str,
+    mxid: &str,
+    room_id: Option<&str>,
+    started: Instant,
+    event_count: Option<usize>,
+    result: &Result<rmcp::model::CallToolResult, ErrorData>,
+) {
+    let (outcome, err_class) = match result {
+        Ok(_) => (outcome::OK, None),
+        Err(e) => (outcome::ERROR, Some(audit::error_class(e))),
+    };
+    audit::tool_call(
+        tool,
+        mxid,
+        room_id,
+        outcome,
+        started,
+        event_count,
+        err_class,
+    );
 }
 
 fn structured_result<T: Serialize>(value: &T) -> Result<rmcp::model::CallToolResult, ErrorData> {

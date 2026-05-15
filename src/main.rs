@@ -11,6 +11,7 @@
 //! the bearer-auth middleware. First tool: `whoami` — returns the MXID +
 //! device id read from the authenticated token. No Matrix calls yet.
 
+mod audit;
 mod auth;
 mod config;
 mod mas;
