@@ -53,6 +53,14 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check publishes results as a GitHub check-run via the
+    # checks API. Workflow-level permissions are tightened to `contents: read`
+    # (audit fix #3), so we grant `checks: write` only on this job — the
+    # narrowest scope that makes the action's reporting path work without
+    # broadening the rest of the workflow.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
