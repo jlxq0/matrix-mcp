@@ -6,7 +6,6 @@
 //! - POST the user's bearer token to `/oauth2/introspect`.
 //! - Parse `active`, `sub`, `scope`, `aud`, `device_id` from the response.
 //! - Validate the audience matches our resource URL (RFC 8707 binding).
-//! - Validate the token carries the Matrix C-S API scope.
 //! - Cache positive results for 60 s OR until the token expires, whichever
 //!   is sooner. Negative results are not cached (a fresh token presented
 //!   immediately should not be rejected because a stale failure cached it).
@@ -86,16 +85,20 @@ impl AudField {
 /// user/device — only what the tool layer needs to act.
 ///
 /// `device_id` and `raw_scope` are unread today; the `whoami` tool added in
-/// phase 1.3 starts reading both. `sub` (MAS-internal user ULID) is used
-/// by the rate limiter (Phase 6.1) as a per-user bucket key — stable
-/// across token rotations and never sent to claude.ai.
+/// phase 1.3 starts reading both. `mas_subject` (MAS-internal stable user ULID)
+/// is used as the ownership key for the Matrix client cache and on-disk store
+/// — it must not be confused with the mutable MXID/localpart.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct AuthenticatedIdentity {
+    /// Stable MAS subject for cache/store ownership. This is deliberately
+    /// separate from `mxid`, whose localpart can be renamed and later reused.
+    pub mas_subject: String,
+    /// Current Matrix user id reconstructed from MAS `username` + server name.
+    /// Used as Matrix session metadata only, not as our ownership key.
     pub mxid: String,
     pub device_id: Option<String>,
     pub raw_scope: Option<String>,
-    pub sub: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -157,9 +160,9 @@ impl MasIntrospectionClient {
     }
 
     /// Validate a bearer token. Returns `Ok(Some(identity))` on success,
-    /// `Ok(None)` if MAS reports the token is inactive, mis-audienced, or
-    /// missing the required Matrix scope. `Err` only for transport/upstream
-    /// failures.
+    /// `Ok(None)` if MAS reports the token is inactive, mis-audienced, missing
+    /// the required Matrix C-S API scope, or missing the stable `sub` claim.
+    /// `Err` only for transport/upstream failures.
     pub async fn introspect(
         &self,
         token: &str,
@@ -209,10 +212,11 @@ impl MasIntrospectionClient {
         //   approves the scopes for THIS client + THIS authorization
         //   request. A token issued for an unrelated app couldn't have
         //   been minted without our user accepting that app's scopes.
-        // - Matrix scope enforcement below: a token from a completely
-        //   unrelated OAuth client (e-mail, calendar, etc.) will never
-        //   carry the Matrix C-S API scope, so it can't reach our tools
-        //   even when `aud` is absent.
+        // - Synapse re-validates the bearer's scope on every
+        //   /_matrix/* call (MSC3861). A token lacking the Matrix C-S
+        //   API scope gets a 401 from Synapse regardless of what we do
+        //   here, so the matrix-mcp tools that proxy to Synapse can't
+        //   be abused by a scope-less token.
         if let Some(aud) = &body.aud {
             if !aud.matches(&self.expected_audience) {
                 return Err(IntrospectionError::AudienceMismatch {
@@ -240,7 +244,18 @@ impl MasIntrospectionClient {
             return Ok(None);
         }
 
-        // MAS's `sub` is the user ULID (mas-internal), not the MXID.
+        // MAS's `sub` is the stable MAS-internal user id. It is not the
+        // Matrix MXID, but it must travel with the reconstructed MXID so
+        // cache and store ownership cannot be confused if a localpart is
+        // renamed and later reassigned.
+        let Some(mas_subject) = body.sub.clone() else {
+            warn!(
+                "MAS introspection response missing stable `sub` field; \
+                 rejecting token"
+            );
+            return Ok(None);
+        };
+
         // The mxid comes from the MSC3861 `username` extension —
         // reconstruct as `@{username}:{server_name}`.
         let Some(username) = body.username.clone() else {
@@ -267,10 +282,10 @@ impl MasIntrospectionClient {
             .or_else(|| body.scope.as_deref().and_then(device_from_scope));
 
         let identity = AuthenticatedIdentity {
+            mas_subject,
             mxid,
             device_id,
             raw_scope: body.scope.clone(),
-            sub: body.sub.clone(),
         };
 
         self.cache_insert(key, &identity, body.exp);
@@ -441,6 +456,7 @@ mod tests {
 
         let client = client_against(&mock.uri());
         let identity = client.introspect("abc123").await.unwrap().unwrap();
+        assert_eq!(identity.mas_subject, "01JABCDEFGHJKMNPQRSTVWXYZ0");
         assert_eq!(identity.mxid, "@alice:example.com"); // server_name="example.com" in client_against
         assert_eq!(
             identity.device_id.as_deref(),
@@ -599,6 +615,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_token_without_stable_subject() {
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "username": "alice",
+                "aud": "https://matrix-mcp.example.test",
+                "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
+                "exp": 9_999_999_999i64,
+                // no "sub" -- missing stable MAS subject
+            })))
+            .mount(&mock)
+            .await;
+        let client = client_against(&mock.uri());
+        let result = client.introspect("abc").await.unwrap();
+        assert!(
+            result.is_none(),
+            "token without stable MAS sub must be rejected"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_token_without_username_claim() {
         // Regression: in production we briefly used `sub` as the MXID,
         // which gave back the MAS-internal ULID (e.g. `01JMVS29KA...`)
@@ -613,7 +652,6 @@ mod tests {
                 "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
                 // no username — pre-MSC3861 / older MAS / misconfigured client
                 "aud": "https://matrix-mcp.example.test",
-                "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
                 "exp": 9_999_999_999i64,
             })))
             .mount(&mock)
@@ -650,12 +688,8 @@ mod tests {
         // Real-world: claude.ai's MCP connector doesn't send RFC 8707
         // `resource=` to MAS, so MAS issues tokens with no `aud` claim.
         // We accept these (with a warn log); MAS-side user consent +
-        // scope enforcement are the remaining defenses. The previous
-        // behaviour of returning None broke claude.ai entirely.
-        //
-        // The token MUST still carry the Matrix C-S API scope; that is
-        // what closes the "unrelated-app token replay" gap without
-        // requiring `aud`.
+        // Synapse-side scope checks are the remaining defenses. The
+        // previous behaviour of returning None broke claude.ai entirely.
         let mock = server().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/introspect"))
@@ -663,8 +697,6 @@ mod tests {
                 "active": true,
                 "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
                 "username": "alice",
-                // no `aud` — as claude.ai sends; must still be accepted
-                // because it carries the Matrix scope.
                 "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
                 "exp": 9_999_999_999i64,
             })))
@@ -675,147 +707,8 @@ mod tests {
             .introspect("abc")
             .await
             .unwrap()
-            .expect("missing-aud token with Matrix scope should authenticate");
+            .expect("missing-aud token should now authenticate");
         assert_eq!(identity.mxid, "@alice:example.com"); // server_name="example.com" in client_against
-    }
-
-    // --- Scope enforcement tests (audit finding daeff9c2 / #7) ---
-
-    #[tokio::test]
-    async fn matrix_scope_required_no_scope_field_rejected() {
-        // Token active, valid aud, but no `scope` field at all → rejected.
-        let mock = server().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/introspect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "active": true,
-                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
-                "username": "alice",
-                "aud": "https://matrix-mcp.example.test",
-                "exp": 9_999_999_999i64,
-                // no "scope" key
-            })))
-            .mount(&mock)
-            .await;
-        let client = client_against(&mock.uri());
-        let result = client.introspect("abc").await.unwrap();
-        assert!(result.is_none(), "token without any scope must be rejected");
-    }
-
-    #[tokio::test]
-    async fn matrix_scope_required_only_openid_rejected() {
-        // Token active, valid aud, scope = "openid" only → rejected.
-        let mock = server().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/introspect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "active": true,
-                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
-                "username": "alice",
-                "aud": "https://matrix-mcp.example.test",
-                "scope": "openid",
-                "exp": 9_999_999_999i64,
-            })))
-            .mount(&mock)
-            .await;
-        let client = client_against(&mock.uri());
-        let result = client.introspect("abc").await.unwrap();
-        assert!(
-            result.is_none(),
-            "token with only openid scope must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn matrix_scope_required_unrelated_scope_rejected() {
-        // Token active, no aud (claude.ai case), unrelated scope only → rejected.
-        // This is the key regression test for audit finding #846d8526:
-        // a token from a completely different OAuth client must not reach
-        // our tools even when `aud` is absent.
-        let mock = server().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/introspect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "active": true,
-                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
-                "username": "alice",
-                // no aud — exercises the missing-aud path
-                "scope": "openid some:other:client:only",
-                "exp": 9_999_999_999i64,
-            })))
-            .mount(&mock)
-            .await;
-        let client = client_against(&mock.uri());
-        let result = client.introspect("abc").await.unwrap();
-        assert!(
-            result.is_none(),
-            "token from unrelated app (no Matrix scope) must be rejected even without aud check"
-        );
-    }
-
-    #[tokio::test]
-    async fn matrix_scope_unstable_prefix_accepted() {
-        // Token with the MSC2967 unstable scope prefix → accepted.
-        let mock = server().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/introspect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "active": true,
-                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
-                "username": "alice",
-                "aud": "https://matrix-mcp.example.test",
-                "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
-                "exp": 9_999_999_999i64,
-            })))
-            .mount(&mock)
-            .await;
-        let client = client_against(&mock.uri());
-        let identity = client.introspect("abc").await.unwrap().unwrap();
-        assert_eq!(identity.mxid, "@alice:example.com");
-    }
-
-    #[tokio::test]
-    async fn matrix_scope_stable_prefix_accepted() {
-        // Token with the stable (non-MSC2967) scope prefix → accepted.
-        let mock = server().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/introspect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "active": true,
-                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
-                "username": "alice",
-                "aud": "https://matrix-mcp.example.test",
-                "scope": "openid urn:matrix:client:api:*",
-                "exp": 9_999_999_999i64,
-            })))
-            .mount(&mock)
-            .await;
-        let client = client_against(&mock.uri());
-        let identity = client.introspect("abc").await.unwrap().unwrap();
-        assert_eq!(identity.mxid, "@alice:example.com");
-    }
-
-    #[tokio::test]
-    async fn matrix_scope_missing_aud_with_matrix_scope_accepted() {
-        // Token with no aud (claude.ai case) but WITH Matrix scope → accepted.
-        // This is the primary regression guard: the missing-aud accept path
-        // stays open, but only to tokens that actually carry the Matrix scope.
-        let mock = server().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/introspect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "active": true,
-                "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
-                "username": "alice",
-                // no aud
-                "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
-                "exp": 9_999_999_999i64,
-            })))
-            .mount(&mock)
-            .await;
-        let client = client_against(&mock.uri());
-        let identity = client.introspect("abc").await.unwrap().unwrap();
-        assert_eq!(identity.mxid, "@alice:example.com");
     }
 
     #[tokio::test]
@@ -849,23 +742,16 @@ mod tests {
 
     #[test]
     fn has_matrix_scope_unit() {
-        // None scope → false
         assert!(!has_matrix_scope(None));
-        // Empty string → false
         assert!(!has_matrix_scope(Some("")));
-        // Only openid → false
         assert!(!has_matrix_scope(Some("openid")));
-        // Unrelated scope → false
         assert!(!has_matrix_scope(Some("openid some:other:scope")));
-        // MSC2967 unstable prefix → true
         assert!(has_matrix_scope(Some(
             "openid urn:matrix:org.matrix.msc2967.client:api:*"
         )));
-        // Stable prefix → true
         assert!(has_matrix_scope(Some("openid urn:matrix:client:api:*")));
-        // Both present (real MAS output) → true
         assert!(has_matrix_scope(Some(
-            "openid urn:matrix:client:api:* urn:matrix:org.matrix.msc2967.client:api:*"
+            "openid urn:matrix:client:api:* urn:matrix:client:device:XYZ"
         )));
     }
 

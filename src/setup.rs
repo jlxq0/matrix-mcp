@@ -21,9 +21,9 @@
 //!      ↓
 //!  GET /setup/callback?code=…&state=…
 //!      ↓
-//!  exchange code → token; introspect → mxid
+//!  exchange code → token; introspect → stable MAS subject + mxid
 //!      ↓
-//!  store (mxid, token) in setup_sessions, set session_id cookie
+//!  store (MAS subject, mxid, device id, token) in setup_sessions, set session_id cookie
 //!      ↓
 //!  302 /setup/form             — password-type input
 //!      ↓
@@ -39,9 +39,9 @@
 //! - **PKCE state** (`pkce_states`): `state_token → code_verifier`.
 //!   5-minute TTL. Used to bind a callback back to the originating
 //!   authorize request and to PKCE-verify it.
-//! - **Setup session** (`sessions`): `session_id → (mxid,
-//!   access_token, created_at)`. 30-minute TTL. Held only long enough
-//!   to render the form and process one POST. The `session_id` is a
+//! - **Setup session** (`sessions`): `session_id → (MAS subject, mxid,
+//!   device id, access_token, created_at)`. 30-minute TTL. Held only long
+//!   enough to render the form and process one POST. The `session_id` is a
 //!   random 32-byte value carried in a `__Host-`-prefixed cookie.
 //!
 //! ## Why we don't reuse the MCP introspection cache
@@ -121,7 +121,9 @@ pub struct PendingPkce {
 
 #[derive(Clone)]
 pub struct SetupSession {
+    pub mas_subject: String,
     pub mxid: String,
+    pub device_id: Option<String>,
     pub access_token: String,
     pub created_at: Instant,
 }
@@ -245,7 +247,8 @@ pub async fn callback(
     };
 
     match exchange_and_introspect(&state, &code, &pkce.verifier).await {
-        Ok((mxid, access_token)) => {
+        Ok((identity, access_token)) => {
+            let mxid = identity.mxid.clone();
             let session_id = random_alnum(48);
             {
                 let mut guard = state.sessions.write().await;
@@ -253,7 +256,9 @@ pub async fn callback(
                     &mut guard,
                     session_id.clone(),
                     SetupSession {
+                        mas_subject: identity.mas_subject,
                         mxid: mxid.clone(),
+                        device_id: identity.device_id,
                         access_token,
                         created_at: Instant::now(),
                     },
@@ -332,13 +337,10 @@ pub async fn recover(
     }
 
     let identity = crate::mas::AuthenticatedIdentity {
+        mas_subject: session.mas_subject.clone(),
         mxid: session.mxid.clone(),
-        device_id: Some(crate::oauth_metadata::MATRIX_MCP_DEVICE_ID.to_owned()),
+        device_id: session.device_id.clone(),
         raw_scope: None,
-        // /setup is browser-driven; we never went through MAS
-        // introspection for this caller. Rate limiter falls back to
-        // bearer-hash only when `sub` is None.
-        sub: None,
     };
     let client = match state
         .clients
@@ -559,7 +561,7 @@ async fn exchange_and_introspect(
     state: &SetupState,
     code: &str,
     verifier: &str,
-) -> Result<(String, String)> {
+) -> Result<(crate::mas::AuthenticatedIdentity, String)> {
     let creds = state
         .config
         .introspection
@@ -596,16 +598,16 @@ async fn exchange_and_introspect(
     let parsed: TokenResponse =
         serde_json::from_str(&body).with_context(|| format!("parse token body: {body}"))?;
 
-    // Introspect the freshly-issued token to get the mxid. Reuses the
-    // existing MasIntrospectionClient so we go through the same auth +
-    // username-parsing path as /mcp.
+    // Introspect the freshly-issued token to get the stable MAS subject,
+    // device id, and mxid. Reuses the existing MasIntrospectionClient so we
+    // go through the same auth + username-parsing path as /mcp.
     let identity = state
         .mas
         .introspect(&parsed.access_token)
         .await
         .map_err(|e| anyhow!("introspect setup token: {e}"))?
         .ok_or_else(|| anyhow!("MAS rejected the freshly-issued setup token"))?;
-    Ok((identity.mxid, parsed.access_token))
+    Ok((identity, parsed.access_token))
 }
 
 #[derive(Deserialize)]
@@ -930,7 +932,9 @@ mod tests {
                     &mut map,
                     format!("sid-{i}"),
                     SetupSession {
+                        mas_subject: format!("mas-sub-{i}"),
                         mxid: format!("@user{i}:example.com"),
+                        device_id: None,
                         access_token: "tok".into(),
                         created_at: Instant::now(),
                     },
@@ -946,7 +950,9 @@ mod tests {
                 &mut map,
                 "overflow".into(),
                 SetupSession {
+                    mas_subject: "mas-sub-overflow".into(),
                     mxid: "@overflow:example.com".into(),
+                    device_id: None,
                     access_token: "tok".into(),
                     created_at: Instant::now(),
                 },
@@ -968,7 +974,9 @@ mod tests {
             map.insert(
                 format!("stale-{i}"),
                 SetupSession {
+                    mas_subject: format!("mas-sub-stale-{i}"),
                     mxid: format!("@stale{i}:example.com"),
+                    device_id: None,
                     access_token: "tok".into(),
                     created_at: expired_at,
                 },
@@ -982,7 +990,9 @@ mod tests {
                 &mut map,
                 "fresh".into(),
                 SetupSession {
+                    mas_subject: "mas-sub-fresh".into(),
                     mxid: "@fresh:example.com".into(),
+                    device_id: None,
                     access_token: "tok".into(),
                     created_at: Instant::now(),
                 },

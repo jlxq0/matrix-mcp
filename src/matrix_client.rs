@@ -10,29 +10,29 @@
 //!
 //! ```text
 //! {MATRIX_MCP_STORE_DIR}/
-//!   {sha256(mxid)[..32]}/
+//!   {sha256(mas_subject + device_id)[..32]}/
 //!     matrix-sdk-state.sqlite3       — room/state cache
 //!     matrix-sdk-crypto.sqlite3      — olm/megolm + cross-signing
 //! ```
 //!
-//! We hash the mxid for the directory name so the filesystem never
-//! sees raw `@user:host` characters (some are awkward on case-folded
-//! filesystems, and ext4 tolerates them but the hash is portable).
+//! We hash the stable MAS subject plus Matrix device id for the directory
+//! name so the filesystem never sees raw user identifiers and a mutable
+//! Matrix localpart cannot reopen another subject's store after rename/reuse.
 //!
 //! ## Store-cipher key derivation
 //!
 //! ```text
-//!   passphrase = HKDF-SHA256(salt = mxid,
+//!   passphrase = HKDF-SHA256(salt = cache/store owner key,
 //!                            ikm  = pepper,
 //!                            info = "matrix-mcp-store-cipher v1",
 //!                            len  = 32 bytes) → hex
 //! ```
 //!
 //! `pepper` is a single deployment-wide secret in 1Password
-//! (`MATRIX_MCP_STORE_PEPPER`). Per-user passphrases never appear in
-//! 1Password — they're derived deterministically from the pepper + mxid
-//! at runtime. This is the Option-A passphrase model. Pepper rotation
-//! is destructive (invalidates every user's store; users will be
+//! (`MATRIX_MCP_STORE_PEPPER`). Per-owner passphrases never appear in
+//! 1Password — they're derived deterministically from the pepper + stable
+//! MAS subject/device owner key at runtime. This is the Option-A passphrase
+//! model. Pepper rotation is destructive (invalidates every user's store; users will be
 //! re-prompted to verify the matrix-mcp device in Element X). That's a
 //! known property, not a bug.
 //!
@@ -80,7 +80,8 @@ impl Drop for CachedClient {
     }
 }
 
-/// In-memory cache mapping `mxid → matrix_sdk::Client`. Clone-cheap:
+/// In-memory cache mapping stable MAS subject + Matrix device id ->
+/// `matrix_sdk::Client`. Clone-cheap:
 /// the inner `Arc<RwLock<...>>` is shared.
 #[derive(Clone)]
 pub struct MatrixClientCache {
@@ -101,8 +102,8 @@ impl MatrixClientCache {
     /// Get-or-create the matrix-sdk `Client` for the authenticated user,
     /// using the supplied OAuth access token as the Matrix session token.
     ///
-    /// The first call for a given mxid is slow: it opens the `SQLite`
-    /// store (deriving the passphrase via HKDF), runs the SDK's session
+    /// The first call for a given MAS subject/device pair is slow: it opens
+    /// the `SQLite` store (deriving the passphrase via HKDF), runs the SDK's session
     /// restoration, and spawns the background sync task. Subsequent
     /// calls return immediately.
     pub async fn for_user(
@@ -114,13 +115,14 @@ impl MatrixClientCache {
         // drops before any await — clippy::significant_drop_tightening.
         {
             let guard = self.inner.read().await;
-            if let Some(cached) = guard.get(&identity.mxid) {
+            let owner_key = owner_key(identity)?;
+            if let Some(cached) = guard.get(&owner_key) {
                 return Ok(cached.client.clone());
             }
         }
 
         // Slow path: take the write lock *before* building so that concurrent
-        // first callers for the same mxid queue up here rather than all racing
+        // first callers for the same owner queue up here rather than all racing
         // through build_cached. The second (and later) callers will hit the
         // re-check below and return the already-built client without spawning
         // a redundant sync task.
@@ -128,17 +130,20 @@ impl MatrixClientCache {
         // Build time is bounded by the SQLite open + one SDK network round-trip
         // (session restoration). Holding the write lock across that await is
         // acceptable — first-use happens at most once per user per process
-        // lifetime, and concurrent callers for *different* mxids are also
+        // lifetime, and concurrent callers for *different* owners are also
         // serialized here, which is fine given the same frequency.
+        let owner_key = owner_key(identity)?;
         let mut guard = self.inner.write().await;
-        if let Some(existing) = guard.get(&identity.mxid) {
+        if let Some(existing) = guard.get(&owner_key) {
             // A concurrent caller already built the client while we waited for
             // the write lock. Return the canonical entry.
             return Ok(existing.client.clone());
         }
-        let cached = self.build_cached(identity, access_token).await?;
+        let cached = self
+            .build_cached(identity, access_token, &owner_key)
+            .await?;
         let client = cached.client.clone();
-        guard.insert(identity.mxid.clone(), Arc::new(cached));
+        guard.insert(owner_key, Arc::new(cached));
         drop(guard);
         Ok(client)
     }
@@ -147,6 +152,7 @@ impl MatrixClientCache {
         &self,
         identity: &AuthenticatedIdentity,
         access_token: &str,
+        owner_key: &str,
     ) -> Result<CachedClient> {
         let user_id = UserId::parse(&identity.mxid)
             .with_context(|| format!("parse mxid: {}", identity.mxid))?;
@@ -158,16 +164,18 @@ impl MatrixClientCache {
                 anyhow::anyhow!("OAuth token has no device_id; refusing to build E2EE client")
             })?;
 
-        let store_path = self.user_store_dir(&user_id);
+        let store_path = self.user_store_dir(owner_key);
         tokio::fs::create_dir_all(&store_path)
             .await
             .with_context(|| format!("create store dir {}", store_path.display()))?;
 
-        let passphrase = derive_store_passphrase(&self.store.pepper, &identity.mxid);
+        let passphrase = derive_store_passphrase(&self.store.pepper, owner_key);
         let passphrase_fp = passphrase_fingerprint(&passphrase);
 
         info!(
             mxid = %identity.mxid,
+            mas_subject = %identity.mas_subject,
+            device_id = ?identity.device_id,
             store_path = %store_path.display(),
             passphrase_fp = %passphrase_fp,
             "building matrix-sdk client",
@@ -218,28 +226,41 @@ impl MatrixClientCache {
         })
     }
 
-    fn user_store_dir(&self, user_id: &UserId) -> PathBuf {
-        self.store.root.join(mxid_dir_name(user_id.as_str()))
+    fn user_store_dir(&self, owner_key: &str) -> PathBuf {
+        self.store.root.join(owner_dir_name(owner_key))
     }
 }
 
-/// SHA-256 the mxid, hex-encode, take the first 32 chars. Stable and
+/// Compose the resource-server ownership key from MAS's non-reassignable
+/// subject and the Matrix device id. The device id is included because the
+/// `matrix-sdk` `SQLite` crypto store is for one restored Matrix device.
+fn owner_key(identity: &AuthenticatedIdentity) -> Result<String> {
+    let device_id = identity.device_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("OAuth token has no device_id; refusing to build E2EE client")
+    })?;
+    Ok(format!(
+        "mas-sub:{} device:{device_id}",
+        identity.mas_subject
+    ))
+}
+
+/// SHA-256 the owner key, hex-encode, take the first 32 chars. Stable and
 /// filesystem-safe.
-fn mxid_dir_name(mxid: &str) -> String {
+fn owner_dir_name(owner_key: &str) -> String {
     let mut h = Sha256::new();
-    h.update(mxid.as_bytes());
+    h.update(owner_key.as_bytes());
     let digest = h.finalize();
     hex::encode(&digest[..16]) // 16 bytes = 32 hex chars
 }
 
-/// Derive the per-user matrix-sdk store passphrase via HKDF-SHA256.
+/// Derive the per-owner matrix-sdk store passphrase via HKDF-SHA256.
 ///
 /// We hex-encode the 32-byte output before handing it to matrix-sdk
 /// because the SDK's `passphrase` takes `&str`; using hex keeps the
 /// `&str` invariant clean (no embedded NUL / surrogate concerns) while
 /// preserving full 256-bit entropy.
-fn derive_store_passphrase(pepper: &str, mxid: &str) -> String {
-    let hkdf = Hkdf::<Sha256>::new(Some(mxid.as_bytes()), pepper.as_bytes());
+fn derive_store_passphrase(pepper: &str, owner_key: &str) -> String {
+    let hkdf = Hkdf::<Sha256>::new(Some(owner_key.as_bytes()), pepper.as_bytes());
     let mut okm = [0u8; 32];
     // HKDF-SHA256 OKM length up to 8160 bytes is infallible; 32 always
     // succeeds. Unwrap is justified — the only error is OOM-shaped.
@@ -263,9 +284,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mxid_dir_name_is_stable() {
-        let a = mxid_dir_name("@alice:example.com");
-        let b = mxid_dir_name("@alice:example.com");
+    fn owner_dir_name_is_stable() {
+        let a = owner_dir_name("mas-sub:01JA device:DEVICE");
+        let b = owner_dir_name("mas-sub:01JA device:DEVICE");
         assert_eq!(a, b);
         assert_eq!(a.len(), 32, "expected 16 bytes hex-encoded");
         // The whole point: no `@` or `:` in the path component.
@@ -274,34 +295,51 @@ mod tests {
     }
 
     #[test]
-    fn mxid_dir_name_differs_per_user() {
-        let a = mxid_dir_name("@alice:example.com");
-        let b = mxid_dir_name("@other:example.com");
+    fn owner_dir_name_differs_per_subject() {
+        let a = owner_dir_name("mas-sub:01JA device:DEVICE");
+        let b = owner_dir_name("mas-sub:01JB device:DEVICE");
         assert_ne!(a, b);
     }
 
     #[test]
-    fn passphrase_is_deterministic_per_mxid() {
+    fn owner_key_ignores_reassignable_mxid() {
+        let first = AuthenticatedIdentity {
+            mas_subject: "01JA".to_owned(),
+            mxid: "@alice:example.test".to_owned(),
+            device_id: Some("DEVICE".to_owned()),
+            raw_scope: None,
+        };
+        let second = AuthenticatedIdentity {
+            mas_subject: "01JB".to_owned(),
+            mxid: "@alice:example.test".to_owned(),
+            device_id: Some("DEVICE".to_owned()),
+            raw_scope: None,
+        };
+        assert_ne!(owner_key(&first).unwrap(), owner_key(&second).unwrap());
+    }
+
+    #[test]
+    fn passphrase_is_deterministic_per_owner() {
         let pepper = "deadbeef".repeat(8); // 64 chars
-        let a = derive_store_passphrase(&pepper, "@alice:example.com");
-        let b = derive_store_passphrase(&pepper, "@alice:example.com");
+        let a = derive_store_passphrase(&pepper, "mas-sub:01JA device:DEVICE");
+        let b = derive_store_passphrase(&pepper, "mas-sub:01JA device:DEVICE");
         assert_eq!(a, b);
         // 32-byte OKM hex-encoded = 64 chars.
         assert_eq!(a.len(), 64);
     }
 
     #[test]
-    fn passphrase_differs_per_mxid() {
+    fn passphrase_differs_per_owner() {
         let pepper = "deadbeef".repeat(8);
-        let a = derive_store_passphrase(&pepper, "@a:example.com");
-        let b = derive_store_passphrase(&pepper, "@b:example.com");
+        let a = derive_store_passphrase(&pepper, "mas-sub:01JA device:DEVICE");
+        let b = derive_store_passphrase(&pepper, "mas-sub:01JB device:DEVICE");
         assert_ne!(a, b);
     }
 
     #[test]
     fn passphrase_differs_per_pepper() {
-        let a = derive_store_passphrase(&"a".repeat(64), "@alice:example.com");
-        let b = derive_store_passphrase(&"b".repeat(64), "@alice:example.com");
+        let a = derive_store_passphrase(&"a".repeat(64), "mas-sub:01JA device:DEVICE");
+        let b = derive_store_passphrase(&"b".repeat(64), "mas-sub:01JA device:DEVICE");
         assert_ne!(a, b);
     }
 
