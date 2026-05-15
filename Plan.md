@@ -22,11 +22,11 @@ underneath is correct.
       Fields: ts, request_id, mxid, tool, room_id, outcome, latency_ms,
       error_class. **Never** message body, recovery key, bearer, room
       content. Alloy ships to Loki. <!-- completed 2026-05-15 -->
-- [ ] 5.2 Prometheus `/metrics` endpoint on a separate port; never
+- [x] 5.2 Prometheus `/metrics` endpoint on a separate port; never
       label by mxid/room_id/token. Counters: tool_calls_total{tool,
       outcome}; histograms: tool_latency_seconds{tool},
       mas_introspect_latency_seconds. ServiceMonitor manifest in
-      argocd.
+      argocd. <!-- completed 2026-05-15 -->
 - [ ] 5.3 Grafana dashboard JSON in `clusters/gruyere/platform/grafana-dashboards/`:
       tool-call rate, error rate, p50/p95/p99 latency per tool, MAS
       introspect latency, sync state, /setup attempts/successes.
