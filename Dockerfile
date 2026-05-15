@@ -5,7 +5,11 @@
 # Compatible with our existing PSS-restricted namespace conventions.
 
 ARG RUST_VERSION=1.93
-FROM rust:${RUST_VERSION}-bookworm AS builder
+# Digest pinned to rust:1.93-bookworm (OCI index). Update via Renovate or:
+#   TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/rust:pull" | jq -r .token)
+#   curl -sI -H "Accept: application/vnd.oci.image.index.v1+json" -H "Authorization: Bearer $TOKEN" \
+#     "https://registry-1.docker.io/v2/library/rust/manifests/${RUST_VERSION}-bookworm" | grep docker-content-digest
+FROM rust:${RUST_VERSION}-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
 
 WORKDIR /build
 
@@ -24,7 +28,10 @@ RUN cargo build --release --locked
 
 # Distroless runtime: no shell, no apt, no package manager. Smaller surface.
 # `cc` variant includes glibc + ca-certs which we need for HTTPS to MAS / Synapse.
-FROM gcr.io/distroless/cc-debian12:nonroot
+# Digest pinned to gcr.io/distroless/cc-debian12:nonroot (OCI index). Update via:
+#   curl -sI -H "Accept: application/vnd.oci.image.index.v1+json" \
+#     "https://gcr.io/v2/distroless/cc-debian12/manifests/nonroot" | grep docker-content-digest
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
 
 WORKDIR /app
 COPY --from=builder /build/target/release/matrix-mcp /app/matrix-mcp
