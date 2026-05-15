@@ -38,7 +38,7 @@ use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{Instrument as _, Span, warn};
 
 use crate::audit::{self, outcome};
 use crate::audit_room;
@@ -585,6 +585,7 @@ impl MatrixMcpService {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("whoami", &mxid_for_audit, None);
         let result = (|| {
             self.rate_limit_check(&ctx, Category::Read)?;
             let id = identity_from_ctx(&ctx).ok_or_else(missing_identity_err)?;
@@ -593,7 +594,15 @@ impl MatrixMcpService {
                 device_id: id.device_id,
             })
         })();
-        emit_tool_audit("whoami", &mxid_for_audit, None, started, None, &result);
+        emit_tool_audit(
+            "whoami",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
         result
     }
 
@@ -608,6 +617,7 @@ impl MatrixMcpService {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("list_joined_rooms", &mxid_for_audit, None);
         let (result, room_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -616,6 +626,7 @@ impl MatrixMcpService {
             let res = structured_result(&JoinedRoomsResult { rooms });
             Ok::<_, ErrorData>((res, count))
         }
+        .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
         emit_tool_audit(
@@ -624,6 +635,7 @@ impl MatrixMcpService {
             None,
             started,
             Some(room_count),
+            &span,
             &result,
         );
         result
@@ -649,6 +661,11 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "read_recent_messages",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
         let (result, event_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -671,6 +688,7 @@ impl MatrixMcpService {
             let res = structured_result(&ReadRecentMessagesResult { events });
             Ok::<_, ErrorData>((res, count))
         }
+        .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
         emit_tool_audit(
@@ -679,6 +697,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             Some(event_count),
+            &span,
             &result,
         );
         result
@@ -703,6 +722,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("read_thread", &mxid_for_audit, Some(&room_id_for_audit));
         let (result, event_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -737,6 +757,7 @@ impl MatrixMcpService {
             let res = structured_result(&ReadThreadResult { events });
             Ok::<_, ErrorData>((res, count))
         }
+        .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
         emit_tool_audit(
@@ -745,6 +766,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             Some(event_count),
+            &span,
             &result,
         );
         result
@@ -764,6 +786,11 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "send_text_message",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             validate_text_message_body(&params.body)?;
@@ -784,6 +811,7 @@ impl MatrixMcpService {
                 event_id: response.response.event_id.to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "send_text_message",
@@ -791,6 +819,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -818,6 +847,7 @@ impl MatrixMcpService {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("verify_status", &mxid_for_audit, None);
         let result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -882,6 +912,7 @@ impl MatrixMcpService {
                 message,
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "verify_status",
@@ -889,6 +920,7 @@ impl MatrixMcpService {
             None,
             started,
             None,
+            &span,
             &result,
         );
         result
@@ -910,6 +942,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("room_info", &mxid_for_audit, Some(&room_id_for_audit));
         let result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -980,6 +1013,7 @@ impl MatrixMcpService {
                 is_room_creator,
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "room_info",
@@ -987,6 +1021,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         result
@@ -1008,6 +1043,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("room_members", &mxid_for_audit, Some(&room_id_for_audit));
         let (result, member_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -1065,6 +1101,7 @@ impl MatrixMcpService {
             let res = structured_result(&RoomMembersResult { members, total });
             Ok::<_, ErrorData>((res, count))
         }
+        .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
         emit_tool_audit(
@@ -1073,6 +1110,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             Some(member_count),
+            &span,
             &result,
         );
         result
@@ -1090,6 +1128,7 @@ impl MatrixMcpService {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("get_unread_summary", &mxid_for_audit, None);
         let (result, room_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -1147,6 +1186,7 @@ impl MatrixMcpService {
             });
             Ok::<_, ErrorData>((res, total_unread_rooms))
         }
+        .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
         emit_tool_audit(
@@ -1155,6 +1195,7 @@ impl MatrixMcpService {
             None,
             started,
             Some(room_count),
+            &span,
             &result,
         );
         result
@@ -1174,6 +1215,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("mark_read", &mxid_for_audit, Some(&room_id_for_audit));
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
@@ -1207,6 +1249,7 @@ impl MatrixMcpService {
                 event_id: event_id.to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "mark_read",
@@ -1214,6 +1257,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -1241,6 +1285,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("send_reaction", &mxid_for_audit, Some(&room_id_for_audit));
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
@@ -1268,6 +1313,7 @@ impl MatrixMcpService {
                 event_id: response.response.event_id.to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "send_reaction",
@@ -1275,6 +1321,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -1303,6 +1350,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("redact_message", &mxid_for_audit, Some(&room_id_for_audit));
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
@@ -1327,6 +1375,7 @@ impl MatrixMcpService {
                 event_id: response.event_id.to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "redact_message",
@@ -1334,6 +1383,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -1365,6 +1415,11 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "download_attachment",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
         let result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -1509,6 +1564,7 @@ impl MatrixMcpService {
                 filename,
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "download_attachment",
@@ -1516,6 +1572,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             Some(1),
+            &span,
             &result,
         );
         result
@@ -1550,6 +1607,11 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "send_image_from_url",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
 
@@ -1668,6 +1730,7 @@ impl MatrixMcpService {
                 mxc_uri: mxc_uri.to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "send_image_from_url",
@@ -1675,6 +1738,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -1706,6 +1770,11 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "search_messages",
+            &mxid_for_audit,
+            room_id_for_audit.as_deref(),
+        );
         let (result, hit_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
@@ -1794,6 +1863,7 @@ impl MatrixMcpService {
             });
             Ok::<_, ErrorData>((res, count))
         }
+        .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
         emit_tool_audit(
@@ -1802,6 +1872,7 @@ impl MatrixMcpService {
             room_id_for_audit.as_deref(),
             started,
             Some(hit_count),
+            &span,
             &result,
         );
         result
@@ -1821,6 +1892,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id_or_alias.clone();
+        let span = make_tool_span("join_room", &mxid_for_audit, Some(&room_id_for_audit));
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
@@ -1839,6 +1911,7 @@ impl MatrixMcpService {
                 room_id: room.room_id().to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "join_room",
@@ -1846,6 +1919,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -1871,6 +1945,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("leave_room", &mxid_for_audit, Some(&room_id_for_audit));
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
@@ -1887,6 +1962,7 @@ impl MatrixMcpService {
                 room_id: room_id.to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "leave_room",
@@ -1894,6 +1970,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -1919,6 +1996,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("invite_user", &mxid_for_audit, Some(&room_id_for_audit));
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
@@ -1939,6 +2017,7 @@ impl MatrixMcpService {
                 mxid: user_id.to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "invite_user",
@@ -1946,6 +2025,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -1981,6 +2061,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("set_audit_room", &mxid_for_audit, Some(&room_id_for_audit));
         let result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
@@ -1997,6 +2078,7 @@ impl MatrixMcpService {
                 room_id: room_id.to_string(),
             })
         }
+        .instrument(span.clone())
         .await;
         emit_tool_audit(
             "set_audit_room",
@@ -2004,6 +2086,7 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
             &result,
         );
         emit_write_notice(
@@ -2215,14 +2298,33 @@ async fn emit_write_notice(
 /// Audit-log a finished tool call. Looks at the result to decide the
 /// outcome class and pulls the JSON-RPC error code into a stable
 /// `error_class` string. Keeps audit emission DRY across every tool.
+/// Build an `mcp.tool` span for a tool call. The `outcome` and
+/// `latency_ms` fields are recorded after the call completes via
+/// `Span::record()`.
+///
+/// Attributes carry envelope metadata only — no message bodies, keys,
+/// tokens, or display names (same invariant as `audit.rs`).
+fn make_tool_span(tool: &'static str, mxid: &str, room_id: Option<&str>) -> Span {
+    tracing::info_span!(
+        "mcp.tool",
+        tool,
+        mxid,
+        room_id = room_id.unwrap_or(""),
+        outcome = tracing::field::Empty,
+        latency_ms = tracing::field::Empty,
+    )
+}
+
 fn emit_tool_audit(
     tool: &'static str,
     mxid: &str,
     room_id: Option<&str>,
     started: Instant,
     event_count: Option<usize>,
+    span: &Span,
     result: &Result<rmcp::model::CallToolResult, ErrorData>,
 ) {
+    let elapsed = started.elapsed();
     let (outcome, err_class) = match result {
         Ok(_) => (outcome::OK, None),
         Err(e) => {
@@ -2237,6 +2339,11 @@ fn emit_tool_audit(
             (outcome_str, Some(class))
         }
     };
+    span.record("outcome", outcome);
+    span.record(
+        "latency_ms",
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    );
     audit::tool_call(
         tool,
         mxid,
