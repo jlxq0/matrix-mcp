@@ -1,13 +1,193 @@
 # Changelog
 
-## Unreleased
+All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+---
+
+## [v0.1.0] – 2026-05-15
 
 ### Added
+- `send_reaction(room_id, event_id, key)` – add an emoji reaction to an event.
+- `redact_message(room_id, event_id, reason?)` – delete an event.
+- `room_info(room_id)` – name, topic, encryption, member counts, power level.
+- `room_members(room_id, limit?)` – list joined members with display names and avatars.
+- `get_unread_summary()` – rooms with unread messages sorted by latest activity.
+- `mark_read(room_id, event_id?)` – send an unthreaded read receipt.
+- `download_attachment(room_id, event_id)` – return file as base64 + content-type. Size-capped.
+- `send_image_from_url(room_id, image_url, caption?)` – fetch URL, upload to media repo, send m.image.
+- `search_messages(query, room_id?)` – wrap `/_matrix/client/v3/search`. Body null for E2EE rooms.
+- `join_room(room_id_or_alias)`, `leave_room(room_id)`, `invite_user(room_id, mxid)`.
+- `read_recent_messages`: per-event `in_reply_to`, `is_thread_root`, `thread_event_count` fields.
+- `read_thread(room_id, root_event_id, limit?)` – fetch a thread by its root event id.
+- Per-identity token-bucket rate limiting. Defaults: 60 reads/min, 30 writes/min.
+- CSRF token on `POST /setup/recover`; session cookie path tightened to `/setup`.
+- Sync watchdog: exponential backoff on homeserver errors in the background sync loop.
+- Prometheus `/metrics` on pod IP:9090. Counters and histograms per tool.
+- Tool-call audit log (envelope only, no message bodies) to stdout JSON.
 
-- Phase 0 skeleton: axum HTTP server on `:3000` with `/healthz`.
-- Plan, architecture, and security design docs.
-- CI: fmt, clippy (`-D warnings`), test, audit, deny, docker build.
-- Multi-stage Dockerfile producing a distroless image (~25 MiB).
+### Fixed
+- Key Matrix clients by stable MAS `sub` (ULID) instead of mutable MXID (audit #1).
+- Enforce Matrix C-S API scope on every active token (audit #2, #7).
+- CI GHCR write permission scoped to tag-only pushes (audit #3).
+- PKCE and session maps are now bounded (256 and 64 entries) with TTL pruning (audit #4, #12).
+- Cap tool inputs: message limit, body size, member list size, search result count (audit #5, #6, #14).
+- Serialize first-use `MatrixClientCache` construction; abort sync task on drop (audit #9).
+- Drop broken rate-limit janitor that reset exhausted quotas (audit #10).
+- Bind metrics listener to pod IP, not `0.0.0.0` (audit #11).
+- Tighter MCP session TTL and global session cap (audit #13).
+- `room_info` now only returns data for joined rooms (not invited/left/banned).
+- CI actions and Docker images pinned to digest SHAs (audit #8).
+- Metrics listener defaults to `127.0.0.1:9090` in dev, `{POD_IP}:9090` in k8s.
+
+### Removed
+- `recover_with_key` MCP tool (key now flows via browser `/setup` only).
+
+---
+
+## [v0.0.15] – 2026-05-15
+
+### Added
+- Prometheus `/metrics` endpoint on a separate cluster-internal port (9090).
+  ServiceMonitor manifest in argocd.
+
+---
+
+## [v0.0.14] – 2026-05-15
+
+### Added
+- Structured audit log for every tool call (stdout JSON, shipped to Loki via Alloy).
+- `Plan.md` roadmap document.
+
+---
+
+## [v0.0.13] – 2026-05-14
+
+### Added
+- Pull megolm key backup after `recovery().recover()` so E2EE history decrypts.
+  Background task: up to 200 rooms, 15 s timeout per room.
+
+---
+
+## [v0.0.12] – 2026-05-14
+
+### Fixed
+- Use `/authorize` (not `/oauth2/authorize`) for the setup PKCE flow –
+  MAS endpoint quirk discovered on live deployment.
+
+---
+
+## [v0.0.11] – 2026-05-14
+
+### Changed
+- `recover_with_key` MCP tool replaced with browser-based `/setup` flow.
+  Recovery key now taken via HTTPS form, never stored, never in chat history.
+
+---
+
+## [v0.0.10] – 2026-05-13
+
+### Added
+- `recover_with_key` MCP tool for cross-signing via secret storage.
+  *(Removed in v0.1.0 – key flowed through chat history.)*
+
+---
+
+## [v0.0.9] – 2026-05-13
+
+### Fixed
+- Force `/keys/query` before reading user identity in `verify_status`
+  so OAuth-restored sessions see up-to-date cross-signing state.
+
+---
+
+## [v0.0.8] – 2026-05-13
+
+### Fixed
+- Parse `device_id` from the `scope` string when MAS omits the
+  `device_id` field even with `X-MAS-Supports-Device-Id: 1`.
+
+---
+
+## [v0.0.7] – 2026-05-13
+
+### Fixed
+- Send `X-MAS-Supports-Device-Id: 1` on introspect requests to opt into
+  MAS's dedicated `device_id` field.
+
+---
+
+## [v0.0.6] – 2026-05-13
+
+### Fixed
+- Advertise the device-binding scope in the protected-resource metadata
+  so claude.ai requests it and MAS binds the token to the matrix-mcp device.
+
+---
+
+## [v0.0.5] – 2026-05-12
+
+### Fixed
+- Build MXID from MAS `username` field + configured `server_name`, not
+  from `sub` (which is an opaque MAS ULID, not a Matrix localpart).
+
+---
+
+## [v0.0.4] – 2026-05-12
+
+### Fixed
+- Accept introspection tokens without an `aud` claim (claude.ai omits
+  `resource=` in token requests; MAS therefore omits `aud`).
+
+---
+
+## [v0.0.3] – 2026-05-12
+
+### Changed
+- Rename `/healthz` → `/health` to match cluster convention.
+
+---
+
+## [v0.0.2] – 2026-05-12
+
+### Fixed
+- Bundle SQLite statically into the binary via `rusqlite`'s `bundled`
+  feature so the distroless container doesn't need `libsqlite3.so`.
+
+---
+
+## [v0.0.1] – 2026-05-10
+
+### Added
+- Axum HTTP server on `:3000`.
+- MAS introspection client with 60 s token cache.
+- Streamable HTTP MCP transport (`/mcp` endpoint) via `rmcp`.
+- OAuth 2.1 resource server: `/.well-known/oauth-protected-resource`,
+  `WWW-Authenticate` on 401.
+- `whoami` tool – first E2EE-aware tool.
+- `list_joined_rooms`, `read_recent_messages`, `send_text_message` tools
+  backed by `matrix-rust-sdk` (phase 2 + 3).
+- `verify_status` tool for checking cross-signing state.
+- `/setup` browser flow for recovery-key import.
+- Per-user encrypted SQLite stores (phase 3 E2EE).
+- `GET /health` endpoint.
+- Multi-stage Dockerfile: Rust builder → distroless `cc-debian12:nonroot`.
+- CI: fmt, clippy, test, cargo audit, cargo deny, docker build.
 - AGPL-3.0-or-later license.
+- Production deploy on Gruyere (`matrix-mcp.example.com`).
 
-[Unreleased]: https://github.com/jlxq0/matrix-mcp/compare/main...HEAD
+[v0.1.0]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.15...v0.1.0
+[v0.0.15]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.14...v0.0.15
+[v0.0.14]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.13...v0.0.14
+[v0.0.13]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.12...v0.0.13
+[v0.0.12]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.11...v0.0.12
+[v0.0.11]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.10...v0.0.11
+[v0.0.10]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.9...v0.0.10
+[v0.0.9]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.8...v0.0.9
+[v0.0.8]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.7...v0.0.8
+[v0.0.7]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.6...v0.0.7
+[v0.0.6]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.5...v0.0.6
+[v0.0.5]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.4...v0.0.5
+[v0.0.4]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.3...v0.0.4
+[v0.0.3]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.2...v0.0.3
+[v0.0.2]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.1...v0.0.2
+[v0.0.1]: https://github.com/jlxq0/matrix-mcp/releases/tag/v0.0.1

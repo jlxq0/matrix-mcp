@@ -1,118 +1,156 @@
 # Security
 
-Last updated 2026-05-14. Phase 0 — pre-implementation. Revised as the
-code lands.
+Last updated: 2026-05-15, v0.1.0.
 
-## What this server is, security-wise
+## What matrix-mcp is, security-wise
 
-`matrix-mcp` is a Matrix client running on a server, holding **per-user
-E2EE device keys** so it can decrypt messages on behalf of the user. It
-is *not* a "neutral" middleware. From a threat-model perspective it is
-**part of the user's TCB** for E2EE, same as Element on your laptop or
-mautrix-signal in our cluster.
+matrix-mcp is a Matrix client running on a server. It holds per-user
+E2EE device keys and can decrypt messages on behalf of users. From a
+threat-model perspective it is **part of the user's TCB** for E2EE –
+equivalent to Element X on a laptop or a mautrix bridge in the cluster.
 
-## Threat model
+Any operator deploying this server should treat its pod like a
+cross-signing device: compromise of the pod means compromise of every
+room key for every user who has used that pod.
 
-### What an attacker gains from each compromise
+---
 
-| Compromise | Gains |
-|---|---|
-| Read access to PVC disk only | Encrypted SQLite blobs. **No plaintext keys without the pepper.** |
-| Read access to a pod env var (without disk) | The pepper. Useful only when combined with disk access. |
-| Full pod compromise (root in container) | Disk + env + memory. All room keys for all logged-in users — past, future. Audit logs leak only if Loki/Alloy compromised separately. |
-| Compromise of MAS (the issuer) | Ability to mint tokens that pass introspection. Equivalent to full pod compromise for users whose tokens were minted. |
-| Compromise of Synapse | All Matrix data + ability to manipulate cross-signing. Not new — Synapse compromise is already terminal. |
-| Compromise of claude.ai (client) | Claude can call tools as the user. Limited to the tools we expose; logged in our audit trail. |
-| Network-tier MITM | TLS termination at Traefik makes this hard from outside. Inside cluster, NetworkPolicy + Kyverno prevent same-namespace pod-to-pod sniffing. |
+## Attacker model
 
-The headline threat is **pod compromise reveals all room keys for all
-logged-in users**. This is fundamental to the design — server-side E2EE
-*by definition* requires the server to hold keys.
+We consider the following adversaries:
 
-### Mitigations
+1. **External network attacker** – can observe traffic from outside the cluster.
+2. **Rogue claude.ai client** – a claude.ai session (or bearer token
+   holder) calling tools with malicious intent.
+3. **Leaked bearer token** – a valid MAS access token extracted from
+   network traffic or session data.
+4. **Pod compromise** – attacker has code execution inside the container.
+5. **Disk-only access** – attacker exfiltrates the PVC without the pod env.
+6. **Pepper compromise** – attacker reads `MATRIX_MCP_STORE_PEPPER` only.
+7. **MAS compromise** – attacker can mint tokens that pass introspection.
+8. **Synapse compromise** – attacker controls the homeserver.
 
-#### Confidentiality of stored data
-- SQLite files encrypted with `matrix-sdk`'s `StoreCipher`
-- Per-user passphrase = `HKDF-SHA256(pepper, mxid)` — pepper is the
-  only secret; `mxid` is the salt
-- Pepper lives in a Kubernetes Secret backed by an ExternalSecret
-  (1Password); **never written to disk**
+---
 
-#### Pod hardening
-- PSS `restricted` namespace label
+## What each compromise gives an attacker
+
+| Attacker | Gets | Doesn't get | Primary defence |
+|---|---|---|---|
+| External network | Nothing – TLS at Traefik | Plaintext requests | TLS + Traefik IP allowlist |
+| Rogue claude.ai client | Tool calls as that user | Other users' data | Per-user isolation, rate limits, audit log |
+| Leaked bearer token | Same as rogue client for that user | Persistent access (tokens expire) | Token TTL, 60 s introspection cache max |
+| Pod compromise (read) | Pepper + disk → all user key stores | Audit logs (in Loki) | PSS restricted, read-only root FS |
+| Pod compromise (exec) | Full control of all active sessions | Keys for users not yet synced | Single replica, no root, no privilege escalation |
+| Disk-only (PVC exfil) | Encrypted SQLite blobs | Plaintext keys (no pepper) | HKDF key derivation; pepper lives only in env |
+| Pepper-only | Derivation formula | Nothing without the stores | Pepper and disk must both be compromised |
+| MAS compromise | Mint passing tokens → pod-level access | Historical keys (users not connected since) | Token expiry, Synapse scope re-validation |
+| Synapse compromise | All Matrix data | Nothing new beyond Synapse compromise | Out of scope – Synapse compromise is terminal |
+
+### Headline risk
+
+**Full pod compromise reveals all room keys for all users who have
+connected to this pod.** This is inherent to server-side E2EE – a
+server holding device keys must be treated as a trusted device.
+
+Mitigating factors: single-replica (blast radius bounded to one pod),
+PSS-restricted namespace, read-only root filesystem, audit logging to Loki.
+
+---
+
+## Mitigations in place
+
+### Storage encryption
+
+- SQLite stores encrypted by `matrix-sdk`'s `StoreCipher`.
+- Per-user passphrase = `HKDF-SHA256(salt=owner_key, ikm=pepper,
+  info="matrix-mcp-store-cipher v1")`.
+- Owner key = `sha256(mas_subject + device_id)[..32]` – stable across
+  token refreshes, resistant to MXID localpart renames.
+- Pepper is a Kubernetes Secret sourced from 1Password via ExternalSecret.
+  **Never written to disk.**
+
+### Pod hardening (PSS restricted)
+
 - `runAsNonRoot: true`, `runAsUser: 1000`
 - `readOnlyRootFilesystem: true`
-- `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`
+- `allowPrivilegeEscalation: false`
+- `capabilities.drop: ["ALL"]`
 - `seccompProfile.type: RuntimeDefault`
-- Single writable mount: the `/var/lib/matrix-mcp` PVC
 
-#### Network boundary
-- **Ingress:** from Traefik namespace only (existing pattern)
-- **Egress:** allowlisted to MAS, Synapse, and cluster DNS. R2 added
-  when/if we proxy media.
-- **External IP allowlist** at Traefik for Anthropic's documented egress
-  range `160.79.104.0/21`. Defence in depth against scanners.
+### Network boundary
 
-#### Authentication
-- MAS opaque-token introspection on every request
-- Resource indicator (`resource=https://matrix-mcp.example.com`)
-  validated against the introspection response
-- Introspection cached for **60 s max**; cache invalidates on a 401
-  from Synapse downstream
+- Ingress: from Traefik namespace only (NetworkPolicy).
+- Egress: allowlisted to MAS, Synapse, and cluster DNS.
+- External IP allowlist at Traefik: Anthropic egress `160.79.104.0/21`.
 
-#### Audit
-- Every tool invocation logged: timestamp, user MXID, tool name, room
-  id (if relevant), arg-hash, result-size, latency, success/error
-- Shipped to Loki via stdout JSON + Alloy (existing pattern)
-- Grafana alert proposals (Phase 4):
-  - Tool error rate > 5 % over 10 m
-  - OAuth introspection failures > 1/s
-  - Decryption failures > 0 (any failure is interesting)
+### Authentication
 
-#### Operational
-- Pod is **single replica** in Phase 4 (state is per-pod). Multi-replica
-  needs `CrossProcessLockConfig` in matrix-rust-sdk — deferred.
-- Container base images are digest-pinned in the Dockerfile (`rust:1.93-bookworm` and
-  `gcr.io/distroless/cc-debian12:nonroot`). Third-party GitHub Actions in `ci.yml` are
-  pinned to full commit SHAs. Renovate watches both for updates.
-- CI action SHAs and image digests were resolved 2026-05-15; update when Renovate bumps them.
+- MAS opaque-token introspection on every request.
+- Tokens **must** carry a Matrix C-S API scope token
+  (`urn:matrix:client:api:*` or MSC2967 unstable equivalent).
+- `aud` validated against our resource URL when present; missing `aud`
+  accepted with a WARN log (claude.ai behaviour – see ADR-03).
+- Introspection cached 60 s or token TTL, whichever is shorter.
+- Cache invalidates on a 401 from Synapse.
+- MAS `sub` (stable ULID) used as store ownership key – mutable MXID
+  localpart cannot hijack another user's store (ADR-01).
 
-### Mitigations deferred
+### /setup hardening
 
-- **MCP elicitation for per-session passphrase**: if claude.ai supports
-  elicitation in custom connectors (unverified as of 2026-05-14), we
-  flip from "pepper-always-in-env" to "user types passphrase per
-  session". Threat model improves to: pod compromise *while the user is
-  actively connected* leaks current session keys only.
-- **90-day device rotation**: caps historical-decryption blast radius
-  if a key store is later exfiltrated.
-- **Per-tool authorisation policy** beyond "user authenticated → all
-  tools": narrowing send permissions to specific rooms via an explicit
-  user-configured policy.
+- PKCE state map capped at 256 entries; sessions at 64. Both TTL-pruned.
+- CSRF token on `POST /setup/recover`, validated in constant time.
+- Session cookie: `__Secure-` prefix, `Path=/setup`, `HttpOnly`,
+  `SameSite=Lax`, session-only (no Max-Age).
+- Setup sessions are isolated from the `/mcp` auth path.
 
-## Specific external risks to watch
+### Rate limiting
 
-- **vodozemac contributory-check issue (Feb 2026)**. Two issues
-  disclosed by Soatok: non-contributory X25519 acceptance + v2 → v1
-  downgrade. Matrix.org committed to a defence-in-depth fix; no
-  version pinned as of 2026-05-14. We're shipping with current
-  `matrix-sdk` and will bump when the fix lands.
-- **Anthropic egress range change**. Documented as stable but we should
-  page on auth failures so an unannounced change is caught quickly.
-- **MAS DCR policy regressions**. Our MAS policy currently enforces
-  `client_uri` host match (good). If that policy ever loosens or
-  introspection-bypass appears, our auth would silently accept tokens
-  it shouldn't. Audit cadence: review MAS policy on every MAS upgrade.
+- Per-identity token-bucket: `sha256(bearer)[..16]` + MAS subject ULID.
+- Defaults: 60 reads/min, 30 writes/min. Configurable via env.
+
+### Audit logging
+
+- Every tool call: timestamp, MXID, tool name, room_id, token hash,
+  outcome, latency, error class.
+- **Never logged:** message bodies, recovery keys, bearer tokens, room content.
+- Shipped to Loki via stdout JSON + Alloy.
+
+### Input caps
+
+- `read_recent_messages`: limit capped at 50.
+- `send_text_message`: body capped at 64 KiB.
+- `room_members`: capped at 1000.
+- `search_messages`: capped at 100 results.
+- `download_attachment`: declared + actual size checked against cap (default 5 MiB).
+- `send_image_from_url`: HTTPS only, 3 redirects, 15 s timeout, cap 10 MiB.
+
+### Supply chain
+
+- CI `cargo audit` + `cargo deny` on every PR.
+- Container base images digest-pinned in Dockerfile.
+- GitHub Actions pinned to full commit SHAs.
+- Renovate watches both for updates.
+- `#![forbid(unsafe_code)]` at the crate root.
+
+---
+
+## Residual risk
+
+| Risk | Status |
+|---|---|
+| Pod compromise leaks all active user key stores | **Accepted** – inherent to server-side E2EE. Mitigated by pod hardening + audit log. |
+| SSRF via `send_image_from_url` to RFC-1918 addresses | **Known gap** – HTTPS + redirect cap in place; loopback/RFC-1918 blocking is a future item. |
+| MCP prompt injection via Matrix room content | **Known** – see `matrix_mcp_prompt_injection_pattern` in MEMORY.md. Not a server-side concern. |
+| vodozemac X25519 contributory-check issue (Feb 2026) | **Monitor** – will bump matrix-sdk when the fix lands upstream. |
+| Anthropic egress range change | **Monitor** – auth failure alerts would catch an unannounced change. |
+
+---
 
 ## Things we explicitly do NOT do
 
-- **No persistent refresh token storage on server.** Refresh tokens
-  flow client (claude.ai) → MAS → claude.ai. The MCP server only ever
-  holds short-lived access tokens in memory, refreshed by claude.ai out
-  of band.
-- **No user-supplied URLs or recovery keys.** Phase 0–3 don't accept
-  any user-controlled secret that could be a phishing vector.
-- **No HTTP-side ratelimit-bypass paths.** All tool calls go through
-  the same rate-limit middleware.
-- **No `unsafe` Rust code** (`#![forbid(unsafe_code)]` at the crate
-  root).
+- **No persistent refresh-token storage.** Refresh tokens flow claude.ai → MAS → claude.ai.
+- **No unsafe Rust.** `#![forbid(unsafe_code)]` enforced.
+- **No rate-limit bypass paths.** All tool calls share the same middleware.
+- **No SAS verification path.** Cross-signing uses `/setup` only.
+- **No recovery key in chat.** The `recover_with_key` MCP tool was removed;
+  the key flows only via the browser `/setup` form.
