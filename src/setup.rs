@@ -40,9 +40,10 @@
 //!   5-minute TTL. Used to bind a callback back to the originating
 //!   authorize request and to PKCE-verify it.
 //! - **Setup session** (`sessions`): `session_id → (MAS subject, mxid,
-//!   device id, access_token, created_at)`. 30-minute TTL. Held only long
-//!   enough to render the form and process one POST. The `session_id` is a
-//!   random 32-byte value carried in a `__Host-`-prefixed cookie.
+//!   device id, access_token, csrf_token, created_at)`. 30-minute TTL.
+//!   Held only long enough to render the form and process one POST. The
+//!   `session_id` is a random 48-char value carried in a
+//!   `__Secure-`-prefixed cookie scoped to `Path=/setup`.
 //!
 //! ## Why we don't reuse the MCP introspection cache
 //!
@@ -69,6 +70,7 @@ use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -78,10 +80,15 @@ use crate::config::Config;
 use crate::mas::MasIntrospectionClient;
 use crate::matrix_client::MatrixClientCache;
 
-/// Name of the setup-session cookie. The `__Host-` prefix forces the
-/// browser to scope it to this exact host, HTTPS-only, with no Domain
-/// attribute — closes a slew of CSRF/scope footguns.
-const SESSION_COOKIE: &str = "__Host-matrix_mcp_setup";
+/// Name of the setup-session cookie.
+///
+/// We use `__Secure-` (not `__Host-`) so we can restrict the path to
+/// `/setup`. The `__Host-` prefix would also work here but browser spec
+/// requires `Path=/` on `__Host-` cookies — setting `Path=/setup` would
+/// cause the browser to silently reject the cookie entirely. `__Secure-`
+/// gives us Secure-only without the path restriction, and we don't set a
+/// Domain attribute, so the scope remains tight.
+const SESSION_COOKIE: &str = "__Secure-matrix_mcp_setup";
 #[allow(clippy::duration_suboptimal_units)] // clippy suggests from_mins; unstable on 1.93.
 const PKCE_TTL: Duration = Duration::from_secs(300);
 /// Maximum number of OAuth PKCE states retained at once. The /setup/login
@@ -126,6 +133,10 @@ pub struct SetupSession {
     pub device_id: Option<String>,
     pub access_token: String,
     pub created_at: Instant,
+    /// 32-char random alphanumeric CSRF token, bound to this session.
+    /// Generated at callback time, injected into the form as a hidden
+    /// input, and verified in constant time before processing the POST.
+    pub csrf_token: String,
 }
 
 impl SetupState {
@@ -250,6 +261,7 @@ pub async fn callback(
         Ok((identity, access_token)) => {
             let mxid = identity.mxid.clone();
             let session_id = random_alnum(48);
+            let csrf_token = random_alnum(32);
             {
                 let mut guard = state.sessions.write().await;
                 if !insert_pending_session(
@@ -261,6 +273,7 @@ pub async fn callback(
                         device_id: identity.device_id,
                         access_token,
                         created_at: Instant::now(),
+                        csrf_token: csrf_token.clone(),
                     },
                 ) {
                     warn!(
@@ -307,12 +320,14 @@ pub async fn form(State(state): State<SetupState>, jar: CookieJar) -> Response {
     let Some(session) = current_session(&state, &jar).await else {
         return Redirect::to("/setup").into_response();
     };
-    Html(form_html(&session.mxid)).into_response()
+    Html(form_html(&session.mxid, &session.csrf_token)).into_response()
 }
 
 #[derive(Deserialize)]
 pub struct RecoverForm {
     pub recovery_key: String,
+    /// CSRF token injected into the form as a hidden input by `form()`.
+    pub csrf_token: String,
 }
 
 // 100+ lines because the recover handler is intrinsically multi-step
@@ -328,6 +343,32 @@ pub async fn recover(
     let Some(session) = current_session(&state, &jar).await else {
         return Redirect::to("/setup").into_response();
     };
+
+    // CSRF check: compare the submitted token against the session-bound
+    // token in constant time to avoid timing side-channels.
+    let token_matches = session
+        .csrf_token
+        .as_bytes()
+        .ct_eq(form.csrf_token.as_bytes())
+        .unwrap_u8()
+        == 1;
+    if !token_matches {
+        warn!(mxid = %session.mxid, "setup_recover: CSRF token mismatch");
+        audit::setup_event(
+            "setup_recover",
+            Some(&session.mxid),
+            outcome::DENIED,
+            SetupExtras {
+                error_class: Some("csrf"),
+                ..SetupExtras::default()
+            },
+        );
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Invalid or missing CSRF token. Please go back and try again.",
+        );
+    }
+
     let key = form.recovery_key.trim().to_owned();
     if key.is_empty() {
         return error_page(
@@ -471,7 +512,12 @@ pub async fn recover(
                     sessions.remove(&sid);
                 }
             }
-            let cleared = jar.remove(Cookie::from(SESSION_COOKIE));
+            // Must match the Path set in build_session_cookie so the browser
+            // actually removes the cookie (a mismatch means the Set-Cookie
+            // deletion is for a different path-scoped cookie).
+            let mut expired = Cookie::from(SESSION_COOKIE);
+            expired.set_path("/setup");
+            let cleared = jar.remove(expired);
             (cleared, Html(SUCCESS_HTML)).into_response()
         }
         Err(e) => {
@@ -627,8 +673,13 @@ fn build_session_cookie(session_id: &str) -> Cookie<'static> {
     // is the actual authority on freshness; the cookie just carries
     // the session id. Closing the tab is a clean "forget about my
     // setup attempt" signal.
+    //
+    // Path=/setup: restricts the cookie to the /setup subtree so it
+    // is never sent to /mcp or any other endpoint. `__Secure-` prefix
+    // (rather than `__Host-`) is intentional — `__Host-` would require
+    // Path=/ by browser spec, silently dropping a Path=/setup cookie.
     let mut c = Cookie::new(SESSION_COOKIE.to_owned(), session_id.to_owned());
-    c.set_path("/");
+    c.set_path("/setup");
     c.set_http_only(true);
     c.set_secure(true);
     c.set_same_site(SameSite::Lax);
@@ -742,8 +793,11 @@ minute later should show previously-undecryptable history as
 <p>You can close this tab.</p>
 </body></html>"#;
 
-fn form_html(mxid: &str) -> String {
+fn form_html(mxid: &str, csrf_token: &str) -> String {
     let mxid_safe = html_escape(mxid);
+    // csrf_token is random alphanumeric — no escaping needed, but use
+    // html_escape defensively in case the alphabet ever widens.
+    let csrf_safe = html_escape(csrf_token);
     page(
         "matrix-mcp — recovery key",
         &format!(
@@ -753,6 +807,7 @@ Storage recovery key (the 48-character <code>Esso&nbsp;…</code> string)
 or the security passphrase you set up in Element X when you first
 enabled cross-signing.</p>
 <form method="POST" action="/setup/recover" autocomplete="off">
+<input type="hidden" name="csrf_token" value="{csrf_safe}">
 <label for="recovery_key">Recovery key</label>
 <input type="password" id="recovery_key" name="recovery_key" required autofocus
        autocomplete="off" spellcheck="false" inputmode="text">
@@ -936,6 +991,7 @@ mod tests {
                         mxid: format!("@user{i}:example.com"),
                         device_id: None,
                         access_token: "tok".into(),
+                        csrf_token: "dummy".into(),
                         created_at: Instant::now(),
                     },
                 ),
@@ -954,6 +1010,7 @@ mod tests {
                     mxid: "@overflow:example.com".into(),
                     device_id: None,
                     access_token: "tok".into(),
+                    csrf_token: "dummy".into(),
                     created_at: Instant::now(),
                 },
             ),
@@ -978,6 +1035,7 @@ mod tests {
                     mxid: format!("@stale{i}:example.com"),
                     device_id: None,
                     access_token: "tok".into(),
+                    csrf_token: "dummy".into(),
                     created_at: expired_at,
                 },
             );
@@ -994,6 +1052,7 @@ mod tests {
                     mxid: "@fresh:example.com".into(),
                     device_id: None,
                     access_token: "tok".into(),
+                    csrf_token: "dummy".into(),
                     created_at: Instant::now(),
                 },
             ),
@@ -1001,5 +1060,16 @@ mod tests {
         );
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("fresh"));
+    }
+
+    #[test]
+    fn csrf_token_mismatch_is_detected() {
+        // Constant-time comparison: different lengths always differ;
+        // same length with one char changed also differs.
+        let stored = b"AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+        let correct = b"AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+        let wrong = b"AbCdEfGhIjKlMnOpQrStUvWxYz012346";
+        assert_eq!(stored.ct_eq(correct).unwrap_u8(), 1);
+        assert_eq!(stored.ct_eq(wrong).unwrap_u8(), 0);
     }
 }
