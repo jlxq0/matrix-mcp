@@ -59,6 +59,11 @@ rand = "0.8"
 # session manager + http transport + worker bits we need to mount the service
 # via `axum::Router::nest_service("/mcp", ...)`.
 rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
+# `futures` is a transitive dep (via rmcp); listed here explicitly so
+# `session.rs` can name the `Stream` trait in its `SessionManager` impl for
+# `CappedSessionManager`.  `default-features = false` avoids pulling in the
+# async executor and other unused features.
+futures = { version = "0.3", default-features = false }
 # Matrix client SDK. We pull in just the pieces needed for E2EE-aware
 # tools: vodozemac (olm/megolm) via `e2e-encryption`, the encrypted
 # on-disk SQLite store via `sqlite`, and markdown rendering for outgoing
