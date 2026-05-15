@@ -138,28 +138,13 @@ pub struct VerifyStatusResult {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RecoverParams {
-    /// The Matrix Secret Storage recovery key — either the 48-character
-    /// base58 string (often shown as four groups of 12 chars separated
-    /// by spaces, e.g. `Esso ABCD…`) or the security passphrase you
-    /// set up when you first enabled cross-signing. matrix-mcp uses
-    /// this once to fetch the cross-signing private keys from
-    /// server-side secret storage; after this call, the matrix-mcp
-    /// device signs itself with your master key on the next sync.
-    /// The key itself is never persisted by matrix-mcp.
-    pub recovery_key: String,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct RecoverResult {
-    /// True iff secret storage opened, the cross-signing private keys
-    /// were imported into the local `OlmMachine`, and a self-signature
-    /// was uploaded. `verify_status` should report `cross_signed: true`
-    /// within ~one sync cycle (≤30s).
-    pub ok: bool,
-    pub message: String,
-}
+// NOTE: an earlier draft (v0.0.10) exposed a `recover_with_key` MCP
+// tool that took the user's recovery key as a tool argument. That
+// path was deliberately removed in favour of the browser-based
+// /setup flow (`setup.rs`), because passing the recovery key as a
+// tool argument leaves it in claude.ai's chat history forever. The
+// /setup flow takes it over HTTPS, processes it server-side, and
+// never persists the key itself.
 
 #[tool_router]
 impl MatrixMcpService {
@@ -285,59 +270,6 @@ impl MatrixMcpService {
         })
     }
 
-    /// Unlock E2EE for the matrix-mcp device using your Matrix Secret
-    /// Storage recovery key (or security phrase). This is the same
-    /// flow Element X uses on first login: matrix-mcp opens secret
-    /// storage on the homeserver, decrypts the cross-signing private
-    /// keys with the recovery key, hands them to the local
-    /// `OlmMachine`, and the SDK auto-signs the device on the next
-    /// sync. No SAS emoji compare with another device required.
-    ///
-    /// The recovery key is used once and not persisted. The imported
-    /// cross-signing private keys go into matrix-mcp's encrypted
-    /// `SQLite` store under the per-user HKDF-derived passphrase.
-    #[tool(
-        description = "Unlock E2EE: provide your Matrix Secret Storage recovery key / security \
-                       phrase so matrix-mcp can self-sign its device using your master key. \
-                       Same flow Element X uses on first login."
-    )]
-    #[allow(clippy::needless_pass_by_value)]
-    async fn recover_with_key(
-        &self,
-        ctx: RequestContext<RoleServer>,
-        Parameters(params): Parameters<RecoverParams>,
-    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
-        let client = self.client_for(&ctx).await?;
-        let encryption = client.encryption();
-        encryption
-            .recovery()
-            .recover(&params.recovery_key)
-            .await
-            .map_err(|e| {
-                ErrorData::internal_error(
-                    format!(
-                        "recover failed: {e}. Check that you pasted the correct security key / \
-                         phrase (the one Element X showed you when you first enabled \
-                         cross-signing)."
-                    ),
-                    None,
-                )
-            })?;
-        // The SDK uploads the self-signature on the next sync; force a
-        // /keys/query so verify_status flips quickly when the caller
-        // checks back.
-        if let Some(me) = client.user_id() {
-            let _ = encryption.request_user_identity(me).await;
-        }
-        structured_result(&RecoverResult {
-            ok: true,
-            message: "Secret storage opened and cross-signing keys imported. The matrix-mcp \
-                      device will self-sign on the next sync (≤30s). Call `verify_status` \
-                      after a few seconds to confirm `cross_signed: true`."
-                .to_owned(),
-        })
-    }
-
     /// Report whether this matrix-mcp device is verified (cross-signed)
     /// by the authenticated user. If not, no message in E2EE rooms can
     /// be decrypted and outgoing messages to E2EE rooms will be
@@ -393,12 +325,17 @@ impl MatrixMcpService {
         };
 
         let message = if !user_has_master_key {
-            "No cross-signing identity found. Set up cross-signing in Element X first.".to_owned()
+            "No cross-signing identity found on the homeserver. Set up cross-signing in \
+             Element X first (Settings → Encryption → Set up secure backup), then visit \
+             https://matrix-mcp.kampong.social/setup to import the keys here."
+                .to_owned()
         } else if cross_signed {
             "matrix-mcp device is cross-signed; E2EE rooms are accessible.".to_owned()
         } else {
-            "matrix-mcp device exists but is not yet cross-signed. Open Element X → \
-             Settings → Sessions and verify the matrix-mcp device via SAS (emoji compare)."
+            "matrix-mcp device exists but isn't yet signed by your master key. Visit \
+             https://matrix-mcp.kampong.social/setup, sign in, and paste your Matrix \
+             Secret Storage recovery key — matrix-mcp will self-sign the device. No \
+             chat history, no emoji-compare with another device."
                 .to_owned()
         };
 
