@@ -155,6 +155,43 @@ pub struct SendTextMessageResult {
     pub event_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoomInfoParams {
+    /// Matrix room id, e.g. `!abc:example.com`.
+    pub room_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RoomInfoResult {
+    /// Canonical room id.
+    pub room_id: String,
+    /// SDK-computed display name (falls back to heroes for unnamed
+    /// rooms). May be `null` if the room state hasn't loaded yet.
+    pub display_name: Option<String>,
+    /// Canonical `m.room.name` if one is set; otherwise `null`.
+    pub name: Option<String>,
+    /// `m.room.topic` if one is set.
+    pub topic: Option<String>,
+    /// True if the room has `m.room.encryption` enabled.
+    pub encrypted: bool,
+    /// Count of members in `join` state. Cheap — read from cached state.
+    pub joined_members_count: u64,
+    /// Joined + invited. `joined_members_count <= active_members_count`.
+    pub active_members_count: u64,
+    /// The caller's power level in this room (0–100 for typical
+    /// configurations; `null` if the room's power-level state event
+    /// hasn't loaded yet, or if the caller is a v12-or-later room
+    /// creator — see `is_room_creator`).
+    pub my_power_level: Option<i64>,
+    /// True if the caller is a room creator in a Matrix room version
+    /// that grants creators infinite power level (room v12+). In that
+    /// case `my_power_level` is `null`.
+    pub is_room_creator: bool,
+    /// The caller's current membership: `joined`, `invited`, `left`,
+    /// `knocked`, `banned`.
+    pub my_membership: &'static str,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct VerifyStatusResult {
     /// True if this matrix-mcp device has been cross-signed by the
@@ -442,6 +479,98 @@ impl MatrixMcpService {
             "verify_status",
             &mxid_for_audit,
             None,
+            started,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Return metadata about a joined Matrix room: display name, topic,
+    /// encryption state, member counts, the caller's power level and
+    /// membership state. Read-only.
+    #[tool(
+        description = "Return metadata about a Matrix room (name, topic, encryption, members, power level)."
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_info(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomInfoParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+
+            let me = client
+                .user_id()
+                .ok_or_else(|| ErrorData::internal_error("no user_id on client", None))?
+                .to_owned();
+
+            // `power_levels()` can fail if the room state hasn't synced
+            // the `m.room.power_levels` event yet — return None rather
+            // than failing the whole call, so callers can still see
+            // name/topic/etc.
+            // `UserPowerLevel` is `Int(n) | Infinite`; the Infinite
+            // variant signals a v12+ room creator with implicit
+            // unbounded power. Surface that as a separate bool rather
+            // than picking a sentinel integer.
+            let (my_power_level, is_room_creator): (Option<i64>, bool) =
+                match room.power_levels().await {
+                    Ok(pl) => match pl.for_user(&me) {
+                        matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Int(n) => {
+                            (Some(i64::from(n)), false)
+                        }
+                        matrix_sdk::ruma::events::room::power_levels::UserPowerLevel::Infinite => {
+                            (None, true)
+                        }
+                        // `UserPowerLevel` is marked non_exhaustive by ruma so we
+                        // need a wildcard arm — but every variant we know about
+                        // is handled above. If ruma adds a third state, treat it
+                        // as "unknown integer level" rather than crash.
+                        _ => (None, false),
+                    },
+                    Err(e) => {
+                        warn!(error = %e, "power_levels() failed; reporting null");
+                        (None, false)
+                    }
+                };
+
+            let my_membership = match room.state() {
+                matrix_sdk::RoomState::Joined => "joined",
+                matrix_sdk::RoomState::Invited => "invited",
+                matrix_sdk::RoomState::Left => "left",
+                matrix_sdk::RoomState::Knocked => "knocked",
+                matrix_sdk::RoomState::Banned => "banned",
+            };
+
+            structured_result(&RoomInfoResult {
+                room_id: room.room_id().to_string(),
+                display_name: room.cached_display_name().map(|n| n.to_string()),
+                name: room.name(),
+                topic: room.topic(),
+                encrypted: room.encryption_state().is_encrypted(),
+                joined_members_count: room.joined_members_count(),
+                active_members_count: room.active_members_count(),
+                my_power_level,
+                is_room_creator,
+                my_membership,
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "room_info",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
             started,
             None,
             &result,
