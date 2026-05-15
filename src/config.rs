@@ -57,8 +57,8 @@ const ENV_HOMESERVER_URL: &str = "MATRIX_MCP_HOMESERVER_URL";
 /// not MXIDs).
 const ENV_SERVER_NAME: &str = "MATRIX_MCP_SERVER_NAME";
 /// Root directory for per-user encrypted Matrix stores. In production
-/// this points at a PVC mount (Longhorn); each user gets a subdirectory
-/// named `sha256(mxid)[..32]`.
+/// this points at a PVC mount (Longhorn); each owner key (stable MAS
+/// subject + device id) gets a subdirectory named `sha256(owner_key)[..32]`.
 const ENV_STORE_DIR: &str = "MATRIX_MCP_STORE_DIR";
 /// Pepper used to derive per-user store-cipher keys via
 /// `HKDF-SHA256(salt=mxid, ikm=pepper)`. Stored in 1Password, loaded as
@@ -112,11 +112,12 @@ pub struct Config {
 
 #[derive(Clone)]
 pub struct StoreConfig {
-    /// Root directory for per-user encrypted `SQLite` stores. Each mxid
-    /// gets a subdirectory `sha256(mxid)[..32]/`.
+    /// Root directory for per-user encrypted `SQLite` stores. Each stable
+    /// MAS subject/device owner key gets a subdirectory
+    /// `sha256(owner_key)[..32]/`.
     pub root: PathBuf,
     /// 32+ byte secret used as HKDF input keying material. The per-user
-    /// store-cipher passphrase is `HKDF-SHA256(salt=mxid, ikm=pepper,
+    /// store-cipher passphrase is `HKDF-SHA256(salt=owner_key, ikm=pepper,
     /// info="matrix-mcp-store-cipher v1")`. Held in a `String` rather
     /// than a zeroize-on-drop wrapper because matrix-sdk's
     /// `SqliteStoreConfig::passphrase` already takes `&str`; we'd lose
