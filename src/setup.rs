@@ -401,10 +401,21 @@ pub async fn recover(
         );
     }
 
+    // The /setup OAuth flow doesn't request a `device:...` scope, so MAS
+    // returns a token without a device_id. claude.ai's MCP-connector
+    // flow does request that scope and gets `MATRIXMCPCONNECTOR` back.
+    // Fall back to the same constant here so the cache key (mas_subject
+    // + device_id) lines up between /setup and /mcp — without this,
+    // /setup/recover writes the user's keys into a different store dir
+    // than /mcp reads from.
+    let device_id = session
+        .device_id
+        .clone()
+        .or_else(|| Some(crate::oauth_metadata::MATRIX_MCP_DEVICE_ID.to_owned()));
     let identity = crate::mas::AuthenticatedIdentity {
         mas_subject: session.mas_subject.clone(),
         mxid: session.mxid.clone(),
-        device_id: session.device_id.clone(),
+        device_id,
         raw_scope: None,
     };
     let client = match state
