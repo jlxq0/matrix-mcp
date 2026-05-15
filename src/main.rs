@@ -12,6 +12,7 @@
 //! device id read from the authenticated token. No Matrix calls yet.
 
 mod audit;
+mod audit_room;
 mod auth;
 mod config;
 mod mas;
