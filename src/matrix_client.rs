@@ -225,6 +225,26 @@ impl MatrixClientCache {
     fn user_store_dir(&self, owner_key: &str) -> PathBuf {
         self.store.root.join(owner_dir_name(owner_key))
     }
+
+    /// Drop the cached client for this identity, if any.
+    ///
+    /// The dropped `CachedClient`'s `Drop` impl aborts its background
+    /// sync task. The next `for_user` call for the same `owner_key`
+    /// builds a fresh client + spawns a fresh sync. Used by the
+    /// `/setup` flow so a recovery dance with a freshly-issued OAuth
+    /// token doesn't get a stale client (whose `access_token` may
+    /// have been revoked when the user re-authed).
+    pub async fn evict(&self, identity: &AuthenticatedIdentity) -> Result<()> {
+        let key = owner_key(identity)?;
+        let removed = {
+            let mut guard = self.inner.write().await;
+            guard.remove(&key).is_some()
+        };
+        if removed {
+            debug!(mxid = %identity.mxid, "evicted cached matrix-sdk client");
+        }
+        Ok(())
+    }
 }
 
 /// Compose the resource-server ownership key from MAS's non-reassignable
