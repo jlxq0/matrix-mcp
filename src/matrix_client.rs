@@ -63,14 +63,21 @@ use tracing::{debug, info, warn};
 use crate::config::StoreConfig;
 use crate::mas::AuthenticatedIdentity;
 
-/// One entry in the per-user cache. The `_sync_task` handle is held only
-/// to keep the spawned future alive; we abort it on drop via the
-/// `Drop` impl on `JoinHandle` (cancel-on-drop). For single-tenant
-/// matrix-mcp the cache lives the lifetime of the process so this
-/// effectively never fires; for multi-tenant we'd add idle eviction.
+/// One entry in the per-user cache.
+///
+/// The `sync_task` handle is aborted in our explicit `Drop` impl below.
+/// Note: `tokio::task::JoinHandle` does **not** cancel on drop — it merely
+/// detaches the task. We must call `.abort()` ourselves to stop the sync
+/// loop when this entry is evicted or replaced.
 struct CachedClient {
     client: Arc<Client>,
-    _sync_task: JoinHandle<()>,
+    sync_task: JoinHandle<()>,
+}
+
+impl Drop for CachedClient {
+    fn drop(&mut self) {
+        self.sync_task.abort();
+    }
 }
 
 /// In-memory cache mapping `mxid → matrix_sdk::Client`. Clone-cheap:
@@ -112,19 +119,25 @@ impl MatrixClientCache {
             }
         }
 
-        // Slow path: build it under write lock. We re-check after taking
-        // the write lock to avoid two concurrent first-callers both
-        // constructing a client.
-        let cached = self.build_cached(identity, access_token).await?;
-        let client = cached.client.clone();
+        // Slow path: take the write lock *before* building so that concurrent
+        // first callers for the same mxid queue up here rather than all racing
+        // through build_cached. The second (and later) callers will hit the
+        // re-check below and return the already-built client without spawning
+        // a redundant sync task.
+        //
+        // Build time is bounded by the SQLite open + one SDK network round-trip
+        // (session restoration). Holding the write lock across that await is
+        // acceptable — first-use happens at most once per user per process
+        // lifetime, and concurrent callers for *different* mxids are also
+        // serialized here, which is fine given the same frequency.
         let mut guard = self.inner.write().await;
         if let Some(existing) = guard.get(&identity.mxid) {
-            // Another task beat us to it while we were building. Drop
-            // our just-built client; the existing one is canonical.
-            let existing_client = existing.client.clone();
-            drop(guard);
-            return Ok(existing_client);
+            // A concurrent caller already built the client while we waited for
+            // the write lock. Return the canonical entry.
+            return Ok(existing.client.clone());
         }
+        let cached = self.build_cached(identity, access_token).await?;
+        let client = cached.client.clone();
         guard.insert(identity.mxid.clone(), Arc::new(cached));
         drop(guard);
         Ok(client)
@@ -201,7 +214,7 @@ impl MatrixClientCache {
         debug!(mxid = %identity.mxid, "matrix-sdk client ready");
         Ok(CachedClient {
             client: Arc::new(client),
-            _sync_task: sync_task,
+            sync_task,
         })
     }
 
