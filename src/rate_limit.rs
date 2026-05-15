@@ -25,11 +25,11 @@
 //!
 //! ## Memory bound
 //!
-//! Bucket maps grow unbounded if we never evict. A janitor task sweeps
-//! both maps every `JANITOR_INTERVAL`, dropping entries whose limiter
-//! shows zero outstanding cells. For matrix-mcp's scale (single user
-//! today, dozens long-term), this is effectively a no-op, but it
-//! guarantees the maps don't grow forever under bearer-rotation churn.
+//! Buckets are retained for the lifetime of the process; map growth is
+//! bounded by the number of distinct bearer hashes + MAS subjects, which
+//! is small for matrix-mcp's threat model (single tenant today, dozens
+//! long-term). Token rotation may churn a handful of extra entries, but
+//! each bucket is only a few hundred bytes — no eviction needed.
 //!
 //! ## Quota knobs
 //!
@@ -42,7 +42,6 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
@@ -51,13 +50,6 @@ use governor::{Quota, RateLimiter};
 /// Limiter type alias — `governor`'s direct (non-keyed) variant; we
 /// build one per identity and hand it out keyed by bearer-hash or sub.
 type Bucket = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
-
-/// How often the janitor sweeps the bucket maps for idle entries.
-// `Duration::from_mins` is unstable on Rust 1.93 (our MSRV); use
-// `from_secs(300)` and silence the lint that would suggest the
-// nicer-named ctor.
-#[allow(clippy::duration_suboptimal_units)]
-const JANITOR_INTERVAL: Duration = Duration::from_secs(300);
 
 /// What kind of MCP tool this call is. Drives which quota applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,25 +112,6 @@ impl Limiter {
         }
         Ok(())
     }
-
-    /// Best-effort eviction of buckets that currently report no
-    /// outstanding cells (i.e. their state has fully replenished).
-    /// Called by the spawned janitor task; safe to call manually.
-    ///
-    /// We can't introspect "last used" on `governor`, so the proxy is:
-    /// if the bucket is full again, the user hasn't called in at least
-    /// `quota`-worth of minutes — dropping is safe (rebuilds on next
-    /// request with no behavioural change).
-    pub fn sweep(&self) {
-        for (map, quota) in [
-            (&self.bearer_read, self.reads_per_min),
-            (&self.bearer_write, self.writes_per_min),
-            (&self.sub_read, self.reads_per_min),
-            (&self.sub_write, self.writes_per_min),
-        ] {
-            sweep_map(map, quota);
-        }
-    }
 }
 
 fn get_or_insert(
@@ -168,51 +141,6 @@ fn get_or_insert(
             .entry(key.to_owned())
             .or_insert_with(|| Arc::new(RateLimiter::direct(Quota::per_minute(quota)))),
     )
-}
-
-fn sweep_map(map: &RwLock<HashMap<String, Arc<Bucket>>>, quota: NonZeroU32) {
-    let Ok(mut guard) = map.write() else {
-        return;
-    };
-    guard.retain(|_, bucket| {
-        // `check_n` asks "could we consume all `quota` cells right
-        // now?". If yes, the bucket is full → idle → safe to drop.
-        bucket.check_n(quota).is_err() || bucket.check_n(quota).is_ok()
-    });
-    // The retain above keeps everything; do the real eviction below.
-    // (governor doesn't expose a "is the bucket full?" predicate
-    // directly, so we approximate: if `check_n(quota)` succeeds the
-    // bucket was definitely full immediately before — but the check
-    // also *consumed* `quota` cells. We undo that.)
-    //
-    // In practice the sweep is best-effort and any inaccuracy is a
-    // smaller-than-tiny resource leak. Skip the dance: just clear
-    // entries we can probe as full by trying a single-cell check after
-    // briefly refunding. The simplest correct approximation is to drop
-    // entries whose `Arc` strong count == 1 (no caller holds a
-    // reference right now) — when the next request arrives it rebuilds
-    // a fresh bucket with full quota, which is fine because the user
-    // hasn't called for at least a janitor cycle.
-    guard.retain(|_, bucket| Arc::strong_count(bucket) > 1);
-}
-
-/// Spawn the bucket-sweep task. Holds a `Weak` so the task exits when
-/// the limiter is dropped (e.g. test cleanup). In production the
-/// limiter is in a static-lifetime `Arc` so the task lives forever.
-pub fn spawn_janitor(limiter: Arc<Limiter>) {
-    let weak = Arc::downgrade(&limiter);
-    drop(limiter);
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(JANITOR_INTERVAL);
-        tick.tick().await; // skip the immediate fire
-        loop {
-            tick.tick().await;
-            let Some(l) = weak.upgrade() else {
-                break;
-            };
-            l.sweep();
-        }
-    });
 }
 
 #[cfg(test)]
