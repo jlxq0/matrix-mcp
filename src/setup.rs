@@ -213,15 +213,36 @@ pub async fn login(State(state): State<SetupState>) -> Response {
     // the endpoint URLs from `authorization_endpoint` /
     // `token_endpoint` so a future MAS path tweak doesn't 404 us
     // again.
+    // MUST request the device scope alongside the Matrix C-S API scope.
+    // Per MSC3861, every MAS access token is bound to exactly one Matrix
+    // device, decided at /authorize time via the
+    // `urn:matrix:org.matrix.msc2967.client:device:<id>` scope. Without it,
+    // MAS issues a token that isn't tied to any device, and Synapse refuses
+    // /_matrix/client/v3/keys/upload with:
+    //
+    //   400 "To upload keys, you must pass device_id when authenticating"
+    //
+    // That refusal cascades: matrix-sdk never registers our device on the
+    // homeserver, recover()'s self-sign of the device has nowhere to land,
+    // and claude.ai's verify_status reports cross_signed=false forever.
+    //
+    // We request the same device id claude.ai's MCP connector requests
+    // (MATRIXMCPCONNECTOR), so /setup and /mcp share the same Synapse
+    // device record + matrix-sdk store.
+    let device_scope = format!(
+        "urn:matrix:org.matrix.msc2967.client:device:{}",
+        crate::oauth_metadata::MATRIX_MCP_DEVICE_ID,
+    );
     let authorize_url = format!(
         "{auth}/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}\
          &code_challenge={challenge}&code_challenge_method=S256&state={state_tok}\
-         &scope=openid+urn%3Amatrix%3Aorg.matrix.msc2967.client%3Aapi%3A%2A",
+         &scope=openid+urn%3Amatrix%3Aorg.matrix.msc2967.client%3Aapi%3A%2A+{device_scope_enc}",
         auth = state.config.authorization_server,
         client_id = url_encode(&creds.client_id),
         redirect_uri = url_encode(&redirect_uri),
         challenge = url_encode(&challenge),
         state_tok = url_encode(&state_token),
+        device_scope_enc = url_encode(&device_scope),
     );
 
     span.record("outcome", "ok");
