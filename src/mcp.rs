@@ -269,6 +269,54 @@ pub struct UnreadSummaryResult {
     pub total_unread_messages: u64,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MarkReadParams {
+    pub room_id: String,
+    /// Event id to mark as read. If omitted, the latest event in the
+    /// room (per the SDK's cached `latest_event`) is used.
+    #[serde(default)]
+    pub event_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MarkReadResult {
+    pub room_id: String,
+    pub event_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendReactionParams {
+    pub room_id: String,
+    pub event_id: String,
+    /// Reaction key — usually a single emoji (`"👍"`), but Matrix lets
+    /// it be any short string. Be respectful: this is sent in cleartext
+    /// inside encrypted rooms too (reactions are intentionally
+    /// non-E2EE per MSC2677).
+    pub key: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SendReactionResult {
+    /// Event id of the new `m.reaction` event.
+    pub event_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RedactMessageParams {
+    pub room_id: String,
+    pub event_id: String,
+    /// Optional human-readable reason. Stored on the redaction event
+    /// and visible to other clients (including bridged ones).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RedactMessageResult {
+    /// Event id of the `m.room.redaction` event.
+    pub event_id: String,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct VerifyStatusResult {
     /// True if this matrix-mcp device has been cross-signed by the
@@ -810,6 +858,169 @@ impl MatrixMcpService {
             None,
             started,
             Some(room_count),
+            &result,
+        );
+        result
+    }
+
+    /// Mark a Matrix room (or one specific event in it) as read by
+    /// sending an unthreaded read receipt. Fire-and-forget: returns
+    /// once the homeserver has accepted the receipt request. If
+    /// `event_id` is omitted, the latest event in the room is used.
+    #[tool(description = "Mark a room (or a specific event) as read.")]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn mark_read(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<MarkReadParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let event_id = if let Some(id) = params.event_id {
+                id.parse().map_err(|e| {
+                    ErrorData::invalid_params(format!("invalid event_id {id}: {e}"), None)
+                })?
+            } else {
+                room.latest_event().event_id().ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        "room has no latest event to receipt; pass event_id explicitly",
+                        None,
+                    )
+                })?
+            };
+            room.send_single_receipt(
+                matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read,
+                matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded,
+                event_id.clone(),
+            )
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("send_single_receipt: {e}"), None))?;
+            structured_result(&MarkReadResult {
+                room_id: room.room_id().to_string(),
+                event_id: event_id.to_string(),
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "mark_read",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Add an emoji-style reaction to a Matrix event. Returns the
+    /// event id of the new `m.reaction` event. Reactions are
+    /// intentionally non-E2EE per MSC2677 — the `key` string is
+    /// visible to anyone in the room (including bridged services).
+    #[tool(description = "Add an emoji reaction to a Matrix event.")]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn send_reaction(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SendReactionParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let target_event_id: matrix_sdk::ruma::OwnedEventId =
+                params.event_id.parse().map_err(|e| {
+                    ErrorData::invalid_params(
+                        format!("invalid event_id {}: {e}", params.event_id),
+                        None,
+                    )
+                })?;
+            let content = matrix_sdk::ruma::events::reaction::ReactionEventContent::new(
+                matrix_sdk::ruma::events::relation::Annotation::new(target_event_id, params.key),
+            );
+            let response = room
+                .send(content)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.send reaction: {e}"), None))?;
+            structured_result(&SendReactionResult {
+                event_id: response.response.event_id.to_string(),
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "send_reaction",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Redact a Matrix event you own (or that you have power to
+    /// redact). The homeserver enforces ACLs; matrix-mcp does not
+    /// check who sent the event — if your power level is below
+    /// `redact`, the homeserver rejects the request and you get an
+    /// `internal_error` back.
+    #[tool(description = "Redact (delete) a Matrix event.")]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn redact_message(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RedactMessageParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let target_event_id: matrix_sdk::ruma::OwnedEventId =
+                params.event_id.parse().map_err(|e| {
+                    ErrorData::invalid_params(
+                        format!("invalid event_id {}: {e}", params.event_id),
+                        None,
+                    )
+                })?;
+            let response = room
+                .redact(&target_event_id, params.reason.as_deref(), None)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.redact: {e}"), None))?;
+            structured_result(&RedactMessageResult {
+                event_id: response.event_id.to_string(),
+            })
+        }
+        .await;
+        emit_tool_audit(
+            "redact_message",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
             &result,
         );
         result
