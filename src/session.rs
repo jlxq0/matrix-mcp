@@ -3,11 +3,13 @@
 //! Wraps `rmcp`'s `LocalSessionManager` with two complementary defences
 //! against authenticated denial-of-service via session flooding:
 //!
-//! * **Tighter idle TTL** — `LocalSessionManager` is constructed with a
-//!   [`SessionConfig`] whose `keep_alive` is set to 60 seconds instead of the
-//!   default 300. This reduces the steady-state session count under attack by
-//!   5× with no user-visible impact (claude.ai sends periodic activity that
-//!   keeps sessions warm).
+//! * **Idle TTL** — `LocalSessionManager` is constructed with a
+//!   [`SessionConfig`] whose `keep_alive` is set to 30 minutes. rmcp's default
+//!   is 5 minutes; we lengthen it so claude.ai's variable tool-call cadence
+//!   (sometimes >5 min between calls within a long conversation) doesn't
+//!   silently evict sessions and leave the connector wedged in a "connected
+//!   but un-handshaken" state. The global [`MAX_SESSIONS`] cap remains the
+//!   real defence against session flooding.
 //!
 //! * **Global session cap** — [`CappedSessionManager`] wraps the inner
 //!   manager and rejects `create_session` once the live session count hits
@@ -34,16 +36,19 @@ use tracing::warn;
 /// users while bounding the worst-case memory from a flooded attacker.
 pub const MAX_SESSIONS: usize = 256;
 
-/// Idle timeout applied to each session (Mitigation A).
+/// Idle timeout applied to each session.
 ///
-/// 60 s instead of rmcp's 300 s default — a 5× reduction in the steady-state
-/// session count during an attack window. Claude.ai sends a `tools/list` or
-/// similar heartbeat well within this window so legitimate sessions are
-/// unaffected.
+/// 30 minutes — longer than rmcp's 5-minute default. claude.ai's MCP
+/// connector doesn't always heartbeat within a tight window, and an
+/// evicted-too-fast session leaves the connector in a wedged state
+/// (UI shows "connected" but every subsequent tool call sends a
+/// stale session id, 404s, and silently drops). The global
+/// [`MAX_SESSIONS`] cap remains the real defence against an
+/// authenticated session flood.
 // `Duration::from_mins` is unstable on our MSRV (Rust 1.93); use `from_secs`
 // and suppress the clippy lint that would suggest the nicer-named constructor.
 #[allow(clippy::duration_suboptimal_units)]
-pub const SESSION_KEEP_ALIVE: Duration = Duration::from_secs(60);
+pub const SESSION_KEEP_ALIVE: Duration = Duration::from_secs(30 * 60);
 
 /// Build a `LocalSessionManager` with the tightened idle TTL.
 ///
