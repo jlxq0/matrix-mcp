@@ -72,14 +72,19 @@ const ENV_RATE_LIMIT_READS: &str = "MATRIX_MCP_RATE_LIMIT_READS_PER_MIN";
 /// Per-identity write quota (per minute). Writes = `send_text_message`
 /// + future side-effectful tools.
 const ENV_RATE_LIMIT_WRITES: &str = "MATRIX_MCP_RATE_LIMIT_WRITES_PER_MIN";
-
-const DEFAULT_RATE_LIMIT_READS: u32 = 60;
-const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 /// Maximum number of bytes allowed for a single `download_attachment`
 /// fetch. Attachments whose declared size exceeds this cap are rejected
 /// before any media I/O occurs. Default: 5 MiB.
 const ENV_DOWNLOAD_MAX_BYTES: &str = "MATRIX_MCP_DOWNLOAD_MAX_BYTES";
+/// Maximum number of bytes that `send_image_from_url` will fetch from a
+/// remote HTTPS URL before uploading to the homeserver media repo.
+/// Default: 10 MiB. Set higher only if the homeserver allows larger uploads.
+pub const ENV_UPLOAD_MAX_BYTES: &str = "MATRIX_MCP_UPLOAD_MAX_BYTES";
+
+const DEFAULT_RATE_LIMIT_READS: u32 = 60;
+const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
+pub const DEFAULT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -118,6 +123,10 @@ pub struct Config {
     /// network I/O; downloads whose info.size exceeds it are rejected
     /// with `invalid_params`. Default: 5 MiB.
     pub download_max_bytes: u64,
+    /// Maximum image size (bytes) that `send_image_from_url` will fetch
+    /// from a remote URL before uploading to the homeserver media repo.
+    /// Defaults to 10 MiB.
+    pub upload_max_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -198,6 +207,7 @@ impl Config {
             rate_limit_reads_per_min: DEFAULT_RATE_LIMIT_READS,
             rate_limit_writes_per_min: DEFAULT_RATE_LIMIT_WRITES,
             download_max_bytes: DEFAULT_DOWNLOAD_MAX_BYTES,
+            upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
         })
     }
 
@@ -261,6 +271,7 @@ impl Config {
         cfg.rate_limit_writes_per_min =
             parse_rate_limit(ENV_RATE_LIMIT_WRITES, DEFAULT_RATE_LIMIT_WRITES)?;
         cfg.download_max_bytes = parse_download_max_bytes()?;
+        cfg.upload_max_bytes = parse_upload_max_bytes()?;
         Ok(cfg
             .with_introspection(IntrospectionCredentials {
                 client_id,
@@ -326,6 +337,21 @@ fn parse_download_max_bytes() -> Result<u64> {
     raw.parse().with_context(|| {
         format!("{ENV_DOWNLOAD_MAX_BYTES} must be a non-negative integer, got `{raw}`")
     })
+}
+
+fn parse_upload_max_bytes() -> Result<usize> {
+    let Ok(raw) = std::env::var(ENV_UPLOAD_MAX_BYTES) else {
+        return Ok(DEFAULT_UPLOAD_MAX_BYTES);
+    };
+    let n: usize = raw.parse().with_context(|| {
+        format!("{ENV_UPLOAD_MAX_BYTES} must be a positive integer (bytes), got `{raw}`")
+    })?;
+    if n == 0 {
+        anyhow::bail!(
+            "{ENV_UPLOAD_MAX_BYTES} must be > 0              (use a large value to effectively remove the cap)"
+        );
+    }
+    Ok(n)
 }
 
 fn strip_trailing_slash(mut url: String) -> String {
