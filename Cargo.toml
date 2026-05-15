@@ -21,7 +21,11 @@ base64 = "0.22"
 # Exposed on a separate cluster-internal listener (port 9090) so the
 # public Service doesn't surface our metrics endpoint. Alloy scrapes
 # via the pod IP using prometheus.io/scrape annotations.
-prometheus = "0.13"
+# `default-features = false` drops the optional `protobuf` feature
+# (and with it the vulnerable protobuf 2.x dep — RUSTSEC-2024-0437).
+# We only emit the text format from TextEncoder, never the protobuf
+# wire format, so the feature is dead weight.
+prometheus = { version = "0.13", default-features = false }
 # `http` is re-exported by axum/rmcp but we use `http::request::Parts` directly
 # in the tool layer (rmcp injects it into `RequestContext.extensions`), so a
 # top-level dep keeps the import path stable.
