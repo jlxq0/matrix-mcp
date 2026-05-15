@@ -107,7 +107,6 @@ fn build_app(cfg: Config) -> Result<Router> {
             "rate-limit quotas must be > 0; check MATRIX_MCP_RATE_LIMIT_{READS,WRITES}_PER_MIN",
         )?,
     );
-    rate_limit::spawn_janitor(Arc::clone(&limiter));
     Ok(build_router(cfg, auth_state, clients, setup_state, limiter))
 }
 
