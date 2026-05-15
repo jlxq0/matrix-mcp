@@ -110,7 +110,15 @@ fn build_app(cfg: Config) -> Result<Router> {
             "rate-limit quotas must be > 0; check MATRIX_MCP_RATE_LIMIT_{READS,WRITES}_PER_MIN",
         )?,
     );
-    Ok(build_router(cfg, auth_state, clients, setup_state, limiter))
+    let download_max_bytes = cfg.download_max_bytes;
+    Ok(build_router(
+        cfg,
+        auth_state,
+        clients,
+        setup_state,
+        limiter,
+        download_max_bytes,
+    ))
 }
 
 fn build_router(
@@ -119,6 +127,7 @@ fn build_router(
     clients: MatrixClientCache,
     setup_state: setup::SetupState,
     limiter: Arc<Limiter>,
+    download_max_bytes: u64,
 ) -> Router {
     // rmcp's StreamableHttpService is a tower::Service that handles all the
     // MCP transport details (initialize, tools/list, tools/call, SSE
@@ -137,7 +146,13 @@ fn build_router(
     // applies a 60 s idle TTL (down from rmcp's 300 s default) and hard-caps
     // the global session count at session::MAX_SESSIONS (256).
     let mcp_service = StreamableHttpService::new(
-        move || Ok(MatrixMcpService::new(clients.clone(), Arc::clone(&limiter))),
+        move || {
+            Ok(MatrixMcpService::new(
+                clients.clone(),
+                Arc::clone(&limiter),
+                download_max_bytes,
+            ))
+        },
         Arc::new(session::CappedSessionManager::new()),
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
@@ -285,6 +300,7 @@ mod tests {
             clients,
             setup_state,
             limiter,
+            5 * 1024 * 1024, // default 5 MiB cap in tests
         )
     }
 

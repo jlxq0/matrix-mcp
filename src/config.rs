@@ -75,6 +75,11 @@ const ENV_RATE_LIMIT_WRITES: &str = "MATRIX_MCP_RATE_LIMIT_WRITES_PER_MIN";
 
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
+/// Maximum number of bytes allowed for a single `download_attachment`
+/// fetch. Attachments whose declared size exceeds this cap are rejected
+/// before any media I/O occurs. Default: 5 MiB.
+const ENV_DOWNLOAD_MAX_BYTES: &str = "MATRIX_MCP_DOWNLOAD_MAX_BYTES";
+const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -108,6 +113,11 @@ pub struct Config {
     pub rate_limit_reads_per_min: u32,
     /// Per-minute write quota (Phase 6.1). 0 is rejected at parse time.
     pub rate_limit_writes_per_min: u32,
+    /// Maximum attachment size (bytes) that `download_attachment` will
+    /// fetch. Declared size is checked against this cap before any
+    /// network I/O; downloads whose info.size exceeds it are rejected
+    /// with `invalid_params`. Default: 5 MiB.
+    pub download_max_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -187,6 +197,7 @@ impl Config {
             store: None,
             rate_limit_reads_per_min: DEFAULT_RATE_LIMIT_READS,
             rate_limit_writes_per_min: DEFAULT_RATE_LIMIT_WRITES,
+            download_max_bytes: DEFAULT_DOWNLOAD_MAX_BYTES,
         })
     }
 
@@ -249,6 +260,7 @@ impl Config {
             parse_rate_limit(ENV_RATE_LIMIT_READS, DEFAULT_RATE_LIMIT_READS)?;
         cfg.rate_limit_writes_per_min =
             parse_rate_limit(ENV_RATE_LIMIT_WRITES, DEFAULT_RATE_LIMIT_WRITES)?;
+        cfg.download_max_bytes = parse_download_max_bytes()?;
         Ok(cfg
             .with_introspection(IntrospectionCredentials {
                 client_id,
@@ -305,6 +317,15 @@ fn parse_rate_limit(key: &str, default: u32) -> Result<u32> {
         anyhow::bail!("{key} must be > 0 (use a large value like 100000 to effectively disable)");
     }
     Ok(n)
+}
+
+fn parse_download_max_bytes() -> Result<u64> {
+    let Ok(raw) = std::env::var(ENV_DOWNLOAD_MAX_BYTES) else {
+        return Ok(DEFAULT_DOWNLOAD_MAX_BYTES);
+    };
+    raw.parse().with_context(|| {
+        format!("{ENV_DOWNLOAD_MAX_BYTES} must be a non-negative integer, got `{raw}`")
+    })
 }
 
 fn strip_trailing_slash(mut url: String) -> String {
