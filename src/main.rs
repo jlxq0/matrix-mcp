@@ -17,6 +17,7 @@ mod mas;
 mod matrix_client;
 mod mcp;
 mod oauth_metadata;
+mod setup;
 
 use std::sync::Arc;
 
@@ -73,16 +74,22 @@ fn build_app(cfg: Config) -> Result<Router> {
     )?;
     let auth_state = AuthState {
         config: cfg.clone(),
-        mas,
+        mas: mas.clone(),
     };
     let store = cfg.store.clone().context(
         "E2EE store config missing — set MATRIX_MCP_STORE_DIR and MATRIX_MCP_STORE_PEPPER",
     )?;
     let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
-    Ok(build_router(cfg, auth_state, clients))
+    let setup_state = setup::SetupState::new(cfg.clone(), mas, clients.clone());
+    Ok(build_router(cfg, auth_state, clients, setup_state))
 }
 
-fn build_router(cfg: Config, auth_state: AuthState, clients: MatrixClientCache) -> Router {
+fn build_router(
+    cfg: Config,
+    auth_state: AuthState,
+    clients: MatrixClientCache,
+    setup_state: setup::SetupState,
+) -> Router {
     // rmcp's StreamableHttpService is a tower::Service that handles all the
     // MCP transport details (initialize, tools/list, tools/call, SSE
     // upgrades). We nest it under /mcp behind our bearer-auth middleware.
@@ -106,12 +113,24 @@ fn build_router(cfg: Config, auth_state: AuthState, clients: MatrixClientCache) 
         .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn_with_state(auth_state, bearer_auth));
 
+    // /setup is a small browser-rendered flow with its own state
+    // (PKCE map + setup-session map). Sub-router so its state doesn't
+    // bleed into the parent.
+    let setup_routes = Router::new()
+        .route("/setup", get(setup::index))
+        .route("/setup/login", get(setup::login))
+        .route("/setup/callback", get(setup::callback))
+        .route("/setup/form", get(setup::form))
+        .route("/setup/recover", axum::routing::post(setup::recover))
+        .with_state(setup_state);
+
     Router::new()
         .route("/health", get(health))
         .route(
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
         )
+        .merge(setup_routes)
         .merge(mcp_routes)
         .layer(TraceLayer::new_for_http())
         .with_state(cfg)
@@ -223,7 +242,13 @@ mod tests {
             pepper: "a".repeat(64),
         };
         let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
-        build_router(cfg.clone(), AuthState { config: cfg, mas }, clients)
+        let setup_state = setup::SetupState::new(cfg.clone(), mas.clone(), clients.clone());
+        build_router(
+            cfg.clone(),
+            AuthState { config: cfg, mas },
+            clients,
+            setup_state,
+        )
     }
 
     /// Active-token introspection body that audiences correctly for our test
