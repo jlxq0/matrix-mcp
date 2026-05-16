@@ -15,6 +15,7 @@ mod audit;
 mod audit_room;
 mod auth;
 mod config;
+mod device_identity;
 mod mas;
 mod matrix_client;
 mod mcp;
