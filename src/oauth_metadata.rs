@@ -29,7 +29,7 @@ use crate::config::Config;
 /// The id is ASCII, Crockford-base32-ish, ≤ 32 chars so Synapse's
 /// device-id surface doesn't complain. Element X will surface this
 /// string in the device list, so it's deliberately recognisable.
-pub const MATRIX_MCP_DEVICE_ID: &str = "MATRIXMCPCONNECTOR";
+pub const MATRIX_MCP_DEVICE_ID: &str = "MATRIXMCP2";
 
 /// Matches RFC 9728 §3.2. Optional fields are omitted with
 /// `#[serde(skip_serializing_if = "Option::is_none")]` to keep the document
@@ -149,7 +149,7 @@ mod tests {
         assert!(
             scopes
                 .iter()
-                .any(|s| s == "urn:matrix:org.matrix.msc2967.client:device:MATRIXMCPCONNECTOR"),
+                .any(|s| s == "urn:matrix:org.matrix.msc2967.client:device:MATRIXMCP2"),
             "device scope missing in {json}"
         );
     }
