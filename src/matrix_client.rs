@@ -73,6 +73,12 @@ use crate::mas::AuthenticatedIdentity;
 struct CachedClient {
     client: Arc<Client>,
     sync_task: JoinHandle<()>,
+    /// SHA-256 of the access token currently installed in `client`'s
+    /// session. Hashed so the token itself never sits at rest in
+    /// process memory beyond what `matrix-sdk` already holds.
+    /// `tokio::sync::Mutex` because we update under await (the
+    /// `restore_session` swap is async).
+    access_token_hash: tokio::sync::Mutex<[u8; 32]>,
 }
 
 impl Drop for CachedClient {
@@ -146,11 +152,26 @@ impl MatrixClientCache {
         identity: &AuthenticatedIdentity,
         access_token: &str,
     ) -> Result<Arc<Client>> {
-        // Fast path: already cached.
+        let incoming_hash = token_hash(access_token);
+
+        // Fast path: already cached. Verify the cached client's
+        // installed token matches what the caller just presented;
+        // claude.ai's OAuth flow refreshes the bearer roughly hourly,
+        // and a stale token in the cached `matrix-sdk` session
+        // causes the next Synapse call to fail with `M_UNKNOWN_TOKEN`
+        // — exactly the "session expired mid-call" UX. When the hashes
+        // disagree, swap the token in-place via `restore_session`
+        // rather than evicting and rebuilding the whole client (which
+        // would trigger a fresh sync, store reopen, and several
+        // seconds of latency).
         {
             let guard = self.inner.read().await;
             if let Some(cached) = guard.get(&identity.mxid) {
-                return Ok(cached.client.clone());
+                let cached_arc = cached.clone();
+                drop(guard);
+                self.refresh_token_if_needed(&cached_arc, identity, access_token, incoming_hash)
+                    .await?;
+                return Ok(cached_arc.client.clone());
             }
         }
 
@@ -159,13 +180,65 @@ impl MatrixClientCache {
         // a sync task.
         let mut guard = self.inner.write().await;
         if let Some(existing) = guard.get(&identity.mxid) {
-            return Ok(existing.client.clone());
+            let cached_arc = existing.clone();
+            drop(guard);
+            self.refresh_token_if_needed(&cached_arc, identity, access_token, incoming_hash)
+                .await?;
+            return Ok(cached_arc.client.clone());
         }
         let cached = self.build_cached(identity, access_token).await?;
         let client = cached.client.clone();
         guard.insert(identity.mxid.clone(), Arc::new(cached));
         drop(guard);
         Ok(client)
+    }
+
+    /// Swap the access token on a cached client in-place if the
+    /// caller presented a newer one. No-op if the hashes already match.
+    ///
+    /// `restore_session` on `MatrixAuth` is the public knob for
+    /// updating session tokens on an already-built client. The
+    /// underlying `set_session_tokens` is `pub(crate)` in matrix-sdk
+    /// 0.17, so `restore_session` is the only public path. It runs in
+    /// memory only (no network roundtrip) when the session metadata
+    /// hasn't changed.
+    async fn refresh_token_if_needed(
+        &self,
+        cached: &Arc<CachedClient>,
+        identity: &AuthenticatedIdentity,
+        access_token: &str,
+        incoming_hash: [u8; 32],
+    ) -> Result<()> {
+        let mut current = cached.access_token_hash.lock().await;
+        if *current == incoming_hash {
+            return Ok(());
+        }
+        let user_id = UserId::parse(&identity.mxid)
+            .with_context(|| format!("parse mxid: {}", identity.mxid))?;
+        let device_id: OwnedDeviceId = identity
+            .device_id
+            .as_deref()
+            .map(OwnedDeviceId::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!("OAuth token has no device_id; refusing to refresh session")
+            })?;
+        let session = MatrixSession {
+            meta: SessionMeta { user_id, device_id },
+            tokens: SessionTokens {
+                access_token: access_token.to_owned(),
+                refresh_token: None,
+            },
+        };
+        cached
+            .client
+            .matrix_auth()
+            .restore_session(session, RoomLoadSettings::default())
+            .await
+            .context("refresh matrix session token in place")?;
+        *current = incoming_hash;
+        drop(current);
+        debug!(mxid = %identity.mxid, "refreshed access token on cached matrix-sdk client");
+        Ok(())
     }
 
     async fn build_cached(
@@ -257,6 +330,7 @@ impl MatrixClientCache {
         Ok(CachedClient {
             client: client_arc,
             sync_task,
+            access_token_hash: tokio::sync::Mutex::new(token_hash(access_token)),
         })
     }
 
@@ -379,6 +453,16 @@ fn passphrase_fingerprint(passphrase: &str) -> String {
     let mut h = Sha256::new();
     h.update(passphrase.as_bytes());
     hex::encode(&h.finalize()[..4])
+}
+
+/// SHA-256 of an access token. Used to detect when claude.ai has
+/// refreshed its OAuth bearer so we can swap it on the cached
+/// matrix-sdk client without rebuilding. The hash never leaves
+/// process memory.
+fn token_hash(access_token: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(access_token.as_bytes());
+    h.finalize().into()
 }
 
 #[cfg(test)]
