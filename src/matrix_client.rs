@@ -217,24 +217,6 @@ impl MatrixClientCache {
     fn user_store_dir(&self, user_id: &UserId) -> PathBuf {
         self.store.root.join(mxid_dir_name(user_id.as_str()))
     }
-
-    /// Drop the cached client for this mxid, if any.
-    ///
-    /// The dropped `CachedClient`'s `Drop` impl aborts its background
-    /// sync task. The next `for_user` call for the same mxid builds a
-    /// fresh client + spawns a fresh sync. Used by the `/setup` flow
-    /// so a recovery dance with a freshly-issued OAuth token doesn't
-    /// get a stale client (whose `access_token` may have been revoked
-    /// when the user re-authed).
-    pub async fn evict(&self, identity: &AuthenticatedIdentity) {
-        let removed = {
-            let mut guard = self.inner.write().await;
-            guard.remove(&identity.mxid).is_some()
-        };
-        if removed {
-            debug!(mxid = %identity.mxid, "evicted cached matrix-sdk client");
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
