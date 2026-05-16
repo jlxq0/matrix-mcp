@@ -53,6 +53,17 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    # `rustsec/audit-check` publishes results as a GitHub check-run, which
+    # requires `checks: write` on top of the workflow-level `contents: read`.
+    # On `push` events to tags (e.g. our release tags `v*`), the default
+    # workflow token does NOT inherit `checks: write` even if the workflow's
+    # broader scope would otherwise permit it, so the action fails with
+    # `Resource not accessible by integration` and the whole run is marked
+    # failed despite the audit itself returning zero vulnerabilities. Adding
+    # the permission at the job level fixes the failure on every event type.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
