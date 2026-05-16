@@ -127,6 +127,12 @@ pub struct Config {
     /// from a remote URL before uploading to the homeserver media repo.
     /// Defaults to 10 MiB.
     pub upload_max_bytes: usize,
+    /// Persistent Matrix device id for this matrix-mcp instance. Resolved
+    /// from `<store_root>/.device-id` at startup, with one-shot env-var
+    /// bootstrap and random fallback. See [`crate::device_identity`].
+    /// Advertised in the protected-resource metadata as the
+    /// device-binding OAuth scope claude.ai requests.
+    pub device_id: String,
 }
 
 #[derive(Clone)]
@@ -208,6 +214,10 @@ impl Config {
             rate_limit_writes_per_min: DEFAULT_RATE_LIMIT_WRITES,
             download_max_bytes: DEFAULT_DOWNLOAD_MAX_BYTES,
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
+            // Tests and `from_env` overwrite this; the placeholder makes
+            // it obvious in any accidental dump that resolution hasn't
+            // run yet.
+            device_id: "UNRESOLVED".to_owned(),
         })
     }
 
@@ -251,6 +261,14 @@ impl Config {
         let client_secret = require_env(ENV_INTROSPECTION_CLIENT_SECRET)?;
         let store_root = PathBuf::from(require_env(ENV_STORE_DIR)?);
         let pepper = require_env(ENV_STORE_PEPPER)?;
+        // Resolve the per-PVC Matrix device id. See `crate::device_identity`
+        // for the full lifecycle (PVC-persisted, one-shot env bootstrap,
+        // random fallback on fresh PVC).
+        let bootstrap_device_id =
+            std::env::var(crate::device_identity::ENV_BOOTSTRAP_DEVICE_ID).ok();
+        let device_id =
+            crate::device_identity::resolve_device_id(&store_root, bootstrap_device_id.as_deref())
+                .context("resolve matrix device id")?;
         if pepper.len() < 32 {
             anyhow::bail!(
                 "{ENV_STORE_PEPPER} must be at least 32 bytes of high-entropy material \
@@ -272,6 +290,7 @@ impl Config {
             parse_rate_limit(ENV_RATE_LIMIT_WRITES, DEFAULT_RATE_LIMIT_WRITES)?;
         cfg.download_max_bytes = parse_download_max_bytes()?;
         cfg.upload_max_bytes = parse_upload_max_bytes()?;
+        cfg.device_id = device_id;
         Ok(cfg
             .with_introspection(IntrospectionCredentials {
                 client_id,
