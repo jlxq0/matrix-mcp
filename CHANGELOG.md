@@ -12,6 +12,12 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 - `docs/multi-user.md` documenting the per-mxid isolation guarantees.
 
 ### Fixed
+- In-place token refresh on the cached matrix-sdk client. When
+  claude.ai presents a fresh OAuth bearer (typically every ~hour),
+  matrix-mcp now swaps it into the cached session via
+  `restore_session` instead of using the stale token until Synapse
+  returns `M_UNKNOWN_TOKEN`. Eliminates the "session expired
+  mid-call → retry succeeds" UX for cron-style usage.
 - `get_unread_summary` now returns populated `latest_event_id`,
   `latest_sender`, and `latest_origin_server_ts` for E2EE rooms.
   matrix-sdk's `/sync` handler only feeds the LatestEvents subsystem
