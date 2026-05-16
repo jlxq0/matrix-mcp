@@ -7,9 +7,18 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 ## [Unreleased]
 
 ### Added
-- `CONTRIBUTING.md`, `SECURITY.md`, `THREAT_MODEL.md` and a tightened
-  `README.md` for the public release.
+- `SECURITY.md`, `THREAT_MODEL.md` and a tightened `README.md` for the
+  public release.
 - `docs/multi-user.md` documenting the per-mxid isolation guarantees.
+
+### Fixed
+- `get_unread_summary` now returns populated `latest_event_id`,
+  `latest_sender`, and `latest_origin_server_ts` for E2EE rooms.
+  matrix-sdk's `/sync` handler only feeds the LatestEvents subsystem
+  when `Client::event_cache().subscribe()` has been called. Without
+  that call `Room::latest_event()` returned `LatestEventValue::None`
+  for every encrypted room. Same subscription Element X's
+  `RoomListService` performs at startup.
 
 ---
 
