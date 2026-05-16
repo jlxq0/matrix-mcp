@@ -630,7 +630,10 @@ pub struct SendImageFromUrlResult {
 impl MatrixMcpService {
     /// Identity sanity-check. Returns the authenticated MXID and bound
     /// device id without any Matrix calls.
-    #[tool(description = "Return the authenticated Matrix user id and device id.")]
+    #[tool(
+        description = "Return the authenticated Matrix user id and device id.",
+        annotations(title = "Who am I", read_only_hint = true)
+    )]
     #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
     fn whoami(
         &self,
@@ -667,7 +670,10 @@ impl MatrixMcpService {
     /// List the rooms the authenticated user has joined. Each entry
     /// reports the room id, display name, topic, and whether the room
     /// is end-to-end encrypted.
-    #[tool(description = "List Matrix rooms the authenticated user has joined.")]
+    #[tool(
+        description = "List Matrix rooms the authenticated user has joined.",
+        annotations(title = "List joined rooms", read_only_hint = true)
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn list_joined_rooms(
         &self,
@@ -710,7 +716,10 @@ impl MatrixMcpService {
     /// - `is_thread_root`: true if any event in this response starts a
     ///   thread from this event.
     /// - `thread_event_count`: server-aggregated reply count (when present).
-    #[tool(description = "Read recent events (newest first) from a Matrix room.")]
+    #[tool(
+        description = "Read recent events (newest first) from a Matrix room.",
+        annotations(title = "Read recent messages", read_only_hint = true)
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn read_recent_messages(
         &self,
@@ -771,7 +780,8 @@ impl MatrixMcpService {
     /// `read_recent_messages`. The root event itself is not included in the
     /// response (fetch it with `read_recent_messages` if needed).
     #[tool(
-        description = "Read all events in a Matrix thread rooted at a given event id (newest first)."
+        description = "Read all events in a Matrix thread rooted at a given event id (newest first).",
+        annotations(title = "Read thread", read_only_hint = true)
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn read_thread(
@@ -837,7 +847,15 @@ impl MatrixMcpService {
     /// as Markdown (for `formatted_body`) while keeping it as plain
     /// text in `body`. E2EE rooms are encrypted automatically iff this
     /// device is cross-signed.
-    #[tool(description = "Send a text message to a Matrix room (markdown-rendered).")]
+    #[tool(
+        description = "Send a text message to a Matrix room (markdown-rendered).",
+        annotations(
+            title = "Send text message",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn send_text_message(
         &self,
@@ -900,7 +918,8 @@ impl MatrixMcpService {
     /// be decrypted and outgoing messages to E2EE rooms will be
     /// undecryptable to anyone else.
     #[tool(
-        description = "Report the cross-signing / verification status of this matrix-mcp device."
+        description = "Report the cross-signing / verification status of this matrix-mcp device.",
+        annotations(title = "Verify status", read_only_hint = true)
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn verify_status(
@@ -994,7 +1013,8 @@ impl MatrixMcpService {
     /// caller is currently joined to — invited, left, knocked, and
     /// banned rooms are rejected. Read-only.
     #[tool(
-        description = "Return metadata about a joined Matrix room (name, topic, encryption, members, power level)."
+        description = "Return metadata about a joined Matrix room (name, topic, encryption, members, power level).",
+        annotations(title = "Room info", read_only_hint = true)
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn room_info(
@@ -1096,7 +1116,8 @@ impl MatrixMcpService {
     /// maximum 1000). `total` reports the room's true joined-member
     /// count so callers can detect truncation.
     #[tool(
-        description = "List joined members of a Matrix room (mxid, display name, avatar, power level)."
+        description = "List joined members of a Matrix room (mxid, display name, avatar, power level).",
+        annotations(title = "Room members", read_only_hint = true)
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn room_members(
@@ -1185,7 +1206,10 @@ impl MatrixMcpService {
     /// activity. Each entry includes unread counts, the latest event
     /// preview (id + sender + display name + timestamp), and whether
     /// the room is encrypted.
-    #[tool(description = "Summarise rooms with unread messages, sorted by latest activity.")]
+    #[tool(
+        description = "Summarise rooms with unread messages, sorted by latest activity.",
+        annotations(title = "Unread summary", read_only_hint = true)
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn get_unread_summary(
         &self,
@@ -1300,7 +1324,15 @@ impl MatrixMcpService {
     /// sending an unthreaded read receipt. Fire-and-forget: returns
     /// once the homeserver has accepted the receipt request. If
     /// `event_id` is omitted, the latest event in the room is used.
-    #[tool(description = "Mark a room (or a specific event) as read.")]
+    #[tool(
+        description = "Mark a room (or a specific event) as read.",
+        annotations(
+            title = "Mark read",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn mark_read(
         &self,
@@ -1371,7 +1403,15 @@ impl MatrixMcpService {
     /// event id of the new `m.reaction` event. Reactions are
     /// intentionally non-E2EE per MSC2677 — the `key` string is
     /// visible to anyone in the room (including bridged services).
-    #[tool(description = "Add an emoji reaction to a Matrix event.")]
+    #[tool(
+        description = "Add an emoji reaction to a Matrix event.",
+        annotations(
+            title = "Send reaction",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn send_reaction(
         &self,
@@ -1437,7 +1477,15 @@ impl MatrixMcpService {
     /// check who sent the event — if your power level is below
     /// `redact`, the homeserver rejects the request and you get an
     /// `internal_error` back.
-    #[tool(description = "Redact (delete) a Matrix event.")]
+    #[tool(
+        description = "Redact (delete) a Matrix event.",
+        annotations(
+            title = "Redact (delete) message",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn redact_message(
         &self,
@@ -1502,7 +1550,8 @@ impl MatrixMcpService {
     /// (default 5 MiB; `MATRIX_MCP_DOWNLOAD_MAX_BYTES`) are rejected
     /// before any media I/O occurs.
     #[tool(
-        description = "Download an attachment from a Matrix room event and return it as base64."
+        description = "Download an attachment from a Matrix room event and return it as base64.",
+        annotations(title = "Download attachment", read_only_hint = true)
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn download_attachment(
@@ -1695,7 +1744,13 @@ impl MatrixMcpService {
     /// item tracked in the project issue tracker — do NOT remove this note
     /// before that work is done.
     #[tool(
-        description = "Fetch an image from an HTTPS URL and post it to a Matrix room as m.image."
+        description = "Fetch an image from an HTTPS URL and post it to a Matrix room as m.image.",
+        annotations(
+            title = "Send image",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn send_image_from_url(
@@ -1858,9 +1913,12 @@ impl MatrixMcpService {
     /// only has access to the encrypted ciphertext, so `body` is always
     /// `null` in those hits — use `read_recent_messages` to read decrypted
     /// content from a specific E2EE room.
-    #[tool(description = "Search Matrix room history by full-text query. \
+    #[tool(
+        description = "Search Matrix room history by full-text query. \
                        Scope to one room with room_id or search across all joined rooms. \
-                       body is null for E2EE rooms (homeserver cannot decrypt ciphertext).")]
+                       body is null for E2EE rooms (homeserver cannot decrypt ciphertext).",
+        annotations(title = "Search messages", read_only_hint = true)
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn search_messages(
         &self,
@@ -1983,7 +2041,15 @@ impl MatrixMcpService {
     /// canonical room id after the join. If the homeserver bounces
     /// the join (invite-only, banned, etc.) an `internal_error` is
     /// returned.
-    #[tool(description = "Join a Matrix room by id or alias.")]
+    #[tool(
+        description = "Join a Matrix room by id or alias.",
+        annotations(
+            title = "Join room",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn join_room(
         &self,
@@ -2037,7 +2103,15 @@ impl MatrixMcpService {
 
     /// Leave a Matrix room. Idempotent at the spec level — leaving
     /// a room you're not in is a homeserver-decided 200-or-error.
-    #[tool(description = "Leave a Matrix room.")]
+    #[tool(
+        description = "Leave a Matrix room.",
+        annotations(
+            title = "Leave room",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn leave_room(
         &self,
@@ -2089,7 +2163,15 @@ impl MatrixMcpService {
 
     /// Invite an MXID to a Matrix room you're a member of. The
     /// homeserver enforces ACLs (your power level vs. `invite`).
-    #[tool(description = "Invite a Matrix user to a room.")]
+    #[tool(
+        description = "Invite a Matrix user to a room.",
+        annotations(
+            title = "Invite user",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn invite_user(
         &self,
@@ -2152,10 +2234,18 @@ impl MatrixMcpService {
     /// the custom key `m.audit_room` so it persists across sessions.
     ///
     /// **Opt-in only** — no notices are emitted until you call this tool.
-    #[tool(description = "Set the audit room for self-audit m.notice events. \
+    #[tool(
+        description = "Set the audit room for self-audit m.notice events. \
                           After this call every write tool emits a short notice \
                           (tool name + target room + outcome) into the audit room. \
-                          Stored in your Matrix account data; persists across sessions.")]
+                          Stored in your Matrix account data; persists across sessions.",
+        annotations(
+            title = "Set audit room",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     #[allow(clippy::needless_pass_by_value)]
     async fn set_audit_room(
         &self,
