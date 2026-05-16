@@ -217,32 +217,35 @@ pub async fn login(State(state): State<SetupState>) -> Response {
     // Per MSC3861, every MAS access token is bound to exactly one Matrix
     // device, decided at /authorize time via the
     // `urn:matrix:org.matrix.msc2967.client:device:<id>` scope. Without it,
-    // MAS issues a token that isn't tied to any device, and Synapse refuses
-    // /_matrix/client/v3/keys/upload with:
+    // /setup intentionally does NOT request a device scope. claude.ai's
+    // MCP connector is the device-binding session: it requests
+    // `urn:matrix:org.matrix.msc2967.client:device:MATRIXMCPCONNECTOR`,
+    // its tool calls register the device's ed25519 keys with Synapse, and
+    // /setup re-uses claude.ai's already-built matrix-sdk client (keyed by
+    // mxid in `MatrixClientCache`). The recovery key import in `recover()`
+    // therefore signs the device that claude.ai's session put on file —
+    // which is the device claude.ai's `verify_status` checks.
     //
-    //   400 "To upload keys, you must pass device_id when authenticating"
+    // If /setup *also* requested `device:MATRIXMCPCONNECTOR`, MAS would
+    // issue a second OAuth session bound to the same Matrix device, and
+    // the two sessions' /keys/upload calls would fight over Synapse's
+    // device record (whoever uploads last wins; recover()'s signature
+    // ends up referencing whichever ed25519 was current at signing time,
+    // which may not be the one Synapse keeps).
     //
-    // That refusal cascades: matrix-sdk never registers our device on the
-    // homeserver, recover()'s self-sign of the device has nowhere to land,
-    // and claude.ai's verify_status reports cross_signed=false forever.
-    //
-    // We request the same device id claude.ai's MCP connector requests
-    // (MATRIXMCPCONNECTOR), so /setup and /mcp share the same Synapse
-    // device record + matrix-sdk store.
-    let device_scope = format!(
-        "urn:matrix:org.matrix.msc2967.client:device:{}",
-        crate::oauth_metadata::MATRIX_MCP_DEVICE_ID,
-    );
+    // Pre-condition for /setup to succeed: claude.ai's connector must
+    // already have completed its OAuth + first tool call (so the
+    // matrix-sdk client is cached). /setup will surface a clear error
+    // otherwise.
     let authorize_url = format!(
         "{auth}/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}\
          &code_challenge={challenge}&code_challenge_method=S256&state={state_tok}\
-         &scope=openid+urn%3Amatrix%3Aorg.matrix.msc2967.client%3Aapi%3A%2A+{device_scope_enc}",
+         &scope=openid+urn%3Amatrix%3Aorg.matrix.msc2967.client%3Aapi%3A%2A",
         auth = state.config.authorization_server,
         client_id = url_encode(&creds.client_id),
         redirect_uri = url_encode(&redirect_uri),
         challenge = url_encode(&challenge),
         state_tok = url_encode(&state_token),
-        device_scope_enc = url_encode(&device_scope),
     );
 
     span.record("outcome", "ok");
@@ -441,13 +444,13 @@ pub async fn recover(
         device_id: Some(crate::oauth_metadata::MATRIX_MCP_DEVICE_ID.to_owned()),
         raw_scope: None,
     };
-    // Evict any existing cached client for this mxid before building a
-    // fresh one. /setup is the rare case where the same identity can
-    // present a brand-new access token (the user re-authed via
-    // /setup/login). The cache is keyed by mxid, not by token, so
-    // without this eviction a stale client tied to a now-revoked token
-    // gets returned to the recovery flow and every Matrix call 401s.
-    state.clients.evict(&identity).await;
+    // Deliberately NOT evicting the cached client here. /setup is meant
+    // to re-use the matrix-sdk client that claude.ai's MCP connector
+    // already built (cache keyed by mxid). Evicting would force /setup
+    // to rebuild with its own unbound OAuth token, whose /keys/upload
+    // would be rejected by Synapse with "must pass device_id when
+    // authenticating", and recover()'s self-signature would reference
+    // ed25519 keys that aren't actually live on the homeserver.
     let client = match state
         .clients
         .for_user(&identity, &session.access_token)
