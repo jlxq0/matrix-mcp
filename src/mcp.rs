@@ -1201,8 +1201,37 @@ impl MatrixMcpService {
                 .joined_rooms()
                 .iter()
                 .filter_map(|room| {
+                    // matrix-rust-sdk 0.17 exposes two parallel sets of
+                    // unread counters with very different semantics:
+                    //
+                    //   - `Room::num_unread_messages` / `num_unread_notifications`
+                    //     / `num_unread_mentions` are **client-side
+                    //     computed** from local read-receipt state. They
+                    //     require the client to be actively browsing the
+                    //     timeline and emitting `m.read` receipts — and
+                    //     for a headless server like matrix-mcp, which
+                    //     does neither, they are effectively always 0.
+                    //   - `Room::unread_notification_counts()` returns
+                    //     `UnreadNotificationsCount { notification_count,
+                    //     highlight_count }` straight from Synapse's
+                    //     `/sync` response. These are the **server-side**
+                    //     counts — exactly what Element X's sidebar
+                    //     badge shows and what `event_push_summary`
+                    //     stores in postgres.
+                    //
+                    // We want "Synapse says these N rooms have unread,
+                    // summarise them", so gate on the server-side
+                    // counters. We still expose the client-side
+                    // `num_unread_messages` in the response as
+                    // supplementary context — for the small subset of
+                    // rooms where the SDK has been tracking receipts
+                    // (e.g. matrix-mcp itself emitted them via
+                    // `mark_read`), it's a useful extra signal.
+                    let server = room.unread_notification_counts();
+                    let unread_notifications = server.notification_count;
+                    let unread_mentions = server.highlight_count;
                     let unread_messages = room.num_unread_messages();
-                    if unread_messages == 0 {
+                    if unread_notifications == 0 && unread_mentions == 0 && unread_messages == 0 {
                         return None;
                     }
                     // `latest_event()` returns `LatestEventValue` (an
@@ -1229,8 +1258,8 @@ impl MatrixMcpService {
                         display_name: room.cached_display_name().map(|n| n.to_string()),
                         encrypted: room.encryption_state().is_encrypted(),
                         unread_messages,
-                        unread_notifications: room.num_unread_notifications(),
-                        unread_mentions: room.num_unread_mentions(),
+                        unread_notifications,
+                        unread_mentions,
                         latest_event_id,
                         latest_sender,
                         latest_origin_server_ts,
