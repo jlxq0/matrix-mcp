@@ -754,16 +754,16 @@ mod tests {
                 "scope":
                     "openid \
                      urn:matrix:client:api:* \
-                     urn:matrix:client:device:MATRIXMCPCONNECTOR \
+                     urn:matrix:client:device:MATRIXMCP2 \
                      urn:matrix:org.matrix.msc2967.client:api:* \
-                     urn:matrix:org.matrix.msc2967.client:device:MATRIXMCPCONNECTOR",
+                     urn:matrix:org.matrix.msc2967.client:device:MATRIXMCP2",
                 "exp": 9_999_999_999i64,
             })))
             .mount(&mock)
             .await;
         let client = client_against(&mock.uri());
         let identity = client.introspect("t").await.unwrap().unwrap();
-        assert_eq!(identity.device_id.as_deref(), Some("MATRIXMCPCONNECTOR"));
+        assert_eq!(identity.device_id.as_deref(), Some("MATRIXMCP2"));
     }
 
     #[test]
