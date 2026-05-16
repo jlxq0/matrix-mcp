@@ -231,6 +231,18 @@ impl MatrixClientCache {
             .await
             .context("restore matrix session")?;
 
+        // Subscribe the event cache. matrix-sdk's sync handler only feeds the
+        // LatestEvents subsystem when the event cache has been subscribed (see
+        // matrix-sdk-0.17 sync.rs:362 `if !client.event_cache().has_subscribed()
+        // { return; }`). Without this call, `Room::latest_event()` returns
+        // `LatestEventValue::None` for every encrypted room and the unread
+        // summary surfaces null `latest_event_id` / `latest_sender`. This is
+        // the same call Element X's `RoomListService` makes during startup.
+        client
+            .event_cache()
+            .subscribe()
+            .context("subscribe event cache")?;
+
         // Wrap the client in an Arc now so we can hand a Weak reference to
         // the sync watchdog. The watchdog holds only a Weak — when the
         // CachedClient is dropped (i.e. the cache evicts the entry) the
