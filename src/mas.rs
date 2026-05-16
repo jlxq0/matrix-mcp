@@ -319,6 +319,27 @@ impl MasIntrospectionClient {
         Ok(Some(identity))
     }
 
+    /// Drop the introspection cache entry for a given bearer token, if any.
+    ///
+    /// Called from the tool-call result path when Synapse reports
+    /// `M_UNKNOWN_TOKEN` against a request that we'd recently
+    /// classified as `active` by introspect. The cached "active"
+    /// verdict is now wrong; we want the next request bearing the
+    /// same token to re-introspect freshly so MAS can tell us the
+    /// token is dead and the auth middleware can return a clean
+    /// 401 with the correct `WWW-Authenticate` payload, prompting
+    /// claude.ai to re-OAuth instead of retrying with the stale
+    /// token.
+    pub fn drop_token(&self, token: &str) {
+        let key = hash_token(token);
+        let Ok(mut guard) = self.cache.write() else {
+            return;
+        };
+        if guard.remove(&key).is_some() {
+            debug!("dropped introspection cache entry after M_UNKNOWN_TOKEN");
+        }
+    }
+
     fn cache_lookup(&self, key: &[u8; 32]) -> Option<AuthenticatedIdentity> {
         // Bind the guard explicitly + drop early to satisfy
         // clippy::significant_drop_in_scrutinee. The guard is short-lived

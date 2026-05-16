@@ -54,6 +54,13 @@ use crate::rate_limit::{Category, Limiter};
 #[derive(Clone)]
 pub struct MatrixMcpService {
     clients: MatrixClientCache,
+    /// MAS introspection client. Stored on the service so tool handlers
+    /// can drop the per-token introspection cache entry when Synapse
+    /// reports `M_UNKNOWN_TOKEN` — forces the auth middleware to
+    /// re-introspect fresh next time the same token is presented, so a
+    /// revoked token can't keep slipping through on a cached `active`
+    /// verdict.
+    mas: crate::mas::MasIntrospectionClient,
     rate_limiter: Arc<Limiter>,
     /// Maximum attachment size in bytes that `download_attachment` will
     /// fetch. Checked against the event's declared `info.size` before
@@ -74,17 +81,63 @@ impl std::fmt::Debug for MatrixMcpService {
 impl MatrixMcpService {
     pub fn new(
         clients: MatrixClientCache,
+        mas: crate::mas::MasIntrospectionClient,
         rate_limiter: Arc<Limiter>,
         download_max_bytes: u64,
         upload_max_bytes: usize,
     ) -> Self {
         Self {
             clients,
+            mas,
             rate_limiter,
             download_max_bytes,
             upload_max_bytes,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Inspect a tool-call result for the Synapse "auth expired" error
+    /// signatures (`M_UNKNOWN_TOKEN`, `Token is not active`) and, if
+    /// matched: evict the per-mxid SDK client cache, drop the
+    /// per-token MAS introspection cache, and replace the technical
+    /// error with an actionable user-facing message instructing
+    /// claude.ai to reconnect.
+    ///
+    /// Called from every tool handler immediately before the final
+    /// `emit_tool_audit`. The cost is one substring scan on the error
+    /// message, and only runs when the result is already an `Err` —
+    /// zero impact on the happy path. The two evictions are
+    /// idempotent and cheap (`HashMap::remove`s); calling this on a
+    /// non-auth error is a no-op.
+    async fn react_to_auth_expiry(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        result: &mut Result<rmcp::model::CallToolResult, ErrorData>,
+    ) {
+        let Err(err) = result else {
+            return;
+        };
+        if !is_auth_expiry_signature(&err.message) {
+            return;
+        }
+        let mxid = identity_from_ctx(ctx).map(|id| id.mxid);
+        if let Some(mxid) = &mxid {
+            self.clients.evict(mxid).await;
+        }
+        if let Some(AccessToken(token)) = token_from_ctx(ctx) {
+            self.mas.drop_token(&token);
+        }
+        tracing::warn!(
+            mxid = mxid.as_deref().unwrap_or("<unknown>"),
+            "Synapse reported M_UNKNOWN_TOKEN; evicted SDK client + introspect caches"
+        );
+        *err = ErrorData::invalid_request(
+            "Your matrix-mcp OAuth session has expired or been revoked. \
+             In claude.ai → Connectors → Matrix, click Disconnect and then \
+             Connect again to get a fresh session, then retry. Your \
+             cross-signing identity is preserved — no need to re-run /setup.",
+            None,
+        );
     }
 
     /// Check the rate-limit buckets for the caller. On denial, returns
@@ -586,6 +639,11 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let span = make_tool_span("whoami", &mxid_for_audit, None);
+        // whoami reads identity straight from the auth-middleware
+        // introspection result and never touches Synapse, so it cannot
+        // observe `M_UNKNOWN_TOKEN` and there is nothing to evict.
+        // Skip `react_to_auth_expiry` here (and avoid making this handler
+        // async just to satisfy the helper's `.await`).
         let result = (|| {
             self.rate_limit_check(&ctx, Category::Read)?;
             let id = identity_from_ctx(&ctx).ok_or_else(missing_identity_err)?;
@@ -618,7 +676,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let span = make_tool_span("list_joined_rooms", &mxid_for_audit, None);
-        let (result, room_count) = async {
+        let (mut result, room_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let rooms: Vec<JoinedRoom> = client.joined_rooms().iter().map(summarize_room).collect();
@@ -629,6 +687,7 @@ impl MatrixMcpService {
         .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_joined_rooms",
             &mxid_for_audit,
@@ -666,7 +725,7 @@ impl MatrixMcpService {
             &mxid_for_audit,
             Some(&room_id_for_audit),
         );
-        let (result, event_count) = async {
+        let (mut result, event_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -691,6 +750,7 @@ impl MatrixMcpService {
         .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "read_recent_messages",
             &mxid_for_audit,
@@ -723,7 +783,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("read_thread", &mxid_for_audit, Some(&room_id_for_audit));
-        let (result, event_count) = async {
+        let (mut result, event_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -760,6 +820,7 @@ impl MatrixMcpService {
         .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "read_thread",
             &mxid_for_audit,
@@ -791,7 +852,7 @@ impl MatrixMcpService {
             &mxid_for_audit,
             Some(&room_id_for_audit),
         );
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             validate_text_message_body(&params.body)?;
             let client = self.client_for(&ctx).await?;
@@ -813,6 +874,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "send_text_message",
             &mxid_for_audit,
@@ -848,7 +910,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let span = make_tool_span("verify_status", &mxid_for_audit, None);
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let me = client
@@ -914,6 +976,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "verify_status",
             &mxid_for_audit,
@@ -943,7 +1006,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("room_info", &mxid_for_audit, Some(&room_id_for_audit));
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -1015,6 +1078,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "room_info",
             &mxid_for_audit,
@@ -1044,7 +1108,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("room_members", &mxid_for_audit, Some(&room_id_for_audit));
-        let (result, member_count) = async {
+        let (mut result, member_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -1104,6 +1168,7 @@ impl MatrixMcpService {
         .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "room_members",
             &mxid_for_audit,
@@ -1129,7 +1194,7 @@ impl MatrixMcpService {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let span = make_tool_span("get_unread_summary", &mxid_for_audit, None);
-        let (result, room_count) = async {
+        let (mut result, room_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
             let mut rooms: Vec<UnreadRoomSummary> = client
@@ -1189,6 +1254,7 @@ impl MatrixMcpService {
         .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "get_unread_summary",
             &mxid_for_audit,
@@ -1216,7 +1282,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("mark_read", &mxid_for_audit, Some(&room_id_for_audit));
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -1251,6 +1317,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "mark_read",
             &mxid_for_audit,
@@ -1286,7 +1353,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("send_reaction", &mxid_for_audit, Some(&room_id_for_audit));
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -1315,6 +1382,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "send_reaction",
             &mxid_for_audit,
@@ -1351,7 +1419,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("redact_message", &mxid_for_audit, Some(&room_id_for_audit));
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -1377,6 +1445,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "redact_message",
             &mxid_for_audit,
@@ -1420,7 +1489,7 @@ impl MatrixMcpService {
             &mxid_for_audit,
             Some(&room_id_for_audit),
         );
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
 
@@ -1566,6 +1635,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "download_attachment",
             &mxid_for_audit,
@@ -1612,7 +1682,7 @@ impl MatrixMcpService {
             &mxid_for_audit,
             Some(&room_id_for_audit),
         );
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
 
             // --- URL validation -----------------------------------------
@@ -1732,6 +1802,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "send_image_from_url",
             &mxid_for_audit,
@@ -1775,7 +1846,7 @@ impl MatrixMcpService {
             &mxid_for_audit,
             room_id_for_audit.as_deref(),
         );
-        let (result, hit_count) = async {
+        let (mut result, hit_count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let client = self.client_for(&ctx).await?;
 
@@ -1866,6 +1937,7 @@ impl MatrixMcpService {
         .instrument(span.clone())
         .await
         .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "search_messages",
             &mxid_for_audit,
@@ -1893,7 +1965,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id_or_alias.clone();
         let span = make_tool_span("join_room", &mxid_for_audit, Some(&room_id_for_audit));
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let target: &matrix_sdk::ruma::RoomOrAliasId =
@@ -1913,6 +1985,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "join_room",
             &mxid_for_audit,
@@ -1946,7 +2019,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("leave_room", &mxid_for_audit, Some(&room_id_for_audit));
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -1964,6 +2037,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "leave_room",
             &mxid_for_audit,
@@ -1997,7 +2071,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("invite_user", &mxid_for_audit, Some(&room_id_for_audit));
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -2019,6 +2093,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "invite_user",
             &mxid_for_audit,
@@ -2062,7 +2137,7 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let room_id_for_audit = params.room_id.clone();
         let span = make_tool_span("set_audit_room", &mxid_for_audit, Some(&room_id_for_audit));
-        let result = async {
+        let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let room_id: matrix_sdk::ruma::OwnedRoomId = params.room_id.parse().map_err(|e| {
@@ -2080,6 +2155,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "set_audit_room",
             &mxid_for_audit,
@@ -2313,6 +2389,16 @@ fn make_tool_span(tool: &'static str, mxid: &str, room_id: Option<&str>) -> Span
         outcome = tracing::field::Empty,
         latency_ms = tracing::field::Empty,
     )
+}
+
+/// Recognise the Synapse error-text signatures that mean "this token
+/// is no longer valid on the homeserver". Matches both the modern
+/// ruma error variant message (`M_UNKNOWN_TOKEN`) and the older
+/// plaintext (`Token is not active`) so we cover every matrix-rust-sdk
+/// version we might ever depend on. Substring check is fine — these
+/// strings only appear in legitimate 401 envelopes.
+fn is_auth_expiry_signature(msg: &str) -> bool {
+    msg.contains("M_UNKNOWN_TOKEN") || msg.contains("Token is not active")
 }
 
 fn emit_tool_audit(

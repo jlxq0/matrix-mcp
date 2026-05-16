@@ -111,6 +111,29 @@ impl MatrixClientCache {
         self.inner.read().await.contains_key(mxid)
     }
 
+    /// Drop the cached `matrix_sdk::Client` for this mxid, if any.
+    ///
+    /// Aborts the cached client's background sync task (via the
+    /// `Drop` impl on `CachedClient`) and removes the entry from the
+    /// map. The next `for_user` call for this mxid will rebuild from
+    /// scratch using whatever access token is presented at that time.
+    ///
+    /// Called when Synapse reports `M_UNKNOWN_TOKEN` against any tool
+    /// call: the cached client is holding a now-invalid OAuth token
+    /// and there is no point letting subsequent tool calls reuse it.
+    /// The on-disk `SQLite` store and `OlmMachine` state are
+    /// preserved — only the in-memory token-bound client handle is
+    /// dropped.
+    pub async fn evict(&self, mxid: &str) {
+        let removed = {
+            let mut guard = self.inner.write().await;
+            guard.remove(mxid).is_some()
+        };
+        if removed {
+            debug!(mxid, "evicted cached matrix-sdk client");
+        }
+    }
+
     /// Get-or-create the matrix-sdk `Client` for the authenticated user,
     /// using the supplied OAuth access token as the Matrix session token.
     ///

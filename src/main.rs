@@ -107,7 +107,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         "E2EE store config missing — set MATRIX_MCP_STORE_DIR and MATRIX_MCP_STORE_PEPPER",
     )?;
     let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
-    let setup_state = setup::SetupState::new(cfg.clone(), mas, clients.clone());
+    let setup_state = setup::SetupState::new(cfg.clone(), mas.clone(), clients.clone());
     let limiter = Arc::new(
         Limiter::new(cfg.rate_limit_reads_per_min, cfg.rate_limit_writes_per_min).context(
             "rate-limit quotas must be > 0; check MATRIX_MCP_RATE_LIMIT_{READS,WRITES}_PER_MIN",
@@ -118,6 +118,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         cfg,
         auth_state,
         clients,
+        mas,
         setup_state,
         limiter,
         download_max_bytes,
@@ -128,6 +129,7 @@ fn build_router(
     cfg: Config,
     auth_state: AuthState,
     clients: MatrixClientCache,
+    mas: MasIntrospectionClient,
     setup_state: setup::SetupState,
     limiter: Arc<Limiter>,
     download_max_bytes: u64,
@@ -151,9 +153,13 @@ fn build_router(
     // the global session count at session::MAX_SESSIONS (256).
     let mcp_service = StreamableHttpService::new(
         move || {
+            let mas = mas.clone();
+            let clients = clients.clone();
+            let limiter = Arc::clone(&limiter);
             Ok(MatrixMcpService::new(
-                clients.clone(),
-                Arc::clone(&limiter),
+                clients,
+                mas,
+                limiter,
                 download_max_bytes,
                 upload_max_bytes,
             ))
@@ -307,8 +313,12 @@ mod tests {
         let limiter = Arc::new(crate::rate_limit::Limiter::new(100_000, 100_000).unwrap());
         build_router(
             cfg.clone(),
-            AuthState { config: cfg, mas },
+            AuthState {
+                config: cfg,
+                mas: mas.clone(),
+            },
             clients,
+            mas,
             setup_state,
             limiter,
             5 * 1024 * 1024, // default 5 MiB cap in tests
