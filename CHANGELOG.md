@@ -4,6 +4,67 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ---
 
+## [Unreleased]
+
+### Added
+- `CONTRIBUTING.md`, `SECURITY.md`, `THREAT_MODEL.md` and a tightened
+  `README.md` for the public release.
+- `docs/multi-user.md` documenting the per-mxid isolation guarantees.
+
+---
+
+## [v0.2.2.1] – 2026-05-16
+
+### Fixed
+- CI `cargo audit` job grants itself `checks: write` so tag pushes
+  stop emailing "build failed".
+
+---
+
+## [v0.2.2] – 2026-05-16
+
+### Fixed
+- `get_unread_summary` now uses `Room::unread_notification_counts()`
+  (server-side, from `/sync`) instead of `Room::num_unread_*` (which
+  are receipt-based and always 0 for a headless server). Matches the
+  Element badge.
+
+---
+
+## [v0.2.1] – 2026-05-16
+
+### Fixed
+- Cache eviction on Synapse `M_UNKNOWN_TOKEN`: when a tool call hits
+  an expired token, the per-mxid matrix-sdk client and MAS
+  introspection entry are dropped so the next reconnect rebuilds
+  cleanly. No more pod restarts on token rotation.
+- `get_unread_summary` first attempt at a wider filter (superseded by
+  v0.2.2, which fixed the real bug – wrong method entirely).
+
+---
+
+## [v0.2.0] – 2026-05-15
+
+### Added
+- Auto-rotating per-PVC device id. `<store_root>/.device-id` is
+  written on first start (random) or seeded from
+  `MATRIX_MCP_DEVICE_ID_BOOTSTRAP`. PVC wipes self-heal: a fresh id
+  is generated and the next `/setup` cross-signs it. Sidesteps
+  Synapse's `SigningKeyChanged` permanently-rejected device state.
+- `/setup` precondition (HTTP 428) refuses if the matrix-sdk cache
+  is cold for the calling mxid – forces the user through the proper
+  order (connect MCP first, then recovery key).
+- MCP tool annotations on all 19 tools: `title`, `read_only_hint`,
+  and (where applicable) `destructive_hint`, `idempotent_hint`. Per
+  the MCP spec, `destructive_hint` and `idempotent_hint` are only
+  meaningful when `read_only_hint = false`.
+- `docs/cross-signing-recover-flow.md` and
+  `scripts/verify-device-signature.py` for end-to-end verification
+  of the cross-signing chain without trusting matrix-rust-sdk's own
+  opinion.
+
+---
+
 ## [v0.1.0] – 2026-05-15
 
 ### Added
@@ -175,6 +236,11 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 - AGPL-3.0-or-later license.
 - Production deploy on Gruyere (`matrix-mcp.kampong.social`).
 
+[Unreleased]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.2.1...HEAD
+[v0.2.2.1]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.2...v0.2.2.1
+[v0.2.2]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.1...v0.2.2
+[v0.2.1]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.0...v0.2.1
+[v0.2.0]: https://github.com/jlxq0/matrix-mcp/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.15...v0.1.0
 [v0.0.15]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.14...v0.0.15
 [v0.0.14]: https://github.com/jlxq0/matrix-mcp/compare/v0.0.13...v0.0.14
