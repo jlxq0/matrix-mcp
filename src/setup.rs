@@ -131,8 +131,10 @@ pub struct SetupSession {
     pub mas_subject: String,
     pub mxid: String,
     // Kept in the session for audit/logging context; /setup/recover
-    // deliberately hardcodes MATRIX_MCP_DEVICE_ID below so the recovery
-    // imports land in the same store claude.ai's tool calls use.
+    // fills the AuthenticatedIdentity's device_id from `config.device_id`
+    // (the per-PVC value from `<store_root>/.device-id`) so the
+    // recovery imports land in the same matrix-sdk store claude.ai's
+    // MCP tool calls use.
     #[allow(dead_code)]
     pub device_id: Option<String>,
     pub access_token: String,
@@ -429,28 +431,55 @@ pub async fn recover(
         );
     }
 
-    // The /setup OAuth flow doesn't request a `device:...` scope, so MAS
-    // Hardcode device_id to MATRIX_MCP_DEVICE_ID. The /setup OAuth flow
-    // doesn't request a `device:...` scope, so MAS may return either no
-    // device_id or a fresh per-session one. Either way we want this
-    // recovery to land in the SAME matrix-sdk store that claude.ai's
-    // MCP tool calls use (which always advertise device_id =
-    // MATRIXMCPCONNECTOR). Otherwise /setup imports keys into a
-    // different OlmMachine than /mcp reads from and verify_status keeps
-    // reporting cross_signed=false.
+    // Pre-condition: claude.ai's MCP connector must have already built
+    // the matrix-sdk client for this user via a real tool call (e.g.
+    // list_joined_rooms). /setup itself does an OAuth flow without a
+    // `device:...` scope, so its access token is unbound; if /setup
+    // built the matrix-sdk client first, the SDK would attempt
+    // /keys/upload with that unbound token, Synapse would reject the
+    // call with 400 "must pass device_id when authenticating", and
+    // recover()'s self-signature would reference ed25519 keys that
+    // never landed on the homeserver — producing a cryptographically
+    // valid local signature attached to a device that doesn't exist
+    // server-side. The trap is invisible (the /setup UI says
+    // "Unlocked", `verify_status` reports cross_signed=false, and the
+    // signature appears on Synapse pointing at the wrong device pubkey).
+    //
+    // We avoid the trap by refusing /setup outright unless the
+    // per-mxid SDK cache already has an entry. If absent, the user is
+    // told to run a Matrix tool from claude.ai first. This is the
+    // single safety net that makes /setup's design invariant
+    // ("piggyback on claude.ai's client") explicit and enforced.
+    if !state.clients.contains(&session.mxid).await {
+        span.record("outcome", "precondition");
+        return error_page(
+            StatusCode::PRECONDITION_REQUIRED,
+            "matrix-mcp's Matrix client isn't built yet for your account. \
+             In claude.ai, run any matrix-mcp tool — e.g. ask Claude to use \
+             `list_joined_rooms` — then return here to /setup and try again. \
+             (Why: /setup imports your cross-signing keys into the same SDK \
+             instance claude.ai's connector uses. If claude.ai hasn't \
+             triggered the client to be built yet, /setup has nothing to \
+             attach the keys to.)",
+        );
+    }
+
+    // Build the identity for cache lookup. The device id comes from
+    // the runtime config (`<store_root>/.device-id`), not a compile-time
+    // constant — see `crate::device_identity` for the rationale. /setup's
+    // OAuth token has no device scope, so we fill in this field from
+    // config to ensure the AuthenticatedIdentity lookup key matches
+    // what claude.ai's tool calls produced.
     let identity = crate::mas::AuthenticatedIdentity {
         mas_subject: session.mas_subject.clone(),
         mxid: session.mxid.clone(),
-        device_id: Some(crate::oauth_metadata::MATRIX_MCP_DEVICE_ID.to_owned()),
+        device_id: Some(state.config.device_id.clone()),
         raw_scope: None,
     };
-    // Deliberately NOT evicting the cached client here. /setup is meant
-    // to re-use the matrix-sdk client that claude.ai's MCP connector
-    // already built (cache keyed by mxid). Evicting would force /setup
-    // to rebuild with its own unbound OAuth token, whose /keys/upload
-    // would be rejected by Synapse with "must pass device_id when
-    // authenticating", and recover()'s self-signature would reference
-    // ed25519 keys that aren't actually live on the homeserver.
+    // Cache HIT is guaranteed by the contains() check above; for_user
+    // returns the already-built client (built with claude.ai's
+    // device-bound token), and /setup's own unbound access_token is
+    // silently dropped by the fast path.
     let client = match state
         .clients
         .for_user(&identity, &session.access_token)

@@ -100,6 +100,17 @@ impl MatrixClientCache {
         }
     }
 
+    /// Returns `true` iff a matrix-sdk client is already cached for
+    /// this mxid. Read-only; does **not** build a client. Used by the
+    /// /setup route as a precondition check — /setup must piggyback on
+    /// the device-bound client claude.ai's MCP tool calls built; it
+    /// must not build the client itself with /setup's own unbound
+    /// OAuth token, or `recover()` produces signatures against device
+    /// keys that never reach Synapse.
+    pub async fn contains(&self, mxid: &str) -> bool {
+        self.inner.read().await.contains_key(mxid)
+    }
+
     /// Get-or-create the matrix-sdk `Client` for the authenticated user,
     /// using the supplied OAuth access token as the Matrix session token.
     ///

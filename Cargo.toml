@@ -111,6 +111,10 @@ mime = "0.3"
 # Mock HTTP server for MAS introspection tests. Used by `cargo test` only;
 # never linked into the release binary.
 wiremock = "0.6"
+# Per-test temporary directories for tests that exercise on-disk PVC layout
+# (device_identity persistence, store dir creation). `TempDir` cleans up on
+# drop, keeping tests hermetic.
+tempfile = "3"
 
 [profile.release]
 # Optimise for binary size + decent perf; we're an HTTP server, not a CPU
