@@ -27,3 +27,7 @@ coverage/
 
 # Container build leftovers
 .docker-cache/
+
+# Internal planning notes — not part of the public docs surface.
+Plan.md
+docs/plan.md
