@@ -125,3 +125,5 @@ otherwise. Conventional Commits for messages.
 [AGPL-3.0-or-later](LICENSE). If you run a modified version as a
 network service, the licence requires you to make the modified source
 available to your users.
+
+<!-- Source migrated to forge.oddie.app/julian/matrix-mcp on 2026-05-17; GitHub jlxq0/matrix-mcp is now a push-mirror for CI continuity -->
