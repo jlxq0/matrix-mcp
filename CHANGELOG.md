@@ -22,6 +22,13 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
   HTTPS URL (re-uploaded to the homeserver media repo).
 - `users_get_profile` tool – fetch another user's public display
   name + avatar.
+- `send_file`, `send_video`, `send_audio` tools – mirror
+  `send_image_from_url` for the other media `MessageType`s. The
+  underlying upload pipeline (HTTPS-only, redirect-limited, timeouted,
+  size-capped) is now shared via `MatrixMcpService::upload_from_url`.
+- `send_voice_note` deliberately omitted: it would require the
+  `unstable-msc3245-v1-compat` feature on `matrix-sdk` + `ruma`, and
+  without that marker it'd be an exact duplicate of `send_audio`.
 
 ### Fixed
 - In-place token refresh on the cached matrix-sdk client. When
