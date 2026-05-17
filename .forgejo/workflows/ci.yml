@@ -60,19 +60,15 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with: { command: check bans licenses sources }
 
-  # Single docker job — builds always, pushes only on tag.
-  # Pada runner has `valid_volumes: ['**']`, so we explicitly request the
-  # host docker socket mount from the workflow. (act_runner's
-  # `docker_host: automount` setting did not actually inject the mount in
-  # v6.4.0 in our test, so we wire it explicitly.)
+  # docker job runs directly on the Pada VM (host mode) — the `pada-host`
+  # runner label has no `docker://` image mapping, so act_runner skips the
+  # job-container layer entirely and the host's docker daemon is reachable
+  # at /var/run/docker.sock natively. This sidesteps act_runner v6.4.0's
+  # buggy `docker_host: automount` setting.
   docker:
-    runs-on: ubuntu-22.04
+    runs-on: pada-host
     needs: [clippy, test]
     permissions: { contents: read, packages: write }
-    container:
-      image: ghcr.io/catthehacker/ubuntu:act-22.04
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
