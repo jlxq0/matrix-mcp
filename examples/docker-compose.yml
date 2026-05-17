@@ -4,20 +4,29 @@
 # terminates HTTPS via Let's Encrypt. claude.ai's MCP transport
 # requires HTTPS, so a TLS-terminating fronting proxy is mandatory.
 #
-# Before bringing this up, set the variables in a .env file alongside
-# this compose file. Required:
+# ---------------------------------------------------------------------
+# Before bringing this up you need to register matrix-mcp as a
+# confidential OAuth client against your MAS instance — that's where
+# MATRIX_MCP_INTROSPECTION_CLIENT_ID + _SECRET come from. The procedure
+# is in ../docs/installation.md, section "1. Register an OAuth client
+# in MAS". A two-line snippet of MAS config + one shell command.
+# ---------------------------------------------------------------------
+#
+# Then set the variables in a .env file alongside this compose file:
 #
 #   MATRIX_MCP_HOSTNAME=matrix-mcp.your-domain.example
 #   MATRIX_MCP_AUTHORIZATION_SERVER=https://your-mas.example
 #   MATRIX_MCP_HOMESERVER_URL=https://matrix.your-domain.example
 #   MATRIX_MCP_SERVER_NAME=your-domain.example
-#   MATRIX_MCP_INTROSPECTION_CLIENT_ID=...
-#   MATRIX_MCP_INTROSPECTION_CLIENT_SECRET=...
+#   MATRIX_MCP_INTROSPECTION_CLIENT_ID=...  # from MAS registration
+#   MATRIX_MCP_INTROSPECTION_CLIENT_SECRET=...  # ditto
 #   MATRIX_MCP_STORE_PEPPER=...  # openssl rand -hex 32
 #   CADDY_ACME_EMAIL=you@example.com
 #
 # Then: `docker compose up -d`. Browse to
 # https://${MATRIX_MCP_HOSTNAME}/health — should return `ok`.
+#
+# Then follow ../docs/onboarding.md to connect claude.ai.
 
 services:
   matrix-mcp:

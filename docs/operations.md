@@ -9,10 +9,10 @@ matrix-mcp on Gruyere.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `MATRIX_MCP_RESOURCE_URL` | yes | – | Public URL of this server, e.g. `https://matrix-mcp.kampong.social`. No trailing slash. |
-| `MATRIX_MCP_AUTHORIZATION_SERVER` | yes | – | MAS issuer URL, e.g. `https://matrixauthservice.kampong.social`. No trailing slash. |
-| `MATRIX_MCP_HOMESERVER_URL` | yes | – | Synapse base URL, e.g. `https://matrix.kampong.social`. No trailing slash. |
-| `MATRIX_MCP_SERVER_NAME` | yes | – | Matrix server name (right side of MXIDs), e.g. `kampong.social`. Not a URL. |
+| `MATRIX_MCP_RESOURCE_URL` | yes | – | Public URL of this server, e.g. `https://matrix-mcp.your-domain.example`. No trailing slash. |
+| `MATRIX_MCP_AUTHORIZATION_SERVER` | yes | – | MAS issuer URL, e.g. `https://your-mas.example`. No trailing slash. |
+| `MATRIX_MCP_HOMESERVER_URL` | yes | – | Synapse base URL, e.g. `https://matrix.your-domain.example`. No trailing slash. |
+| `MATRIX_MCP_SERVER_NAME` | yes | – | Matrix server name (right side of MXIDs), e.g. `your-domain.example`. Not a URL. |
 | `MATRIX_MCP_INTROSPECTION_CLIENT_ID` | yes | – | OAuth client id for MAS introspection endpoint. |
 | `MATRIX_MCP_INTROSPECTION_CLIENT_SECRET` | yes | – | OAuth client secret paired with the id above. |
 | `MATRIX_MCP_STORE_DIR` | yes | – | Root directory for per-user SQLite stores. In production: PVC mount at `/var/lib/matrix-mcp`. |
@@ -71,7 +71,7 @@ or by calling the MAS introspect endpoint directly:
 
 ```bash
 curl -su 'CLIENT_ID:CLIENT_SECRET' \
-  https://matrixauthservice.kampong.social/oauth2/introspect \
+  https://your-mas.example/oauth2/introspect \
   -d "token=<bearer>" | jq .
 ```
 
@@ -150,7 +150,7 @@ user sessions continue after rotation.
      force-sync=$(date +%s) --overwrite
    ```
 5. Restart the pod to pick up the new secret from env.
-6. Verify: `curl -i https://matrix-mcp.kampong.social/health` should return
+6. Verify: `curl -i https://matrix-mcp.your-domain.example/health` should return
    200. If MCP calls start returning 401 immediately after restart, the
    MAS-side secret wasn't updated – double-check step 3.
 

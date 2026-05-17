@@ -91,7 +91,7 @@ If `/mcp` (any real Matrix tool) builds the client first:
      introspection result, never touches the matrix-sdk client.
      Tools that do count: `list_joined_rooms`, `read_recent_messages`,
      `verify_status`, anything that actually queries Matrix state.
-3. **Browser → `https://matrix-mcp.kampong.social/setup`** → sign in
+3. **Browser → `https://matrix-mcp.your-domain.example/setup`** → sign in
    → paste your Secret Storage recovery key → submit.
 4. Page reads ✓ Unlocked. Done.
 

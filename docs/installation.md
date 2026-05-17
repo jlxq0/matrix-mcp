@@ -47,15 +47,15 @@ Do not lose it – losing the pepper destroys all user key stores.
 # docker-compose.yml
 services:
   matrix-mcp:
-    image: ghcr.io/jlxq0/matrix-mcp:v0.1.0
+    image: ghcr.io/jlxq0/matrix-mcp:latest
     ports:
       - "3000:3000"
     volumes:
       - ./data:/var/lib/matrix-mcp
     environment:
-      MATRIX_MCP_RESOURCE_URL: https://matrix-mcp.example.com
-      MATRIX_MCP_AUTHORIZATION_SERVER: https://matrixauthservice.example.com
-      MATRIX_MCP_HOMESERVER_URL: https://matrix.example.com
+      MATRIX_MCP_RESOURCE_URL: https://matrix-mcp.your-domain.example
+      MATRIX_MCP_AUTHORIZATION_SERVER: https://your-mas.example
+      MATRIX_MCP_HOMESERVER_URL: https://matrix.your-domain.example
       MATRIX_MCP_SERVER_NAME: example.com
       MATRIX_MCP_INTROSPECTION_CLIENT_ID: matrix-mcp
       MATRIX_MCP_INTROSPECTION_CLIENT_SECRET: your-secret-here
@@ -136,7 +136,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: app
-          image: ghcr.io/jlxq0/matrix-mcp:v0.1.0
+          image: ghcr.io/jlxq0/matrix-mcp:latest
           ports:
             - containerPort: 3000
           securityContext:
@@ -146,11 +146,11 @@ spec:
               drop: ["ALL"]
           env:
             - name: MATRIX_MCP_RESOURCE_URL
-              value: "https://matrix-mcp.example.com"
+              value: "https://matrix-mcp.your-domain.example"
             - name: MATRIX_MCP_AUTHORIZATION_SERVER
-              value: "https://matrixauthservice.example.com"
+              value: "https://your-mas.example"
             - name: MATRIX_MCP_HOMESERVER_URL
-              value: "https://matrix.example.com"
+              value: "https://matrix.your-domain.example"
             - name: MATRIX_MCP_SERVER_NAME
               value: "example.com"
             - name: MATRIX_MCP_INTROSPECTION_CLIENT_ID
@@ -222,17 +222,17 @@ your own cert-manager issuer or static cert.
 
 ```bash
 # health
-curl -i https://matrix-mcp.example.com/health
-# expect: 200 {"status":"healthy"}
+curl -i https://matrix-mcp.your-domain.example/health
+# expect: 200 ok
 
 # resource metadata (RFC 9728)
-curl -s https://matrix-mcp.example.com/.well-known/oauth-protected-resource | jq .
+curl -s https://matrix-mcp.your-domain.example/.well-known/oauth-protected-resource | jq .
 
 # unauthenticated MCP call
-curl -i -X POST https://matrix-mcp.example.com/mcp
+curl -i -X POST https://matrix-mcp.your-domain.example/mcp
 # expect: 401 with WWW-Authenticate pointing at /.well-known/...
 ```
 
 Once the server responds correctly, add
-`https://matrix-mcp.example.com/mcp` as a custom connector in claude.ai
+`https://matrix-mcp.your-domain.example/mcp` as a custom connector in claude.ai
 and follow the [onboarding guide](onboarding.md).

@@ -1,6 +1,6 @@
 # Security
 
-Last updated: 2026-05-15, v0.1.0.
+Last updated: 2026-05-17, v0.3.0.
 
 ## What matrix-mcp is, security-wise
 
