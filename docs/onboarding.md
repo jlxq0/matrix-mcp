@@ -1,14 +1,20 @@
 # Onboarding
 
-How to connect claude.ai to your Matrix account on `kampong.social`.
+How to connect claude.ai to your Matrix account once an operator
+has deployed matrix-mcp.
+
+If you *are* the operator and haven't deployed yet, follow
+[installation.md](installation.md) first; come back here when
+`https://matrix-mcp.<your-domain>/health` returns `ok`.
 
 ---
 
 ## Prerequisites
 
-- A `kampong.social` Matrix account.
+- A Matrix account on the homeserver matrix-mcp is bound to.
 - Cross-signing set up in Element X (Settings → Security → Set up
-  secure backup). You'll need the recovery key it shows you.
+  secure backup). You'll need the recovery key it shows you (the
+  48-character string starting with `Esso…`).
 - A claude.ai account with access to custom connectors.
 
 ---
@@ -16,11 +22,11 @@ How to connect claude.ai to your Matrix account on `kampong.social`.
 ## Step 1 – Add the connector in claude.ai
 
 1. Open claude.ai → Settings → Connectors → Add custom connector.
-2. Enter the URL: `https://matrix-mcp.kampong.social/mcp`
+2. Enter the URL: `https://matrix-mcp.your-domain.example/mcp`
 3. Click Connect.
 
 Claude.ai will discover the MAS authorization server, register itself
-as a client via DCR, and redirect you to `id.kampong.social` to log in
+as a client via DCR, and redirect you to `your-mas.example` to log in
 and approve the scopes.
 
 Approve the `openid`, Matrix C-S API (`urn:matrix:…`), and device scopes
@@ -35,8 +41,8 @@ tell you if E2EE is already active. On first connection it won't be.
 
 To unlock E2EE:
 
-1. Open `https://matrix-mcp.kampong.social/setup` in a browser.
-2. Click "Sign in" – you're redirected to `id.kampong.social`.
+1. Open `https://matrix-mcp.your-domain.example/setup` in a browser.
+2. Click "Sign in" – you're redirected to `your-mas.example`.
 3. After signing in, you're redirected back to the recovery key form.
 4. Paste your Matrix Secret Storage recovery key (the 48-character
    string starting with `Esso…` that Element X showed you when you first
@@ -96,7 +102,7 @@ cross-signing state is replaced.
 ## Optional: check Element X
 
 After running `/setup`, a new device named something like
-`MATRIXMCPCONNECTOR` should appear in Element X under
+`MATRIXMCP2` should appear in Element X under
 Settings → Devices. It will be marked as verified.
 
 If you see it marked as unverified, call `verify_status` from claude.ai

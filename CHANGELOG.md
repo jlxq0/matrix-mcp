@@ -6,75 +6,99 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+## [v0.3.0] – 2026-05-17
+
 ### Added
-- `SECURITY.md`, `THREAT_MODEL.md` and a tightened `README.md` for the
-  public release.
-- `docs/multi-user.md` documenting the per-mxid isolation guarantees.
 - `send_text_message` gained an optional `reply_to_event_id` so the
   caller can reply or continue a thread; the reply is auto-promoted
-  into the original event's thread when the target is threaded.
+  into the original event's thread when the target is threaded (#66).
 - `message_edit` tool – replace a previously-sent message via
-  `m.replace`. Matrix enforces sender ownership.
+  `m.replace`. Matrix enforces sender ownership (#66).
 - `message_forward` tool – forward the text body of a message into
-  another room. Text only; media is not re-uploaded.
-- `me_set_displayname` tool – set or clear this user's display name.
+  another room. Text only; media is not re-uploaded (#66).
+- `me_set_displayname` tool – set or clear this user's display name (#67).
 - `me_set_avatar` tool – set or clear this user's avatar from an
-  HTTPS URL (re-uploaded to the homeserver media repo).
+  HTTPS URL (re-uploaded to the homeserver media repo) (#67).
 - `users_get_profile` tool – fetch another user's public display
-  name + avatar.
+  name + avatar (#67).
 - `send_file`, `send_video`, `send_audio` tools – mirror
   `send_image_from_url` for the other media `MessageType`s. The
   underlying upload pipeline (HTTPS-only, redirect-limited, timeouted,
-  size-capped) is now shared via `MatrixMcpService::upload_from_url`.
-- `send_voice_note` deliberately omitted: it would require the
-  `unstable-msc3245-v1-compat` feature on `matrix-sdk` + `ruma`, and
-  without that marker it'd be an exact duplicate of `send_audio`.
+  size-capped) is now shared via `MatrixMcpService::upload_from_url` (#68).
 - `room_create` tool – create a new Matrix room. Defaults to private
   + encrypted. Accepts name, topic, invite list, public/private,
-  is_direct, alias.
-- `room_create_dm` tool – convenience wrapper for 1:1 encrypted DMs.
-- `invites_list` tool – return pending invites.
-- `invites_accept` / `invites_reject` tools.
+  is_direct, alias (#69).
+- `room_create_dm` tool – convenience wrapper for 1:1 encrypted DMs (#69).
+- `invites_list` / `invites_accept` / `invites_reject` tools (#69).
 - `room_kick` / `room_ban` / `room_unban` – membership-state changes
-  on a single user with an optional reason.
+  on a single user with an optional reason (#70).
 - `admin_get_power_levels` / `admin_set_power_level` – inspect and
-  edit power-level assignments. The set tool flips one user's
-  level at a time; pass the default (`0`) to remove the explicit
-  entry.
+  edit power-level assignments (#70).
 - `room_pin_message` / `room_unpin_message` – append to / remove
-  from `m.room.pinned_events`.
+  from `m.room.pinned_events` (#70).
 - `send_bulk` tool – send the same body to up to 20 rooms in one
-  call. Per-room outcomes returned individually.
+  call. Per-room outcomes returned individually (#71).
 - `send_broadcast` tool – send to every joined room. Refuses
   without `confirm: true`, refuses if joined > 50 rooms, skips
   rooms above `max_room_members` (default 10) so the blast radius
-  stays DM / small-group shaped.
-- `send_at` deliberately omitted: a durable scheduled-send needs a
-  persistent queue (survive pod restarts, replay on cold start),
-  which is more storage-layer work than belongs in this PR. An
-  in-memory `tokio::time::sleep + spawn` would silently drop sends
-  on the next pod rotation – worse than not shipping at all.
+  stays DM / small-group shaped (#71).
 - `examples/docker-compose.yml` + `examples/Caddyfile` – a
   single-host setup with Let's Encrypt for users who don't want to
-  set up Talos and ArgoCD.
-- CI badge on the README.
+  set up Talos and ArgoCD (#72).
+- CI badge on the README (#72).
+
+### Notes
+- `send_voice_note` deliberately omitted: it would require the
+  `unstable-msc3245-v1-compat` feature on `matrix-sdk` + `ruma`, and
+  without that marker it'd be an exact duplicate of `send_audio`.
+- `send_at` deliberately omitted: a durable scheduled-send needs a
+  persistent queue (survive pod restarts, replay on cold start). An
+  in-memory `tokio::time::sleep + spawn` would silently drop sends
+  on the next pod rotation – worse than not shipping at all.
 - `Plan.md` and `docs/plan.md` are now gitignored (internal notes,
   not part of the public docs surface).
 
+---
+
+## [v0.2.5] – 2026-05-17
+
 ### Fixed
-- In-place token refresh on the cached matrix-sdk client. When
+- In-place token refresh on the cached matrix-sdk client (#65). When
   claude.ai presents a fresh OAuth bearer (typically every ~hour),
   matrix-mcp now swaps it into the cached session via
   `restore_session` instead of using the stale token until Synapse
   returns `M_UNKNOWN_TOKEN`. Eliminates the "session expired
   mid-call → retry succeeds" UX for cron-style usage.
+
+---
+
+## [v0.2.4] – 2026-05-16
+
+### Fixed
 - `get_unread_summary` now returns populated `latest_event_id`,
-  `latest_sender`, and `latest_origin_server_ts` for E2EE rooms.
+  `latest_sender`, and `latest_origin_server_ts` for E2EE rooms (#64).
   matrix-sdk's `/sync` handler only feeds the LatestEvents subsystem
   when `Client::event_cache().subscribe()` has been called. Without
   that call `Room::latest_event()` returned `LatestEventValue::None`
   for every encrypted room. Same subscription Element X's
   `RoomListService` performs at startup.
+
+---
+
+## [v0.2.3] – 2026-05-16
+
+### Added
+- MCP tool annotations on all 19 tools – `title`, `read_only_hint`,
+  and (where applicable) `destructive_hint` / `idempotent_hint` (#62).
+- `SECURITY.md`, `THREAT_MODEL.md` and a tightened `README.md` for
+  the public release (#63).
+- `docs/multi-user.md` documenting the per-mxid isolation
+  guarantees (#63).
+
+### Removed
+- `CONTRIBUTING.md` – folded a three-line "PRs welcome, run cargo
+  fmt/clippy/test" note into the README instead. One-person project,
+  the long contributor-policy file was theatre (#63).
 
 ---
 
@@ -299,9 +323,13 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 - Multi-stage Dockerfile: Rust builder → distroless `cc-debian12:nonroot`.
 - CI: fmt, clippy, test, cargo audit, cargo deny, docker build.
 - AGPL-3.0-or-later license.
-- Production deploy on Gruyere (`matrix-mcp.kampong.social`).
+- Production deploy on Gruyere (`matrix-mcp.your-domain.example`).
 
-[Unreleased]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.2.1...HEAD
+[Unreleased]: https://github.com/jlxq0/matrix-mcp/compare/v0.3.0...HEAD
+[v0.3.0]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.5...v0.3.0
+[v0.2.5]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.4...v0.2.5
+[v0.2.4]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.3...v0.2.4
+[v0.2.3]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.2.1...v0.2.3
 [v0.2.2.1]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.2...v0.2.2.1
 [v0.2.2]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/jlxq0/matrix-mcp/compare/v0.2.0...v0.2.1

@@ -20,8 +20,8 @@ Return the authenticated Matrix user id and device id.
 **Returns:**
 ```json
 {
-  "mxid": "@julian:kampong.social",
-  "device_id": "MATRIXMCPCONNECTOR"
+  "mxid": "@alice:your-domain.example",
+  "device_id": "MATRIXMCP2"
 }
 ```
 
@@ -42,7 +42,7 @@ List Matrix rooms the authenticated user has joined.
 {
   "rooms": [
     {
-      "room_id": "!abc:kampong.social",
+      "room_id": "!abc:your-domain.example",
       "display_name": "General",
       "topic": "General chat",
       "encrypted": true
@@ -64,7 +64,7 @@ return `status: "unable_to_decrypt"` with a null event body.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
-| `room_id` | string | required | Matrix room id, e.g. `!abc:kampong.social` |
+| `room_id` | string | required | Matrix room id, e.g. `!abc:your-domain.example` |
 | `limit` | integer | `20` | Max events to return. Capped at 50. |
 
 **Returns:**
@@ -72,8 +72,8 @@ return `status: "unable_to_decrypt"` with a null event body.
 {
   "events": [
     {
-      "event_id": "$abc123:kampong.social",
-      "sender": "@julian:kampong.social",
+      "event_id": "$abc123:your-domain.example",
+      "sender": "@alice:your-domain.example",
       "origin_server_ts": 1747267200000,
       "status": "decrypted",
       "event": { "type": "m.room.message", "content": { "body": "Hello" } },
@@ -124,7 +124,7 @@ is cross-signed.
 
 **Returns:**
 ```json
-{ "event_id": "$newEvent:kampong.social" }
+{ "event_id": "$newEvent:your-domain.example" }
 ```
 
 ---
@@ -164,7 +164,7 @@ caller is currently joined to.
 **Returns:**
 ```json
 {
-  "room_id": "!abc:kampong.social",
+  "room_id": "!abc:your-domain.example",
   "display_name": "General",
   "name": "General",
   "topic": "General chat",
@@ -198,9 +198,9 @@ normalized power level.
 {
   "members": [
     {
-      "mxid": "@julian:kampong.social",
+      "mxid": "@alice:your-domain.example",
       "display_name": "Julian",
-      "avatar_url": "mxc://kampong.social/abc",
+      "avatar_url": "mxc://your-domain.example/abc",
       "power_level": 100
     }
   ],
@@ -226,14 +226,14 @@ first).
 {
   "rooms": [
     {
-      "room_id": "!abc:kampong.social",
+      "room_id": "!abc:your-domain.example",
       "display_name": "General",
       "encrypted": true,
       "unread_messages": 5,
       "unread_notifications": 2,
       "unread_mentions": 1,
-      "latest_event_id": "$abc:kampong.social",
-      "latest_sender": "@alice:kampong.social",
+      "latest_event_id": "$abc:your-domain.example",
+      "latest_sender": "@alice:your-domain.example",
       "latest_origin_server_ts": 1747267200000
     }
   ],
@@ -259,7 +259,7 @@ receipt.
 
 **Returns:**
 ```json
-{ "room_id": "!abc:kampong.social", "event_id": "$abc:kampong.social" }
+{ "room_id": "!abc:your-domain.example", "event_id": "$abc:your-domain.example" }
 ```
 
 ---
@@ -280,7 +280,7 @@ MSC2677 – the `key` is visible to everyone in the room.
 
 **Returns:**
 ```json
-{ "event_id": "$reactionEvent:kampong.social" }
+{ "event_id": "$reactionEvent:your-domain.example" }
 ```
 
 ---
@@ -301,7 +301,7 @@ power level is below the room's `redact` threshold, you get an error.
 
 **Returns:**
 ```json
-{ "event_id": "$redactionEvent:kampong.social" }
+{ "event_id": "$redactionEvent:your-domain.example" }
 ```
 
 ---
@@ -353,8 +353,8 @@ limited to 3 hops. Fetch timeout 15 s. Max size: `MATRIX_MCP_UPLOAD_MAX_BYTES`
 **Returns:**
 ```json
 {
-  "event_id": "$imageEvent:kampong.social",
-  "mxc_uri": "mxc://kampong.social/abc123"
+  "event_id": "$imageEvent:your-domain.example",
+  "mxc_uri": "mxc://your-domain.example/abc123"
 }
 ```
 
@@ -381,9 +381,9 @@ ciphertext for indexing.
 {
   "results": [
     {
-      "event_id": "$abc:kampong.social",
-      "room_id": "!abc:kampong.social",
-      "sender": "@julian:kampong.social",
+      "event_id": "$abc:your-domain.example",
+      "room_id": "!abc:your-domain.example",
+      "sender": "@alice:your-domain.example",
       "origin_server_ts": 1747267200000,
       "rank": 1.23,
       "body": "Hello world"
@@ -409,7 +409,7 @@ id after joining.
 
 **Returns:**
 ```json
-{ "room_id": "!abc:kampong.social" }
+{ "room_id": "!abc:your-domain.example" }
 ```
 
 ---
@@ -427,7 +427,7 @@ Leave a Matrix room.
 
 **Returns:**
 ```json
-{ "room_id": "!abc:kampong.social" }
+{ "room_id": "!abc:your-domain.example" }
 ```
 
 ---
@@ -443,12 +443,12 @@ vs. `invite` threshold).
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `room_id` | string | required | Matrix room id |
-| `mxid` | string | required | MXID to invite, e.g. `@alice:kampong.social` |
+| `mxid` | string | required | MXID to invite, e.g. `@alice:your-domain.example` |
 
 **Returns:**
 ```json
 {
-  "room_id": "!abc:kampong.social",
-  "mxid": "@alice:kampong.social"
+  "room_id": "!abc:your-domain.example",
+  "mxid": "@alice:your-domain.example"
 }
 ```

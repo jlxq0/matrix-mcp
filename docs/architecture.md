@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-05-15, v0.1.0.
+Last updated: 2026-05-17, v0.3.0.
 
 ## Overview
 
@@ -31,7 +31,7 @@ sequenceDiagram
     C->>M: GET /mcp (no token)
     M-->>C: 401 WWW-Authenticate: resource_metadata=…/.well-known/oauth-protected-resource
     C->>M: GET /.well-known/oauth-protected-resource
-    M-->>C: {authorization_servers: ["https://matrixauthservice.kampong.social"]}
+    M-->>C: {authorization_servers: ["https://your-mas.example"]}
     C->>MAS: GET /.well-known/oauth-authorization-server
     MAS-->>C: endpoints
     C->>MAS: POST /oauth2/registration (DCR, client_uri: https://claude.ai/)
@@ -44,7 +44,7 @@ sequenceDiagram
     C->>M: POST /mcp Bearer <access_token>
     M->>MAS: POST /oauth2/introspect (Basic auth + X-MAS-Supports-Device-Id: 1)
     MAS-->>M: {active: true, sub: <MAS-ULID>, username: julian, device_id: XXXX, scope: …}
-    M->>M: load or create Client(@julian:kampong.social, device=XXXX)
+    M->>M: load or create Client(@alice:your-domain.example, device=XXXX)
     M-->>C: tool result
 ```
 
