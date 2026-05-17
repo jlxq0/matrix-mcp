@@ -61,29 +61,21 @@ jobs:
         with: { command: check bans licenses sources }
 
   # Single docker job — builds always, pushes only on tag.
-  # Avoids the act_runner parser quirk when a separate publish job uses
-  # `needs: [clippy, test]` + `if:` together.
   docker:
     runs-on: ubuntu-22.04
     needs: [clippy, test]
     permissions: { contents: read, packages: write }
+    container:
+      image: ghcr.io/catthehacker/ubuntu:act-22.04
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
-      - name: Probe docker socket
-        run: |
-          echo "--- /var/run ---"
-          ls -la /var/run/ 2>&1 | head -20
-          echo "--- env ---"
-          env | grep -iE "docker|host" | sort
-          echo "--- mount ---"
-          mount | grep -iE "docker|run" | head -10
-          echo "--- which docker ---"
-          which docker || true
-          echo "--- docker info ---"
-          docker info 2>&1 | head -20 || true
       - uses: docker/setup-buildx-action@v3
         with:
+          # Use the host docker daemon (mounted via the volume above).
+          # docker-container driver would need nested Docker which we don't have.
           driver: docker
       - name: Login to Forgejo registry (primary)
         if: startsWith(github.ref, 'refs/tags/v')
