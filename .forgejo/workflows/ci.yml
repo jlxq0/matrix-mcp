@@ -60,20 +60,26 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with: { command: check bans licenses sources }
 
-  # Single docker job — builds always, pushes only on tag. The Pada runner
-  # mounts /var/run/docker.sock into every job container via
-  # `container.options: -v /var/run/docker.sock:/var/run/docker.sock` in
-  # the runner config, so no extra wiring is needed here.
+  # Single docker job — builds always, pushes only on tag.
+  # Pada runner has `valid_volumes: ['**']`, so we explicitly request the
+  # host docker socket mount from the workflow. (act_runner's
+  # `docker_host: automount` setting did not actually inject the mount in
+  # v6.4.0 in our test, so we wire it explicitly.)
   docker:
     runs-on: ubuntu-22.04
     needs: [clippy, test]
     permissions: { contents: read, packages: write }
+    container:
+      image: ghcr.io/catthehacker/ubuntu:act-22.04
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
+      - name: Verify docker access
+        run: docker info | head -8
       - uses: docker/setup-buildx-action@v3
         with:
-          # Use the bound host daemon, not a nested docker-container builder.
           driver: docker
       - name: Login to Forgejo registry (primary)
         if: startsWith(github.ref, 'refs/tags/v')
