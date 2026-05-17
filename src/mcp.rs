@@ -349,6 +349,42 @@ pub struct MessageForwardResult {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendFileFromUrlParams {
+    /// Matrix room id, e.g. `!abc:kampong.social`.
+    pub room_id: String,
+    /// HTTPS URL of the file. Re-uploaded to the homeserver media
+    /// repo before sending.
+    pub file_url: String,
+    /// Optional caption; rendered alongside the file in clients that
+    /// support it. When omitted, the filename (derived from the URL
+    /// path) is used as the body.
+    #[serde(default)]
+    pub caption: Option<String>,
+    /// Optional override for the filename surfaced to the recipient.
+    /// Defaults to the last path segment of `file_url`.
+    #[serde(default)]
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendMediaFromUrlParams {
+    /// Matrix room id, e.g. `!abc:kampong.social`.
+    pub room_id: String,
+    /// HTTPS URL of the media. Re-uploaded to the homeserver media
+    /// repo before sending.
+    pub media_url: String,
+    /// Optional caption alongside the media.
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SendMediaResult {
+    pub event_id: String,
+    pub mxc_uri: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MeSetDisplaynameParams {
     /// New display name. `null` (or omitted) clears the field on the
     /// homeserver. Lengths above 256 chars are rejected.
@@ -2217,6 +2253,90 @@ impl MatrixMcpService {
         result
     }
 
+    /// Send a generic file from an HTTPS URL. Any content-type is
+    /// accepted; the file is uploaded as-is and sent as `m.file`.
+    #[tool(
+        description = "Send a generic file from an HTTPS URL into a Matrix room (m.file).",
+        annotations(
+            title = "Send file",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn send_file(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SendFileFromUrlParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.send_media_from_url(
+            ctx,
+            params.room_id,
+            params.file_url,
+            params.caption,
+            params.filename,
+            MediaKind::File,
+        )
+        .await
+    }
+
+    /// Send a video from an HTTPS URL. Content-Type must start with
+    /// `video/`.
+    #[tool(
+        description = "Send a video from an HTTPS URL into a Matrix room (m.video).",
+        annotations(
+            title = "Send video",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn send_video(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SendMediaFromUrlParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.send_media_from_url(
+            ctx,
+            params.room_id,
+            params.media_url,
+            params.caption,
+            None,
+            MediaKind::Video,
+        )
+        .await
+    }
+
+    /// Send an audio clip from an HTTPS URL. Content-Type must start
+    /// with `audio/`.
+    #[tool(
+        description = "Send an audio clip from an HTTPS URL into a Matrix room (m.audio).",
+        annotations(
+            title = "Send audio",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn send_audio(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SendMediaFromUrlParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.send_media_from_url(
+            ctx,
+            params.room_id,
+            params.media_url,
+            params.caption,
+            None,
+            MediaKind::Audio,
+        )
+        .await
+    }
+
     /// Set this user's Matrix display name. Pass `name: null` to
     /// clear it.
     #[tool(
@@ -2810,21 +2930,44 @@ impl MatrixMcpService {
     }
 
     /// Fetch an HTTPS image URL and upload it to the homeserver media
-    /// repo. Used by `send_image_from_url` and `me_set_avatar`.
-    ///
-    /// SSRF note: HTTPS-only (the http:// guard prevents credential
-    /// exposure over cleartext), size-capped to `upload_max_bytes`,
-    /// limited to 3 redirects, 15 s timeout. Blocking RFC-1918 /
-    /// loopback destinations is a future hardening item.
+    /// repo. Thin wrapper around `upload_from_url` that pins the
+    /// expected content-type prefix to `image/`.
     async fn upload_image_from_url(
         &self,
         url: &str,
         client: &matrix_sdk::Client,
     ) -> Result<OwnedMxcUri, ErrorData> {
+        let uploaded = self
+            .upload_from_url(url, client, Some("image/"), mime::IMAGE_JPEG)
+            .await?;
+        Ok(uploaded.mxc_uri)
+    }
+
+    /// Fetch an HTTPS URL and upload its body to the homeserver media
+    /// repo. Returns the resulting MXC URI together with the parsed
+    /// MIME type, byte length, and a guessed filename derived from
+    /// the URL path. Callers compose this into the appropriate
+    /// `MessageType` (file / image / video / audio / etc.).
+    ///
+    /// `expected_prefix`, when set, requires the remote
+    /// `Content-Type` to start with that string (e.g. `audio/`,
+    /// `video/`, `image/`). Pass `None` to accept any content type
+    /// (used by `send_file`).
+    ///
+    /// SSRF note: HTTPS-only (the http:// guard prevents credential
+    /// exposure over cleartext), size-capped to `upload_max_bytes`,
+    /// limited to 3 redirects, 15 s timeout. Blocking RFC-1918 /
+    /// loopback destinations is a future hardening item.
+    async fn upload_from_url(
+        &self,
+        url: &str,
+        client: &matrix_sdk::Client,
+        expected_prefix: Option<&str>,
+        default_mime: mime::Mime,
+    ) -> Result<UploadedMedia, ErrorData> {
         if !url.starts_with("https://") {
             return Err(ErrorData::invalid_params(
-                "image_url must be an HTTPS URL \
-                 (http:// is rejected to prevent credential exposure over cleartext)",
+                "url must be HTTPS (http:// is rejected to prevent credential exposure over cleartext)",
                 None,
             ));
         }
@@ -2838,29 +2981,31 @@ impl MatrixMcpService {
             .get(url)
             .send()
             .await
-            .map_err(|e| ErrorData::internal_error(format!("fetch image_url: {e}"), None))?;
+            .map_err(|e| ErrorData::internal_error(format!("fetch url: {e}"), None))?;
         let ct = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
-        if !ct.starts_with("image/") {
+        if let Some(prefix) = expected_prefix
+            && !ct.starts_with(prefix)
+        {
             return Err(ErrorData::invalid_params(
-                format!("remote URL returned Content-Type `{ct}`; expected `image/*`"),
+                format!("remote URL returned Content-Type `{ct}`; expected `{prefix}*`"),
                 None,
             ));
         }
-        let mime_type: mime::Mime = ct.parse().unwrap_or(mime::IMAGE_JPEG);
+        let mime_type: mime::Mime = ct.parse().unwrap_or(default_mime);
         let cap = self.upload_max_bytes;
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| ErrorData::internal_error(format!("read image body: {e}"), None))?;
+            .map_err(|e| ErrorData::internal_error(format!("read body: {e}"), None))?;
         if bytes.len() > cap {
             return Err(ErrorData::invalid_params(
                 format!(
-                    "image body {} bytes exceeds the configured cap of {} bytes \
+                    "body {} bytes exceeds the configured cap of {} bytes \
                      (set MATRIX_MCP_UPLOAD_MAX_BYTES to raise it)",
                     bytes.len(),
                     cap
@@ -2868,12 +3013,177 @@ impl MatrixMcpService {
                 None,
             ));
         }
+        let bytes_len = bytes.len();
         let upload_resp = client
             .media()
             .upload(&mime_type, bytes.to_vec(), None)
             .await
             .map_err(|e| ErrorData::internal_error(format!("media upload: {e}"), None))?;
-        Ok(upload_resp.content_uri)
+        let filename = url
+            .split('/')
+            .next_back()
+            .and_then(|s| s.split('?').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("file")
+            .to_owned();
+        Ok(UploadedMedia {
+            mxc_uri: upload_resp.content_uri,
+            mime_type,
+            bytes_len: u64::try_from(bytes_len).unwrap_or(u64::MAX),
+            filename,
+        })
+    }
+}
+
+/// Outcome of `upload_from_url`. The fields are everything the
+/// various attachment-sending tools need to compose a
+/// `MessageType` for the media event.
+struct UploadedMedia {
+    mxc_uri: OwnedMxcUri,
+    mime_type: mime::Mime,
+    bytes_len: u64,
+    filename: String,
+}
+
+/// Distinguishes the four media-bearing `MessageType` variants so a
+/// single send helper can compose the right one.
+#[derive(Debug, Clone, Copy)]
+enum MediaKind {
+    File,
+    Video,
+    Audio,
+}
+
+impl MediaKind {
+    const fn expected_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::File => None,
+            Self::Video => Some("video/"),
+            Self::Audio => Some("audio/"),
+        }
+    }
+
+    fn default_mime(self) -> mime::Mime {
+        match self {
+            Self::File => mime::APPLICATION_OCTET_STREAM,
+            // Conservative defaults if the remote Content-Type is
+            // present but unparseable.
+            Self::Video => "video/mp4"
+                .parse()
+                .unwrap_or(mime::APPLICATION_OCTET_STREAM),
+            Self::Audio => "audio/ogg"
+                .parse()
+                .unwrap_or(mime::APPLICATION_OCTET_STREAM),
+        }
+    }
+
+    const fn tool_name(self) -> &'static str {
+        match self {
+            Self::File => "send_file",
+            Self::Video => "send_video",
+            Self::Audio => "send_audio",
+        }
+    }
+}
+
+impl MatrixMcpService {
+    /// Shared body for `send_file`, `send_video`, `send_audio`.
+    /// Uploads from `url`, builds the right `MessageType`, sends to
+    /// `room_id`, emits the standard audit + notice envelope.
+    async fn send_media_from_url(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        room_id_param: String,
+        url: String,
+        caption: Option<String>,
+        filename_override: Option<String>,
+        kind: MediaKind,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::UInt;
+        use matrix_sdk::ruma::events::room::message::{
+            AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent, VideoInfo,
+            VideoMessageEventContent,
+        };
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = room_id_param.clone();
+        let span = make_tool_span(kind.tool_name(), &mxid_for_audit, Some(&room_id_for_audit));
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let uploaded = self
+                .upload_from_url(&url, &client, kind.expected_prefix(), kind.default_mime())
+                .await?;
+            let display_filename = filename_override.unwrap_or_else(|| uploaded.filename.clone());
+            let body = caption.unwrap_or_else(|| display_filename.clone());
+            let mime_str = uploaded.mime_type.essence_str().to_owned();
+            let size = UInt::try_from(uploaded.bytes_len).ok();
+            let msg_type = match kind {
+                MediaKind::File => {
+                    let mut info = FileInfo::new();
+                    info.mimetype = Some(mime_str);
+                    info.size = size;
+                    let mut content =
+                        FileMessageEventContent::plain(body, uploaded.mxc_uri.clone());
+                    content.filename = Some(display_filename);
+                    content.info = Some(Box::new(info));
+                    MessageType::File(content)
+                }
+                MediaKind::Video => {
+                    let mut info = VideoInfo::new();
+                    info.mimetype = Some(mime_str);
+                    info.size = size;
+                    let mut content =
+                        VideoMessageEventContent::plain(body, uploaded.mxc_uri.clone());
+                    content.info = Some(Box::new(info));
+                    MessageType::Video(content)
+                }
+                MediaKind::Audio => {
+                    let mut info = AudioInfo::new();
+                    info.mimetype = Some(mime_str);
+                    info.size = size;
+                    let mut content =
+                        AudioMessageEventContent::plain(body, uploaded.mxc_uri.clone());
+                    content.info = Some(Box::new(info));
+                    MessageType::Audio(content)
+                }
+            };
+            let room_id: OwnedRoomId = room_id_param.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {room_id_param}: {e}"), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let send_resp = room
+                .send(RoomMessageEventContent::new(msg_type))
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.send: {e}"), None))?;
+            structured_result(&SendMediaResult {
+                event_id: send_resp.response.event_id.to_string(),
+                mxc_uri: uploaded.mxc_uri.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            kind.tool_name(),
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            kind.tool_name(),
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
     }
 }
 
