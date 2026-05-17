@@ -24,6 +24,7 @@ use matrix_sdk::room::{IncludeRelations, MessagesOptions, RelationsOptions};
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::OwnedMxcUri;
 use matrix_sdk::ruma::OwnedRoomId;
+use matrix_sdk::ruma::UserId;
 use matrix_sdk::ruma::api::Direction;
 use matrix_sdk::ruma::api::client::search::search_events;
 use matrix_sdk::ruma::events::relation::RelationType;
@@ -345,6 +346,47 @@ pub struct MessageForwardParams {
 pub struct MessageForwardResult {
     /// Event id of the new event in the target room.
     pub event_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MeSetDisplaynameParams {
+    /// New display name. `null` (or omitted) clears the field on the
+    /// homeserver. Lengths above 256 chars are rejected.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MeSetDisplaynameResult {
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MeSetAvatarParams {
+    /// HTTPS URL of the image to use as the new avatar. The image is
+    /// fetched, size-capped (`MATRIX_MCP_UPLOAD_MAX_BYTES`), and
+    /// re-uploaded to the homeserver media repo. Pass `null` (or
+    /// omit) to clear the avatar.
+    #[serde(default)]
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MeSetAvatarResult {
+    pub mxc_uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UsersGetProfileParams {
+    /// Matrix user id, e.g. `@alice:kampong.social`.
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct UsersGetProfileResult {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2175,6 +2217,177 @@ impl MatrixMcpService {
         result
     }
 
+    /// Set this user's Matrix display name. Pass `name: null` to
+    /// clear it.
+    #[tool(
+        description = "Set this user's Matrix display name. Pass null to clear.",
+        annotations(
+            title = "Set display name",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn me_set_displayname(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<MeSetDisplaynameParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("me_set_displayname", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            if let Some(ref name) = params.name
+                && name.len() > 256
+            {
+                return Err(ErrorData::invalid_params(
+                    format!("display name length {} exceeds 256", name.len()),
+                    None,
+                ));
+            }
+            let client = self.client_for(&ctx).await?;
+            client
+                .account()
+                .set_display_name(params.name.as_deref())
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("set_display_name: {e}"), None))?;
+            structured_result(&MeSetDisplaynameResult {
+                display_name: params.name.clone(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "me_set_displayname",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(&result, &self.clients, &ctx, "me_set_displayname", None).await;
+        result
+    }
+
+    /// Set this user's Matrix avatar from an HTTPS URL (fetched and
+    /// re-uploaded to the homeserver media repo). Pass `image_url:
+    /// null` to clear the avatar.
+    #[tool(
+        description = "Set this user's Matrix avatar from an HTTPS URL. Pass null to clear.",
+        annotations(
+            title = "Set avatar",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn me_set_avatar(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<MeSetAvatarParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("me_set_avatar", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let mxc_uri = if let Some(ref url) = params.image_url {
+                Some(self.upload_image_from_url(url, &client).await?)
+            } else {
+                None
+            };
+            client
+                .account()
+                .set_avatar_url(mxc_uri.as_deref())
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("set_avatar_url: {e}"), None))?;
+            structured_result(&MeSetAvatarResult {
+                mxc_uri: mxc_uri.map(|m| m.to_string()),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "me_set_avatar",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(&result, &self.clients, &ctx, "me_set_avatar", None).await;
+        result
+    }
+
+    /// Fetch another user's public profile (display name + avatar).
+    /// Does not reveal anything that's not already visible to anyone
+    /// on the federated graph.
+    #[tool(
+        description = "Fetch another user's public Matrix profile (display name + avatar URL).",
+        annotations(title = "Get user profile", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn users_get_profile(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<UsersGetProfileParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("users_get_profile", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let user_id = UserId::parse(&params.user_id).map_err(|e| {
+                ErrorData::invalid_params(format!("invalid user_id {}: {e}", params.user_id), None)
+            })?;
+            let profile = client
+                .account()
+                .fetch_user_profile_of(&user_id)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("fetch_user_profile_of: {e}"), None)
+                })?;
+            // ruma's get_profile::v3::Response stores fields in a flat
+            // `data: BTreeMap<String, JsonValue>` keyed by Matrix spec
+            // field name. We pluck the two well-known ones.
+            let display_name = profile
+                .get("displayname")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let avatar_url = profile
+                .get("avatar_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            structured_result(&UsersGetProfileResult {
+                user_id: params.user_id,
+                display_name,
+                avatar_url,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "users_get_profile",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
     /// Search Matrix room history using the homeserver's full-text search
     /// index (`POST /_matrix/client/v3/search`). Results are ordered by
     /// relevance (homeserver-computed rank). For E2EE rooms the homeserver
@@ -2594,6 +2807,73 @@ impl MatrixMcpService {
             .for_user(&id, &token.0)
             .await
             .map_err(|e| ErrorData::internal_error(format!("build matrix client: {e:#}"), None))
+    }
+
+    /// Fetch an HTTPS image URL and upload it to the homeserver media
+    /// repo. Used by `send_image_from_url` and `me_set_avatar`.
+    ///
+    /// SSRF note: HTTPS-only (the http:// guard prevents credential
+    /// exposure over cleartext), size-capped to `upload_max_bytes`,
+    /// limited to 3 redirects, 15 s timeout. Blocking RFC-1918 /
+    /// loopback destinations is a future hardening item.
+    async fn upload_image_from_url(
+        &self,
+        url: &str,
+        client: &matrix_sdk::Client,
+    ) -> Result<OwnedMxcUri, ErrorData> {
+        if !url.starts_with("https://") {
+            return Err(ErrorData::invalid_params(
+                "image_url must be an HTTPS URL \
+                 (http:// is rejected to prevent credential exposure over cleartext)",
+                None,
+            ));
+        }
+        let http = reqwest::Client::builder()
+            .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::limited(3))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| ErrorData::internal_error(format!("build http client: {e}"), None))?;
+        let response = http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("fetch image_url: {e}"), None))?;
+        let ct = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        if !ct.starts_with("image/") {
+            return Err(ErrorData::invalid_params(
+                format!("remote URL returned Content-Type `{ct}`; expected `image/*`"),
+                None,
+            ));
+        }
+        let mime_type: mime::Mime = ct.parse().unwrap_or(mime::IMAGE_JPEG);
+        let cap = self.upload_max_bytes;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("read image body: {e}"), None))?;
+        if bytes.len() > cap {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "image body {} bytes exceeds the configured cap of {} bytes \
+                     (set MATRIX_MCP_UPLOAD_MAX_BYTES to raise it)",
+                    bytes.len(),
+                    cap
+                ),
+                None,
+            ));
+        }
+        let upload_resp = client
+            .media()
+            .upload(&mime_type, bytes.to_vec(), None)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("media upload: {e}"), None))?;
+        Ok(upload_resp.content_uri)
     }
 }
 

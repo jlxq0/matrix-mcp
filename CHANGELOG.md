@@ -10,8 +10,6 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 - `SECURITY.md`, `THREAT_MODEL.md` and a tightened `README.md` for the
   public release.
 - `docs/multi-user.md` documenting the per-mxid isolation guarantees.
-
-### Added
 - `send_text_message` gained an optional `reply_to_event_id` so the
   caller can reply or continue a thread; the reply is auto-promoted
   into the original event's thread when the target is threaded.
@@ -19,6 +17,11 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
   `m.replace`. Matrix enforces sender ownership.
 - `message_forward` tool – forward the text body of a message into
   another room. Text only; media is not re-uploaded.
+- `me_set_displayname` tool – set or clear this user's display name.
+- `me_set_avatar` tool – set or clear this user's avatar from an
+  HTTPS URL (re-uploaded to the homeserver media repo).
+- `users_get_profile` tool – fetch another user's public display
+  name + avatar.
 
 ### Fixed
 - In-place token refresh on the cached matrix-sdk client. When
