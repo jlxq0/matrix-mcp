@@ -69,7 +69,10 @@ jobs:
     needs: [clippy, test]
     permissions: { contents: read, packages: write }
     env:
-      BUILDKIT_HOST: tcp://host.docker.internal:1234
+      # Pada VM LAN IP. We use the IP directly because act_runner's
+      # container.options (--add-host) isn't honored — host.docker.internal
+      # would not resolve from the job container.
+      BUILDKIT_HOST: tcp://10.0.1.57:1234
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
