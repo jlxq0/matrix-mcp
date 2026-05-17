@@ -385,6 +385,73 @@ pub struct SendMediaResult {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoomCreateParams {
+    /// Optional room name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional room topic.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// MXIDs to invite at creation. Empty list = invite nobody.
+    #[serde(default)]
+    pub invite: Vec<String>,
+    /// When `true`, the room joins the homeserver's public directory
+    /// and uses the `public_chat` preset. Default: false (private).
+    #[serde(default)]
+    pub public: bool,
+    /// When `true`, the room is created with an `m.room.encryption`
+    /// state event. Default: true.
+    #[serde(default = "default_true")]
+    pub encrypted: bool,
+    /// Mark the room as a 1:1 DM in clients' UIs. Doesn't affect
+    /// homeserver semantics. Default: false.
+    #[serde(default)]
+    pub is_direct: bool,
+    /// Optional room alias localpart (without the `#` or
+    /// `:server_name`). Server-side uniqueness rules apply.
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RoomCreateResult {
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoomCreateDmParams {
+    /// The other user's MXID, e.g. `@alice:kampong.social`.
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct InviteSummary {
+    pub room_id: String,
+    pub display_name: Option<String>,
+    pub encrypted: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct InvitesListResult {
+    pub invites: Vec<InviteSummary>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InvitesActionParams {
+    /// Matrix room id of the invite to accept/reject.
+    pub room_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct InvitesActionResult {
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MeSetDisplaynameParams {
     /// New display name. `null` (or omitted) clears the field on the
     /// homeserver. Lengths above 256 chars are rejected.
@@ -2820,6 +2887,315 @@ impl MatrixMcpService {
             &self.clients,
             &ctx,
             "invite_user",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
+
+    /// Create a new Matrix room.
+    #[tool(
+        description = "Create a new Matrix room. Defaults to private + encrypted.",
+        annotations(
+            title = "Create room",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_create(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomCreateParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::api::client::room::Visibility;
+        use matrix_sdk::ruma::api::client::room::create_room;
+        use matrix_sdk::ruma::api::client::room::create_room::v3::RoomPreset;
+        use matrix_sdk::ruma::events::InitialStateEvent;
+        use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("room_create", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let mut req = create_room::v3::Request::new();
+            req.name = params.name;
+            req.topic = params.topic;
+            req.is_direct = params.is_direct;
+            req.room_alias_name = params.alias;
+            req.preset = Some(if params.public {
+                RoomPreset::PublicChat
+            } else {
+                RoomPreset::PrivateChat
+            });
+            req.visibility = if params.public {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            };
+            for mxid in &params.invite {
+                let user_id = UserId::parse(mxid).map_err(|e| {
+                    ErrorData::invalid_params(format!("invalid invitee mxid {mxid}: {e}"), None)
+                })?;
+                req.invite.push(user_id);
+            }
+            // Default-on encryption: send an m.room.encryption initial
+            // state event with the megolm-v1 algorithm. Setting it at
+            // creation time is the only sound way — turning encryption
+            // on after the fact is irreversible but doesn't retroactively
+            // encrypt earlier events.
+            if params.encrypted {
+                let enc_content = RoomEncryptionEventContent::new(
+                    matrix_sdk::ruma::EventEncryptionAlgorithm::MegolmV1AesSha2,
+                );
+                req.initial_state =
+                    vec![InitialStateEvent::with_empty_state_key(enc_content).to_raw_any()];
+            }
+            let room = client
+                .create_room(req)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("create_room: {e}"), None))?;
+            structured_result(&RoomCreateResult {
+                room_id: room.room_id().to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "room_create",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(&result, &self.clients, &ctx, "room_create", None).await;
+        result
+    }
+
+    /// Create a 1:1 encrypted DM with another user. Convenience wrapper
+    /// over `room_create`.
+    #[tool(
+        description = "Create an encrypted 1:1 DM room with another Matrix user.",
+        annotations(
+            title = "Create DM",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_create_dm(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomCreateDmParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::api::client::room::Visibility;
+        use matrix_sdk::ruma::api::client::room::create_room;
+        use matrix_sdk::ruma::api::client::room::create_room::v3::RoomPreset;
+        use matrix_sdk::ruma::events::InitialStateEvent;
+        use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("room_create_dm", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let user_id = UserId::parse(&params.user_id).map_err(|e| {
+                ErrorData::invalid_params(format!("invalid user_id {}: {e}", params.user_id), None)
+            })?;
+            let mut req = create_room::v3::Request::new();
+            req.is_direct = true;
+            req.preset = Some(RoomPreset::TrustedPrivateChat);
+            req.visibility = Visibility::Private;
+            req.invite = vec![user_id.clone()];
+            let enc_content = RoomEncryptionEventContent::new(
+                matrix_sdk::ruma::EventEncryptionAlgorithm::MegolmV1AesSha2,
+            );
+            req.initial_state =
+                vec![InitialStateEvent::with_empty_state_key(enc_content).to_raw_any()];
+            let room = client
+                .create_room(req)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("create_room: {e}"), None))?;
+            structured_result(&RoomCreateResult {
+                room_id: room.room_id().to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "room_create_dm",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(&result, &self.clients, &ctx, "room_create_dm", None).await;
+        result
+    }
+
+    /// List pending Matrix invites — rooms the user has been invited
+    /// to but hasn't joined or rejected.
+    #[tool(
+        description = "List pending Matrix room invites (rooms invited to but not yet joined or rejected).",
+        annotations(title = "List invites", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn invites_list(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("invites_list", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let invites: Vec<InviteSummary> = client
+                .invited_rooms()
+                .into_iter()
+                .map(|r| InviteSummary {
+                    room_id: r.room_id().to_string(),
+                    display_name: r.cached_display_name().map(|n| n.to_string()),
+                    encrypted: r.encryption_state().is_encrypted(),
+                })
+                .collect();
+            structured_result(&InvitesListResult { invites })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "invites_list",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Accept a pending Matrix invite.
+    #[tool(
+        description = "Accept a pending Matrix room invite (join the room).",
+        annotations(
+            title = "Accept invite",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn invites_accept(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<InvitesActionParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("invites_accept", &mxid_for_audit, Some(&room_id_for_audit));
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            client
+                .join_room_by_id(&room_id)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("join_room_by_id: {e}"), None))?;
+            structured_result(&InvitesActionResult {
+                room_id: room_id.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "invites_accept",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "invites_accept",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
+
+    /// Reject a pending Matrix invite. Idempotent — calling on a room
+    /// you're no longer invited to is a no-op.
+    #[tool(
+        description = "Reject a pending Matrix room invite (leave without joining).",
+        annotations(
+            title = "Reject invite",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn invites_reject(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<InvitesActionParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("invites_reject", &mxid_for_audit, Some(&room_id_for_audit));
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("no such room {room_id}"), None)
+            })?;
+            room.leave()
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.leave: {e}"), None))?;
+            structured_result(&InvitesActionResult {
+                room_id: room_id.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "invites_reject",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "invites_reject",
             Some(room_id_for_audit.as_str()),
         )
         .await;
