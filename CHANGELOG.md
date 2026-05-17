@@ -54,6 +54,12 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
   which is more storage-layer work than belongs in this PR. An
   in-memory `tokio::time::sleep + spawn` would silently drop sends
   on the next pod rotation – worse than not shipping at all.
+- `examples/docker-compose.yml` + `examples/Caddyfile` – a
+  single-host setup with Let's Encrypt for users who don't want to
+  set up Talos and ArgoCD.
+- CI badge on the README.
+- `Plan.md` and `docs/plan.md` are now gitignored (internal notes,
+  not part of the public docs surface).
 
 ### Fixed
 - In-place token refresh on the cached matrix-sdk client. When
