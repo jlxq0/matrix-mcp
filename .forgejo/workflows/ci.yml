@@ -63,11 +63,13 @@ jobs:
             | sudo tar -xz -C /usr/local --strip-components=0
           buildctl --version
       # forge.oddie.app login is needed on every run (for buildcache push/pull).
+      # secrets.GITHUB_TOKEN doesn't have write:package scope on Forgejo's
+      # container registry — we use FORGE_PUSH_TOKEN (a PAT with that scope).
       # GHCR login only when we're about to push real tags.
       - name: Login to Forgejo registry
         run: |
           mkdir -p ~/.docker
-          F_AUTH=$(printf "%s:%s" "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
+          F_AUTH=$(printf "%s:%s" "julian" "${{ secrets.FORGE_PUSH_TOKEN }}" | base64 -w0)
           echo "{\"auths\":{\"forge.oddie.app\":{\"auth\":\"$F_AUTH\"}}}" > ~/.docker/config.json
       - name: Login to GHCR (tag only)
         if: startsWith(github.ref, 'refs/tags/v')
