@@ -60,59 +60,50 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with: { command: check bans licenses sources }
 
-  # docker job builds via a standalone BuildKit daemon on the Pada VM
-  # (listening on tcp://172.17.0.1:1234, reachable from job containers as
-  # host.docker.internal:1234). The runner injects --add-host via its
-  # container.options so DNS resolves correctly. No docker socket mount
-  # needed; clean isolation between build daemon and job container.
+  # docker job uses buildctl talking to the Pada VM's buildkitd over TCP
+  # (tcp://host.docker.internal:1234). We use buildctl directly rather
+  # than `docker buildx` because buildx v0.33 (bundled in catthehacker
+  # image) hangs on plain-TCP remote endpoints.
   docker:
     runs-on: ubuntu-22.04
     needs: [clippy, test]
     permissions: { contents: read, packages: write }
+    env:
+      BUILDKIT_HOST: tcp://host.docker.internal:1234
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver: remote
-          endpoint: tcp://host.docker.internal:1234
-      - name: Login to Forgejo registry (primary)
+      - name: Install buildctl
+        run: |
+          curl -sSL https://github.com/moby/buildkit/releases/download/v0.30.0/buildkit-v0.30.0.linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local --strip-components=0
+          buildctl --version
+      - name: Login to registries (tag only)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/login-action@v3
-        with:
-          registry: forge.oddie.app
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Login to GHCR (backup)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: jlxq0
-          password: ${{ secrets.GHCR_TOKEN }}
-      - name: Compute tags
-        id: meta
+        run: |
+          mkdir -p ~/.docker
+          F_AUTH=$(printf "%s:%s" "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
+          G_AUTH=$(printf "%s:%s" "jlxq0" "${{ secrets.GHCR_TOKEN }}" | base64 -w0)
+          cat > ~/.docker/config.json <<JSON
+          {
+            "auths": {
+              "forge.oddie.app": { "auth": "$F_AUTH" },
+              "ghcr.io":         { "auth": "$G_AUTH" }
+            }
+          }
+          JSON
+      - name: Build (and push on tag)
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             V="${GITHUB_REF#refs/tags/}"
-            {
-              echo 'tags<<EOF'
-              echo "forge.oddie.app/julian/matrix-mcp:${V}"
-              echo "forge.oddie.app/julian/matrix-mcp:latest"
-              echo "ghcr.io/jlxq0/matrix-mcp:${V}"
-              echo "ghcr.io/jlxq0/matrix-mcp:latest"
-              echo 'EOF'
-              echo 'push=true'
-            } >> "$GITHUB_OUTPUT"
+            TAGS="forge.oddie.app/julian/matrix-mcp:${V},forge.oddie.app/julian/matrix-mcp:latest,ghcr.io/jlxq0/matrix-mcp:${V},ghcr.io/jlxq0/matrix-mcp:latest"
+            PUSH=true
           else
-            {
-              echo "tags=forge.oddie.app/julian/matrix-mcp:ci-${GITHUB_SHA}"
-              echo 'push=false'
-            } >> "$GITHUB_OUTPUT"
+            TAGS="forge.oddie.app/julian/matrix-mcp:ci-${GITHUB_SHA::8}"
+            PUSH=false
           fi
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: ${{ steps.meta.outputs.push }}
-          tags: ${{ steps.meta.outputs.tags }}
-          platforms: linux/amd64
+          buildctl build \
+            --frontend dockerfile.v0 \
+            --local context=. \
+            --local dockerfile=. \
+            --output "type=image,\"name=${TAGS}\",push=${PUSH}"
