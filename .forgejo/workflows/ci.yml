@@ -60,23 +60,22 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with: { command: check bans licenses sources }
 
-  # docker job runs directly on the Pada VM (host mode) — the `pada-host`
-  # runner label has no `docker://` image mapping, so act_runner skips the
-  # job-container layer entirely and the host's docker daemon is reachable
-  # at /var/run/docker.sock natively. This sidesteps act_runner v6.4.0's
-  # buggy `docker_host: automount` setting.
+  # docker job builds via a standalone BuildKit daemon on the Pada VM
+  # (listening on tcp://172.17.0.1:1234, reachable from job containers as
+  # host.docker.internal:1234). The runner injects --add-host via its
+  # container.options so DNS resolves correctly. No docker socket mount
+  # needed; clean isolation between build daemon and job container.
   docker:
-    runs-on: pada-host
+    runs-on: ubuntu-22.04
     needs: [clippy, test]
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
-      - name: Verify docker access
-        run: docker info | head -8
       - uses: docker/setup-buildx-action@v3
         with:
-          driver: docker
+          driver: remote
+          endpoint: tcp://host.docker.internal:1234
       - name: Login to Forgejo registry (primary)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v3
