@@ -29,7 +29,8 @@ use matrix_sdk::ruma::api::client::search::search_events;
 use matrix_sdk::ruma::events::relation::RelationType;
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::room::message::{
-    ImageMessageEventContent, MessageType, RoomMessageEventContent,
+    AddMentions, ForwardThread, ImageMessageEventContent, MessageType, OriginalRoomMessageEvent,
+    RoomMessageEventContent,
 };
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -293,10 +294,56 @@ pub struct SendTextMessageParams {
     /// automatically by the SDK iff this device is cross-signed.
     /// Bodies larger than 64 KiB are rejected.
     pub body: String,
+    /// Optional event id to reply to. When set, the message is sent as
+    /// a Matrix rich reply (`m.in_reply_to`). If the target event is
+    /// already part of a thread, the reply is automatically scoped to
+    /// that thread; otherwise it becomes a top-level reply.
+    #[serde(default)]
+    pub reply_to_event_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SendTextMessageResult {
+    pub event_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MessageEditParams {
+    /// Matrix room id containing the event to edit.
+    pub room_id: String,
+    /// Event id of the original message. Must have been sent by the
+    /// authenticated user — Matrix enforces this at the protocol
+    /// level.
+    pub event_id: String,
+    /// New body (Markdown). Replaces the original via an `m.replace`
+    /// relation.
+    pub new_body: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MessageEditResult {
+    /// Event id of the replacement event. The original event id is
+    /// unchanged.
+    pub event_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MessageForwardParams {
+    /// Room id the original message lives in.
+    pub source_room_id: String,
+    /// Event id of the message to forward.
+    pub event_id: String,
+    /// Room id the forward is sent to.
+    pub target_room_id: String,
+    /// Optional prefix prepended to the forwarded body. Defaults to
+    /// `Forwarded from {source_room}:\n\n`.
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MessageForwardResult {
+    /// Event id of the new event in the target room.
     pub event_id: String,
 }
 
@@ -848,7 +895,7 @@ impl MatrixMcpService {
     /// text in `body`. E2EE rooms are encrypted automatically iff this
     /// device is cross-signed.
     #[tool(
-        description = "Send a text message to a Matrix room (markdown-rendered).",
+        description = "Send a text message to a Matrix room (markdown-rendered). Pass `reply_to_event_id` to reply / continue a thread.",
         annotations(
             title = "Send text message",
             read_only_hint = false,
@@ -881,7 +928,29 @@ impl MatrixMcpService {
                 ErrorData::invalid_params(format!("not joined to {room_id}"), None)
             })?;
 
-            let content = RoomMessageEventContent::text_markdown(&params.body);
+            let mut content = RoomMessageEventContent::text_markdown(&params.body);
+            if let Some(reply_target) = params.reply_to_event_id.as_deref() {
+                let reply_event_id: OwnedEventId = reply_target.parse().map_err(|e| {
+                    ErrorData::invalid_params(
+                        format!("invalid reply_to_event_id {reply_target}: {e}"),
+                        None,
+                    )
+                })?;
+                let target_tle = room.event(&reply_event_id, None).await.map_err(|e| {
+                    ErrorData::internal_error(format!("fetch reply target: {e}"), None)
+                })?;
+                let original: OriginalRoomMessageEvent =
+                    target_tle.raw().deserialize_as_unchecked().map_err(|e| {
+                        ErrorData::invalid_params(
+                            format!("reply target {reply_event_id} is not an m.room.message: {e}"),
+                            None,
+                        )
+                    })?;
+                // make_reply_to with ForwardThread::Yes auto-promotes the
+                // reply into the same thread when the target is threaded;
+                // for non-threaded targets it stays a top-level rich reply.
+                content = content.make_reply_to(&original, ForwardThread::Yes, AddMentions::Yes);
+            }
             let response = room
                 .send(content)
                 .await
@@ -908,6 +977,205 @@ impl MatrixMcpService {
             &ctx,
             "send_text_message",
             Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
+
+    /// Edit a previously-sent message via an `m.replace` relation.
+    /// Matrix enforces sender ownership at the protocol level — you
+    /// can only edit your own events.
+    #[tool(
+        description = "Edit a previously-sent message (new body replaces the original via m.replace).",
+        annotations(
+            title = "Edit message",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn message_edit(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<MessageEditParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("message_edit", &mxid_for_audit, Some(&room_id_for_audit));
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            validate_text_message_body(&params.new_body)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let event_id: OwnedEventId = params.event_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid event_id {}: {e}", params.event_id),
+                    None,
+                )
+            })?;
+            let target_tle = room
+                .event(&event_id, None)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("fetch edit target: {e}"), None))?;
+            let original: OriginalRoomMessageEvent =
+                target_tle.raw().deserialize_as_unchecked().map_err(|e| {
+                    ErrorData::invalid_params(
+                        format!("edit target {event_id} is not an m.room.message: {e}"),
+                        None,
+                    )
+                })?;
+            let new_content = RoomMessageEventContent::text_markdown(&params.new_body)
+                .make_replacement(&original);
+            let response = room
+                .send(new_content)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.send: {e}"), None))?;
+            structured_result(&MessageEditResult {
+                event_id: response.response.event_id.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "message_edit",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "message_edit",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
+
+    /// Forward the text body of a message into another room as a new
+    /// top-level message. Media (images / files / video / audio) is
+    /// not re-uploaded — only the plaintext body is carried over.
+    #[tool(
+        description = "Forward the text body of a message into another room (text only; media is not re-uploaded).",
+        annotations(
+            title = "Forward message",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn message_forward(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<MessageForwardParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let target_room_for_audit = params.target_room_id.clone();
+        let span = make_tool_span(
+            "message_forward",
+            &mxid_for_audit,
+            Some(&target_room_for_audit),
+        );
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let source_room_id: OwnedRoomId = params.source_room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid source_room_id {}: {e}", params.source_room_id),
+                    None,
+                )
+            })?;
+            let target_room_id: OwnedRoomId = params.target_room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid target_room_id {}: {e}", params.target_room_id),
+                    None,
+                )
+            })?;
+            let source_room = client.get_room(&source_room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {source_room_id}"), None)
+            })?;
+            let target_room = client.get_room(&target_room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {target_room_id}"), None)
+            })?;
+            let event_id: OwnedEventId = params.event_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid event_id {}: {e}", params.event_id),
+                    None,
+                )
+            })?;
+            let source_tle = source_room.event(&event_id, None).await.map_err(|e| {
+                ErrorData::internal_error(format!("fetch forward source: {e}"), None)
+            })?;
+            let source_content: RoomMessageEventContent = source_tle
+                .raw()
+                .deserialize_as::<serde_json::Value>()
+                .ok()
+                .and_then(|v| {
+                    v.get("content")
+                        .and_then(|c| serde_json::from_value(c.clone()).ok())
+                })
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        format!("forward source {event_id} is not an m.room.message"),
+                        None,
+                    )
+                })?;
+            // We only carry the plaintext body. Media forwards would
+            // require download + re-upload (and a fresh megolm session
+            // for the target room), which is more product surface than
+            // this tool is meant to take on.
+            let body = match source_content.msgtype {
+                MessageType::Text(t) => t.body,
+                other => other.body().to_owned(),
+            };
+            let source_display = source_room
+                .cached_display_name()
+                .map_or_else(|| source_room_id.to_string(), |n| n.to_string());
+            let default_prefix = format!("Forwarded from {source_display}:\n\n");
+            let prefix = params.prefix.as_deref().unwrap_or(default_prefix.as_str());
+            let forwarded_body = format!("{prefix}{body}");
+            validate_text_message_body(&forwarded_body)?;
+            let new_content = RoomMessageEventContent::text_markdown(&forwarded_body);
+            let response = target_room
+                .send(new_content)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.send: {e}"), None))?;
+            structured_result(&MessageForwardResult {
+                event_id: response.response.event_id.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "message_forward",
+            &mxid_for_audit,
+            Some(&target_room_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "message_forward",
+            Some(target_room_for_audit.as_str()),
         )
         .await;
         result

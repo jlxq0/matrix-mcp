@@ -11,6 +11,15 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
   public release.
 - `docs/multi-user.md` documenting the per-mxid isolation guarantees.
 
+### Added
+- `send_text_message` gained an optional `reply_to_event_id` so the
+  caller can reply or continue a thread; the reply is auto-promoted
+  into the original event's thread when the target is threaded.
+- `message_edit` tool – replace a previously-sent message via
+  `m.replace`. Matrix enforces sender ownership.
+- `message_forward` tool – forward the text body of a message into
+  another room. Text only; media is not re-uploaded.
+
 ### Fixed
 - In-place token refresh on the cached matrix-sdk client. When
   claude.ai presents a fresh OAuth bearer (typically every ~hour),
