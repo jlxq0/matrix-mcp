@@ -128,4 +128,3 @@ available to your users.
 
 <!-- Source migrated to forge.oddie.app/julian/matrix-mcp on 2026-05-17; GitHub jlxq0/matrix-mcp is now a push-mirror for CI continuity -->
 
-<!-- Source migrated to forge.oddie.app/julian/matrix-mcp on 2026-05-17; GitHub jlxq0/matrix-mcp is now a push-mirror for CI continuity -->
