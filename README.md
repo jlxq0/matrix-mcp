@@ -15,17 +15,23 @@ the device is cross-signed, which `/setup` arranges with your recovery key.
 
 ## What you get
 
-19 tools, all carrying MCP annotations (`read_only_hint`,
+41 tools, all carrying MCP annotations (`read_only_hint`,
 `destructive_hint`, `idempotent_hint`) so client UIs can auto-approve reads
 and warn before writes.
 
 - **Reads**: `read_recent_messages`, `read_thread`, `search_messages`,
   `get_unread_summary`, `list_joined_rooms`, `room_info`, `room_members`,
-  `download_attachment`, `verify_status`, `whoami`
-- **Writes**: `send_text_message`, `send_image_from_url`, `send_reaction`,
-  `mark_read`
-- **Room management**: `join_room`, `leave_room`, `invite_user`,
-  `redact_message`
+  `download_attachment`, `users_get_profile`, `admin_get_power_levels`,
+  `invites_list`, `verify_status`, `whoami`
+- **Writes**: `send_text_message` (thread-aware via `reply_to_event_id`),
+  `send_image_from_url`, `send_file`, `send_video`, `send_audio`,
+  `send_reaction`, `send_bulk`, `send_broadcast`, `mark_read`,
+  `message_edit`, `message_forward`, `redact_message`
+- **Profile**: `me_set_displayname`, `me_set_avatar`
+- **Room management**: `room_create`, `room_create_dm`, `join_room`,
+  `leave_room`, `invite_user`, `invites_accept`, `invites_reject`
+- **Moderation / admin**: `room_kick`, `room_ban`, `room_unban`,
+  `admin_set_power_level`, `room_pin_message`, `room_unpin_message`
 - **Self-audit**: `set_audit_room` – designate a room where matrix-mcp
   posts an `m.notice` for every write it makes on your behalf
 
@@ -114,7 +120,7 @@ otherwise. Conventional Commits for messages.
 | [`docs/onboarding.md`](docs/onboarding.md) | Connecting from claude.ai end-to-end |
 | [`docs/installation.md`](docs/installation.md) | Deploy on a VPS or Kubernetes |
 | [`docs/architecture.md`](docs/architecture.md) | Component diagrams, OAuth dance, sync loop, storage layout |
-| [`docs/api-reference.md`](docs/api-reference.md) | All 19 tools, arguments, return shapes |
+| [`docs/api-reference.md`](docs/api-reference.md) | All 41 tools, arguments, return shapes |
 | [`docs/operations.md`](docs/operations.md) | Running in production, debug recipes, pepper rotation |
 | [`docs/security.md`](docs/security.md) | Implementation-level security notes |
 | [`docs/multi-user.md`](docs/multi-user.md) | Multi-user isolation guarantees |
