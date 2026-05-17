@@ -29,6 +29,12 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 - `send_voice_note` deliberately omitted: it would require the
   `unstable-msc3245-v1-compat` feature on `matrix-sdk` + `ruma`, and
   without that marker it'd be an exact duplicate of `send_audio`.
+- `room_create` tool – create a new Matrix room. Defaults to private
+  + encrypted. Accepts name, topic, invite list, public/private,
+  is_direct, alias.
+- `room_create_dm` tool – convenience wrapper for 1:1 encrypted DMs.
+- `invites_list` tool – return pending invites.
+- `invites_accept` / `invites_reject` tools.
 
 ### Fixed
 - In-place token refresh on the cached matrix-sdk client. When
