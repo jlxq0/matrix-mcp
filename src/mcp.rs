@@ -33,6 +33,7 @@ use matrix_sdk::ruma::events::room::message::{
     AddMentions, ForwardThread, ImageMessageEventContent, MessageType, OriginalRoomMessageEvent,
     RoomMessageEventContent,
 };
+use std::collections::HashMap;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -382,6 +383,65 @@ pub struct SendMediaFromUrlParams {
 pub struct SendMediaResult {
     pub event_id: String,
     pub mxc_uri: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoomMembershipParams {
+    pub room_id: String,
+    pub user_id: String,
+    /// Optional reason surfaced to the affected user and recorded in
+    /// the room's audit log of membership transitions.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RoomMembershipResult {
+    pub room_id: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoomIdOnlyParams {
+    pub room_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct AdminGetPowerLevelsResult {
+    /// Default level applied to users without an explicit entry.
+    pub users_default: i64,
+    /// User-id -> integer level for every user with a non-default
+    /// power level entry.
+    pub users: HashMap<String, i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AdminSetPowerLevelParams {
+    pub room_id: String,
+    pub user_id: String,
+    /// New integer level. The Matrix room creator is typically 100,
+    /// moderator 50, default 0. Negative values are allowed by the
+    /// spec.
+    pub level: i64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct AdminSetPowerLevelResult {
+    pub user_id: String,
+    pub level: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoomPinParams {
+    pub room_id: String,
+    pub event_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RoomPinResult {
+    pub room_id: String,
+    pub event_id: String,
+    pub pinned_count: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1956,6 +2016,236 @@ impl MatrixMcpService {
         result
     }
 
+    /// Kick a user from a Matrix room.
+    #[tool(
+        description = "Kick a user from a Matrix room. The user can rejoin if invited.",
+        annotations(
+            title = "Kick user",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_kick(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomMembershipParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.membership_change(ctx, params, MembershipAction::Kick)
+            .await
+    }
+
+    /// Ban a user from a Matrix room. The user cannot rejoin until
+    /// unbanned.
+    #[tool(
+        description = "Ban a user from a Matrix room. The user cannot rejoin until unbanned.",
+        annotations(
+            title = "Ban user",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_ban(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomMembershipParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.membership_change(ctx, params, MembershipAction::Ban)
+            .await
+    }
+
+    /// Unban a previously banned user from a Matrix room.
+    #[tool(
+        description = "Unban a previously banned user from a Matrix room.",
+        annotations(
+            title = "Unban user",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_unban(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomMembershipParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.membership_change(ctx, params, MembershipAction::Unban)
+            .await
+    }
+
+    /// Return current power-level assignments for the room. Useful
+    /// to know what state to inspect before calling
+    /// `admin_set_power_level`.
+    #[tool(
+        description = "Return current power-level assignments for a Matrix room.",
+        annotations(title = "Get power levels", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn admin_get_power_levels(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomIdOnlyParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "admin_get_power_levels",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let pl = room
+                .power_levels()
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("power_levels: {e}"), None))?;
+            let users: HashMap<String, i64> = pl
+                .users
+                .iter()
+                .map(|(uid, lvl)| (uid.to_string(), i64::from(*lvl)))
+                .collect();
+            structured_result(&AdminGetPowerLevelsResult {
+                users_default: i64::from(pl.users_default),
+                users,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "admin_get_power_levels",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Set a single user's power level in a Matrix room.
+    #[tool(
+        description = "Set a user's power level in a Matrix room. -1 demotes back to the room default.",
+        annotations(
+            title = "Set power level",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn admin_set_power_level(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<AdminSetPowerLevelParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::Int;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "admin_set_power_level",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let user_id = UserId::parse(&params.user_id).map_err(|e| {
+                ErrorData::invalid_params(format!("invalid user_id {}: {e}", params.user_id), None)
+            })?;
+            let level = Int::try_from(params.level)
+                .map_err(|e| ErrorData::invalid_params(format!("level out of range: {e}"), None))?;
+            room.update_power_levels(vec![(&user_id, level)])
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("update_power_levels: {e}"), None)
+                })?;
+            structured_result(&AdminSetPowerLevelResult {
+                user_id: params.user_id,
+                level: params.level,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "admin_set_power_level",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "admin_set_power_level",
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
+
+    /// Pin a message in a Matrix room.
+    #[tool(
+        description = "Pin a message in a Matrix room (append to m.room.pinned_events).",
+        annotations(
+            title = "Pin message",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_pin_message(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomPinParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.toggle_pin(ctx, params, true).await
+    }
+
+    /// Unpin a message in a Matrix room.
+    #[tool(
+        description = "Unpin a message in a Matrix room (remove from m.room.pinned_events).",
+        annotations(
+            title = "Unpin message",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn room_unpin_message(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RoomPinParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.toggle_pin(ctx, params, false).await
+    }
+
     /// Fetch and return the binary content of an attachment event
     /// (`m.file`, `m.image`, `m.audio`, or `m.video`) as a base64
     /// string. The SDK handles decryption transparently for E2EE rooms.
@@ -3419,6 +3709,188 @@ struct UploadedMedia {
     mime_type: mime::Mime,
     bytes_len: u64,
     filename: String,
+}
+
+/// Kick / Ban / Unban discriminator. Shared by `room_kick`,
+/// `room_ban`, `room_unban` via `membership_change`.
+#[derive(Debug, Clone, Copy)]
+enum MembershipAction {
+    Kick,
+    Ban,
+    Unban,
+}
+
+impl MembershipAction {
+    const fn tool_name(self) -> &'static str {
+        match self {
+            Self::Kick => "room_kick",
+            Self::Ban => "room_ban",
+            Self::Unban => "room_unban",
+        }
+    }
+}
+
+impl MatrixMcpService {
+    /// Body for `room_kick` / `room_ban` / `room_unban` — same args,
+    /// same audit envelope, only the matrix-sdk call differs.
+    async fn membership_change(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        params: RoomMembershipParams,
+        action: MembershipAction,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            action.tool_name(),
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let user_id = UserId::parse(&params.user_id).map_err(|e| {
+                ErrorData::invalid_params(format!("invalid user_id {}: {e}", params.user_id), None)
+            })?;
+            let reason = params.reason.as_deref();
+            match action {
+                MembershipAction::Kick => room.kick_user(&user_id, reason).await,
+                MembershipAction::Ban => room.ban_user(&user_id, reason).await,
+                MembershipAction::Unban => room.unban_user(&user_id, reason).await,
+            }
+            .map_err(|e| ErrorData::internal_error(format!("{}: {e}", action.tool_name()), None))?;
+            structured_result(&RoomMembershipResult {
+                room_id: params.room_id.clone(),
+                user_id: params.user_id,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            action.tool_name(),
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            action.tool_name(),
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
+
+    /// Body for `room_pin_message` / `room_unpin_message`. `add`
+    /// selects which.
+    async fn toggle_pin(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        params: RoomPinParams,
+        add: bool,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::events::room::pinned_events::RoomPinnedEventsEventContent;
+        let tool = if add {
+            "room_pin_message"
+        } else {
+            "room_unpin_message"
+        };
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(tool, &mxid_for_audit, Some(&room_id_for_audit));
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let event_id: OwnedEventId = params.event_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid event_id {}: {e}", params.event_id),
+                    None,
+                )
+            })?;
+            // get_state_event_static returns Option<RawSyncOrStrippedState<C>>;
+            // either variant deserialises into a typed event whose `content`
+            // is the RoomPinnedEventsEventContent we want.
+            let mut current: Vec<OwnedEventId> = match room
+                .get_state_event_static::<RoomPinnedEventsEventContent>()
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("fetch pinned: {e}"), None))?
+            {
+                Some(raw) => match raw
+                    .deserialize()
+                    .map_err(|e| ErrorData::internal_error(format!("decode pinned: {e}"), None))?
+                {
+                    matrix_sdk::deserialized_responses::SyncOrStrippedState::Sync(ev) => ev
+                        .as_original()
+                        .map(|o| o.content.pinned.clone())
+                        .unwrap_or_default(),
+                    matrix_sdk::deserialized_responses::SyncOrStrippedState::Stripped(ev) => {
+                        ev.content.pinned.unwrap_or_default()
+                    }
+                },
+                None => Vec::new(),
+            };
+            if add {
+                if !current.contains(&event_id) {
+                    current.push(event_id.clone());
+                }
+            } else {
+                current.retain(|e| e != &event_id);
+            }
+            let new_content = RoomPinnedEventsEventContent::new(current.clone());
+            room.send_state_event(new_content).await.map_err(|e| {
+                ErrorData::internal_error(
+                    format!("send_state_event m.room.pinned_events: {e}"),
+                    None,
+                )
+            })?;
+            structured_result(&RoomPinResult {
+                room_id: params.room_id,
+                event_id: event_id.to_string(),
+                pinned_count: current.len(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            tool,
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            tool,
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
 }
 
 /// Distinguishes the four media-bearing `MessageType` variants so a
