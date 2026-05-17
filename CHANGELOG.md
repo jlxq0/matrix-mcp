@@ -35,6 +35,14 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 - `room_create_dm` tool – convenience wrapper for 1:1 encrypted DMs.
 - `invites_list` tool – return pending invites.
 - `invites_accept` / `invites_reject` tools.
+- `room_kick` / `room_ban` / `room_unban` – membership-state changes
+  on a single user with an optional reason.
+- `admin_get_power_levels` / `admin_set_power_level` – inspect and
+  edit power-level assignments. The set tool flips one user's
+  level at a time; pass the default (`0`) to remove the explicit
+  entry.
+- `room_pin_message` / `room_unpin_message` – append to / remove
+  from `m.room.pinned_events`.
 
 ### Fixed
 - In-place token refresh on the cached matrix-sdk client. When
