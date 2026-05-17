@@ -6,6 +6,17 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added
+- Read-path content sandboxing. `read_recent_messages`, `read_thread`,
+  and `search_messages` now return two additional fields per event:
+  `untrusted_body` (the body wrapped in a
+  `<matrix:message trust="external">…</matrix:message>` delimiter with
+  common prompt-injection tokens — `<system>`, `[INST]`, `<|im_start|>`,
+  etc. — escaped to entity references) and `suspicious` (a heuristic
+  flag for instruction-override phrasing and role-control markers).
+  The existing `event` / `body` fields are unchanged. Tool descriptions
+  document the new contract. See `src/content_sandbox.rs`.
+
 ## [v0.3.0] – 2026-05-17
 
 ### Added
