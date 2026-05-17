@@ -70,10 +70,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
+      - name: Probe docker socket
+        run: |
+          echo "--- /var/run ---"
+          ls -la /var/run/ 2>&1 | head -20
+          echo "--- env ---"
+          env | grep -iE "docker|host" | sort
+          echo "--- mount ---"
+          mount | grep -iE "docker|run" | head -10
+          echo "--- which docker ---"
+          which docker || true
+          echo "--- docker info ---"
+          docker info 2>&1 | head -20 || true
       - uses: docker/setup-buildx-action@v3
         with:
-          # Pada runner auto-mounts /var/run/docker.sock; the default
-          # docker-container driver wants nested Docker which isn't there.
           driver: docker
       - name: Login to Forgejo registry (primary)
         if: startsWith(github.ref, 'refs/tags/v')
