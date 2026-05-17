@@ -43,6 +43,17 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
   entry.
 - `room_pin_message` / `room_unpin_message` – append to / remove
   from `m.room.pinned_events`.
+- `send_bulk` tool – send the same body to up to 20 rooms in one
+  call. Per-room outcomes returned individually.
+- `send_broadcast` tool – send to every joined room. Refuses
+  without `confirm: true`, refuses if joined > 50 rooms, skips
+  rooms above `max_room_members` (default 10) so the blast radius
+  stays DM / small-group shaped.
+- `send_at` deliberately omitted: a durable scheduled-send needs a
+  persistent queue (survive pod restarts, replay on cold start),
+  which is more storage-layer work than belongs in this PR. An
+  in-memory `tokio::time::sleep + spawn` would silently drop sends
+  on the next pod rotation – worse than not shipping at all.
 
 ### Fixed
 - In-place token refresh on the cached matrix-sdk client. When

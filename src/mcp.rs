@@ -386,6 +386,44 @@ pub struct SendMediaResult {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendBulkParams {
+    /// Room ids to send to. Hard-capped at 20 per call.
+    pub room_ids: Vec<String>,
+    /// Markdown body to send (rendered into `formatted_body`).
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendBroadcastParams {
+    /// Markdown body to send to every joined room.
+    pub body: String,
+    /// Must be `true` for the broadcast to fire. Refuses without it.
+    /// Forces the caller to acknowledge the blast radius.
+    pub confirm: bool,
+    /// Maximum joined-member count per room to send to. Rooms with
+    /// more than this many members are skipped. Defaults to 10 to
+    /// keep broadcasts DM / small-group shaped.
+    #[serde(default)]
+    pub max_room_members: Option<u64>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SendBulkOutcome {
+    pub room_id: String,
+    /// Set on success. Mutually exclusive with `error`.
+    pub event_id: Option<String>,
+    /// Set on failure. Mutually exclusive with `event_id`. A skip
+    /// (e.g. "too many members") is reported as an `error` so the
+    /// caller can see exactly what didn't happen.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SendBulkResult {
+    pub results: Vec<SendBulkOutcome>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RoomMembershipParams {
     pub room_id: String,
     pub user_id: String,
@@ -2694,6 +2732,176 @@ impl MatrixMcpService {
         .await
     }
 
+    /// Send the same text body to a specific list of rooms. Hard cap
+    /// of 20 rooms per call to keep blast radius modest. Per-room
+    /// outcomes are returned individually — a failure in one room
+    /// doesn't prevent the others from being attempted.
+    #[tool(
+        description = "Send the same text body to multiple Matrix rooms (max 20 per call).",
+        annotations(
+            title = "Send to many rooms",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn send_bulk(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SendBulkParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        const MAX_ROOMS_PER_CALL: usize = 20;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("send_bulk", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            validate_text_message_body(&params.body)?;
+            if params.room_ids.is_empty() {
+                return Err(ErrorData::invalid_params(
+                    "room_ids must contain at least one room id",
+                    None,
+                ));
+            }
+            if params.room_ids.len() > MAX_ROOMS_PER_CALL {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "send_bulk capped at {MAX_ROOMS_PER_CALL} rooms per call; got {}",
+                        params.room_ids.len()
+                    ),
+                    None,
+                ));
+            }
+            let client = self.client_for(&ctx).await?;
+            let mut outcomes: Vec<SendBulkOutcome> = Vec::with_capacity(params.room_ids.len());
+            for rid_str in &params.room_ids {
+                let outcome = match self.send_text_to_room(&client, rid_str, &params.body).await {
+                    Ok(event_id) => SendBulkOutcome {
+                        room_id: rid_str.clone(),
+                        event_id: Some(event_id),
+                        error: None,
+                    },
+                    Err(e) => SendBulkOutcome {
+                        room_id: rid_str.clone(),
+                        event_id: None,
+                        error: Some(e),
+                    },
+                };
+                outcomes.push(outcome);
+            }
+            structured_result(&SendBulkResult { results: outcomes })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "send_bulk",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(&result, &self.clients, &ctx, "send_bulk", None).await;
+        result
+    }
+
+    /// Send the same text body to **every** joined room. Requires
+    /// explicit `confirm: true` to fire, refuses if you're joined to
+    /// more than the configured cap, and skips rooms with more
+    /// members than `max_room_members` (default 10) to keep the
+    /// blast radius DM/small-group-shaped.
+    #[tool(
+        description = "Broadcast a text body to every joined Matrix room. Requires confirm=true. Skips rooms above max_room_members (default 10) to keep blast radius small.",
+        annotations(
+            title = "Broadcast",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn send_broadcast(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SendBroadcastParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        const MAX_ROOMS_TOTAL: usize = 50;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("send_broadcast", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            validate_text_message_body(&params.body)?;
+            if !params.confirm {
+                return Err(ErrorData::invalid_params(
+                    "send_broadcast refuses to fire without confirm=true. \
+                     This tool sends to every joined room — set confirm=true \
+                     after you've reviewed which rooms that includes.",
+                    None,
+                ));
+            }
+            let max_members = params.max_room_members.unwrap_or(10);
+            let client = self.client_for(&ctx).await?;
+            let joined = client.joined_rooms();
+            if joined.len() > MAX_ROOMS_TOTAL {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "send_broadcast refuses to fan out across {} rooms (cap {MAX_ROOMS_TOTAL}); \
+                         use send_bulk with an explicit list instead",
+                        joined.len()
+                    ),
+                    None,
+                ));
+            }
+            let mut outcomes: Vec<SendBulkOutcome> = Vec::new();
+            for room in joined {
+                let rid_str = room.room_id().to_string();
+                let member_count = room.joined_members_count();
+                if member_count > max_members {
+                    outcomes.push(SendBulkOutcome {
+                        room_id: rid_str,
+                        event_id: None,
+                        error: Some(format!(
+                            "skipped: {member_count} joined members exceeds max_room_members {max_members}"
+                        )),
+                    });
+                    continue;
+                }
+                let outcome = match self.send_text_to_room(&client, &rid_str, &params.body).await {
+                    Ok(event_id) => SendBulkOutcome {
+                        room_id: rid_str,
+                        event_id: Some(event_id),
+                        error: None,
+                    },
+                    Err(e) => SendBulkOutcome {
+                        room_id: rid_str,
+                        event_id: None,
+                        error: Some(e),
+                    },
+                };
+                outcomes.push(outcome);
+            }
+            structured_result(&SendBulkResult { results: outcomes })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "send_broadcast",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(&result, &self.clients, &ctx, "send_broadcast", None).await;
+        result
+    }
+
     /// Set this user's Matrix display name. Pass `name: null` to
     /// clear it.
     #[tool(
@@ -3731,6 +3939,29 @@ impl MembershipAction {
 }
 
 impl MatrixMcpService {
+    /// Send a plain markdown text into one room, returning the
+    /// resulting event id or a stringified error. Pulled out so
+    /// `send_bulk` and `send_broadcast` can loop over it without
+    /// duplicating the parse-room + send dance.
+    async fn send_text_to_room(
+        &self,
+        client: &matrix_sdk::Client,
+        rid_str: &str,
+        body: &str,
+    ) -> Result<String, String> {
+        let room_id: OwnedRoomId = rid_str
+            .parse()
+            .map_err(|e| format!("invalid room_id {rid_str}: {e}"))?;
+        let room = client
+            .get_room(&room_id)
+            .ok_or_else(|| format!("not joined to {room_id}"))?;
+        let content = RoomMessageEventContent::text_markdown(body);
+        room.send(content)
+            .await
+            .map(|r| r.response.event_id.to_string())
+            .map_err(|e| format!("room.send: {e}"))
+    }
+
     /// Body for `room_kick` / `room_ban` / `room_unban` — same args,
     /// same audit envelope, only the matrix-sdk call differs.
     async fn membership_change(
