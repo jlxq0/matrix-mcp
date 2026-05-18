@@ -128,6 +128,11 @@ pub struct PendingPkce {
 
 #[derive(Clone)]
 pub struct SetupSession {
+    /// Stable MAS subject from the introspection. No longer used by
+    /// /setup/recover (which uses the cached client directly via
+    /// `MatrixClientCache::get_if_cached`), but kept on the session
+    /// for audit/logging context and forward compatibility.
+    #[allow(dead_code)]
     pub mas_subject: String,
     pub mxid: String,
     // Kept in the session for audit/logging context; /setup/recover
@@ -137,6 +142,14 @@ pub struct SetupSession {
     // MCP tool calls use.
     #[allow(dead_code)]
     pub device_id: Option<String>,
+    /// `/setup`'s own (unbound) OAuth access token. Stored on the
+    /// session at callback time but no longer routed into the cached
+    /// matrix-sdk client — see the comment in `recover` for why. Kept
+    /// here so the session shape stays compatible with rolling
+    /// deploys and so a future flow that needs a `/setup`-scoped
+    /// token (e.g. unbound MAS calls) doesn't have to reintroduce the
+    /// field.
+    #[allow(dead_code)]
     pub access_token: String,
     pub created_at: Instant,
     /// 32-char random alphanumeric CSRF token, bound to this session.
@@ -464,38 +477,34 @@ pub async fn recover(
         );
     }
 
-    // Build the identity for cache lookup. The device id comes from
-    // the runtime config (`<store_root>/.device-id`), not a compile-time
-    // constant — see `crate::device_identity` for the rationale. /setup's
-    // OAuth token has no device scope, so we fill in this field from
-    // config to ensure the AuthenticatedIdentity lookup key matches
-    // what claude.ai's tool calls produced.
-    let identity = crate::mas::AuthenticatedIdentity {
-        mas_subject: session.mas_subject.clone(),
-        mxid: session.mxid.clone(),
-        device_id: Some(state.config.device_id.clone()),
-        raw_scope: None,
-        // `/setup` constructs a synthetic identity for cache priming;
-        // it doesn't carry a real bearer expiry. The token-introspect
-        // endpoint isn't reached via this path.
-        exp: None,
-    };
-    // Cache HIT is guaranteed by the contains() check above; for_user
-    // returns the already-built client (built with claude.ai's
-    // device-bound token), and /setup's own unbound access_token is
-    // silently dropped by the fast path.
-    let client = match state
-        .clients
-        .for_user(&identity, &session.access_token)
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return error_page(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Could not build the Matrix client for your session: {e:#}"),
-            );
-        }
+    // Cache HIT is guaranteed by the `contains()` check above. We must
+    // not route through `for_user(&identity, &session.access_token)`:
+    // `/setup`'s OAuth access token is different from claude.ai's
+    // bearer (a separate OAuth grant against MAS), and `for_user`'s
+    // fast path would call `refresh_token_if_needed` → `restore_session`
+    // to swap it onto the cached client. In matrix-sdk 0.17 that
+    // panics with `AlreadyInitializedError` because the client's auth
+    // slot is already set from claude.ai's tool call, taking the pod
+    // down (verified 2026-05-18 during device-binding recovery).
+    //
+    // `get_if_cached` returns the cached client untouched. The client
+    // is already authenticated with claude.ai's device-bound bearer;
+    // `encryption().recovery().recover()` calls below run against
+    // Synapse using that bearer, not the unbound `/setup` token —
+    // which is exactly what we want, because the recovery operation
+    // needs a device-scoped session.
+    // Defensive: precondition was checked above; the `else` branch is
+    // unreachable unless the cache was evicted in the gap between
+    // `contains()` and this call (e.g. Synapse returned
+    // `M_UNKNOWN_TOKEN` to a concurrent tool call in that window and
+    // triggered eviction).
+    let Some(client) = state.clients.get_if_cached(&session.mxid).await else {
+        return error_page(
+            StatusCode::PRECONDITION_REQUIRED,
+            "matrix-mcp's Matrix client was evicted between the \
+             precondition check and this call. Run any matrix-mcp \
+             tool in claude.ai and try /setup again.",
+        );
     };
 
     match client.encryption().recovery().recover(&key).await {

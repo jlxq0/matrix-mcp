@@ -147,6 +147,21 @@ impl MatrixClientCache {
     /// the `SQLite` store (deriving the passphrase via HKDF), runs the SDK's session
     /// restoration, and spawns the background sync task. Subsequent
     /// calls return immediately.
+    /// Return the cached `Client` for `mxid` without touching its
+    /// session state, or `None` if no client is cached for this user.
+    ///
+    /// Use this when you have a bearer that is **not** suitable for
+    /// installing onto the cached client — most importantly, `/setup`'s
+    /// own unbound OAuth access token. The cached client is already
+    /// authenticated with claude.ai's device-bound bearer; running
+    /// `restore_session` to swap in `/setup`'s token panics in
+    /// matrix-sdk 0.17 (`AlreadyInitializedError`), which is what
+    /// crashed the pod on 2026-05-18 when verifying device-binding
+    /// recovery.
+    pub async fn get_if_cached(&self, mxid: &str) -> Option<Arc<Client>> {
+        self.inner.read().await.get(mxid).map(|c| c.client.clone())
+    }
+
     pub async fn for_user(
         &self,
         identity: &AuthenticatedIdentity,

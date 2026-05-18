@@ -6,6 +6,21 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Fixed
+- `/setup/recover` no longer panics the pod when claude.ai's connector
+  has already built the matrix-sdk client for the user (which the
+  `/setup` precondition demands). Previously, recover went through
+  `MatrixClientCache::for_user` with `/setup`'s own unbound OAuth
+  access token; the fast path then called `restore_session` to swap
+  that token onto the already-initialised cached client, which
+  matrix-sdk 0.17 rejects with `AlreadyInitializedError`, taking the
+  pod down. Setup now uses a new `get_if_cached(&mxid)` accessor that
+  returns the cached client untouched. The recovery operation runs
+  against Synapse using claude.ai's already-installed device-bound
+  bearer, which is what we want (the unbound `/setup` token has no
+  device scope). Verified 2026-05-18 during device-binding recovery
+  on v0.3.3.
+
 ### Added
 - `GET /token/introspect` endpoint. Bearer-authenticated; returns
   `{mxid, device_id, scope, exp, token_hash, last_used:{at_unix, ip}}`
