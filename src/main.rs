@@ -17,6 +17,7 @@ mod auth;
 mod config;
 mod content_sandbox;
 mod device_identity;
+mod last_used;
 mod mas;
 mod matrix_client;
 mod mcp;
@@ -26,6 +27,7 @@ mod rate_limit;
 mod session;
 mod setup;
 mod telemetry;
+mod token_introspect;
 
 use std::sync::Arc;
 
@@ -103,6 +105,7 @@ fn build_app(cfg: Config) -> Result<Router> {
     let auth_state = AuthState {
         config: cfg.clone(),
         mas: mas.clone(),
+        last_used: last_used::LastUsedTracker::new(),
     };
     let store = cfg.store.clone().context(
         "E2EE store config missing — set MATRIX_MCP_STORE_DIR and MATRIX_MCP_STORE_PEPPER",
@@ -169,9 +172,19 @@ fn build_router(
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
 
+    // `/token/introspect` shares the bearer-auth middleware with `/mcp`
+    // and reads `state.last_used`, so it lives in this sub-router. The
+    // explicit `.with_state(auth_state.clone())` is what makes
+    // `State<AuthState>` extractable in the handler; `from_fn_with_state`
+    // alone wires state into the middleware only.
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp_service)
-        .layer(middleware::from_fn_with_state(auth_state, bearer_auth));
+        .route("/token/introspect", get(token_introspect::handler))
+        .layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            bearer_auth,
+        ))
+        .with_state(auth_state);
 
     // /setup is a small browser-rendered flow with its own state
     // (PKCE map + setup-session map). Sub-router so its state doesn't
@@ -317,6 +330,7 @@ mod tests {
             AuthState {
                 config: cfg,
                 mas: mas.clone(),
+                last_used: crate::last_used::LastUsedTracker::new(),
             },
             clients,
             mas,
@@ -517,6 +531,77 @@ mod tests {
                     .body(Body::from(
                         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
                     ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_introspect_returns_envelope_for_active_bearer() {
+        let mas_mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mas_mock)
+            .await;
+
+        let app = router(test_config(&mas_mock.uri(), "https://res.example"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/token/introspect")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["mxid"], "@alice:example.test", "body: {body}");
+        assert_eq!(body["device_id"], "matrix-mcp-test-device");
+        assert_eq!(body["exp"], 9_999_999_999i64);
+        // The bearer in this test is the literal string "test-token";
+        // its truncated SHA-256 hex (16 chars) is deterministic.
+        assert!(
+            body["token_hash"]
+                .as_str()
+                .is_some_and(|s| s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "expected 16 hex-char token_hash, got: {}",
+            body["token_hash"]
+        );
+        // last_used was populated by the auth middleware on this same
+        // request; ip is the leftmost X-Forwarded-For entry.
+        assert_eq!(body["last_used"]["ip"], "203.0.113.7");
+        assert!(
+            body["last_used"]["at_unix"].as_i64().is_some(),
+            "at_unix should be an integer; body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_introspect_without_bearer_returns_401() {
+        let mas_mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"active": false})))
+            .mount(&mas_mock)
+            .await;
+
+        let app = router(test_config(&mas_mock.uri(), "https://res.example"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/token/introspect")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await

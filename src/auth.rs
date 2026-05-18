@@ -12,8 +12,10 @@ use tracing::{debug, warn};
 
 use crate::audit::{self, outcome};
 use crate::config::Config;
+use crate::last_used::{self, LastUsedTracker};
 use crate::mas::{AuthenticatedIdentity, MasIntrospectionClient};
 use crate::oauth_metadata::www_authenticate_header;
+use std::sync::Arc;
 
 /// Newtype around the raw OAuth access token, stashed on request extensions
 /// by `bearer_auth`. Per MSC3861, the OAuth access token issued by MAS is
@@ -30,11 +32,15 @@ impl std::fmt::Debug for AccessToken {
 }
 
 /// State the auth middleware needs. Cheap to clone: the inner `Arc`s in
-/// `MasIntrospectionClient` make the actual data shared.
+/// `MasIntrospectionClient` and `LastUsedTracker` make the actual data
+/// shared.
 #[derive(Clone)]
 pub struct AuthState {
     pub config: Config,
     pub mas: MasIntrospectionClient,
+    /// Per-bearer last-used tracker. Written by [`bearer_auth`] on every
+    /// successful introspect, read by the `/token/introspect` endpoint.
+    pub last_used: Arc<LastUsedTracker>,
 }
 
 /// Middleware function plugged in via `axum::middleware::from_fn_with_state`.
@@ -53,6 +59,16 @@ pub async fn bearer_auth(
         Ok(Some(identity)) => {
             debug!(mxid = %identity.mxid, "authenticated request");
             audit::introspect(&token_hash, outcome::ACTIVE, started, Some(&identity.mxid));
+            // Record last-used for the audit/introspect endpoint. IP comes
+            // from `X-Forwarded-For` (Traefik appends each hop; the leftmost
+            // value is the original client). Absent / unparseable header → None.
+            let client_ip = last_used::parse_client_ip(
+                request
+                    .headers()
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok()),
+            );
+            state.last_used.record(&token_hash, client_ip);
             // Stash both the identity and the raw OAuth token on the request
             // extensions. rmcp's streamable-http tower layer wraps the
             // request's `Parts` (including our extensions) into the tool

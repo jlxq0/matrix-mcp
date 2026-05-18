@@ -7,6 +7,15 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 ## [Unreleased]
 
 ### Added
+- `GET /token/introspect` endpoint. Bearer-authenticated; returns
+  `{mxid, device_id, scope, exp, token_hash, last_used:{at_unix, ip}}`
+  for the calling bearer. `last_used` is recorded by the auth
+  middleware on every successful introspect, keyed on the bearer's
+  short SHA-256 (same identifier as the operator audit log). `ip`
+  comes from `X-Forwarded-For` (leftmost). Bounded in-memory cache
+  (1024 distinct bearers, evict-oldest on overflow) — survives only
+  pod-lifetime, intentional. See `src/last_used.rs` and
+  `src/token_introspect.rs`.
 - Read-path content sandboxing. `read_recent_messages`, `read_thread`,
   and `search_messages` now return two additional fields per event:
   `untrusted_body` (the body wrapped in a

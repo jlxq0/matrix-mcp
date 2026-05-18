@@ -475,6 +475,10 @@ pub async fn recover(
         mxid: session.mxid.clone(),
         device_id: Some(state.config.device_id.clone()),
         raw_scope: None,
+        // `/setup` constructs a synthetic identity for cache priming;
+        // it doesn't carry a real bearer expiry. The token-introspect
+        // endpoint isn't reached via this path.
+        exp: None,
     };
     // Cache HIT is guaranteed by the contains() check above; for_user
     // returns the already-built client (built with claude.ai's

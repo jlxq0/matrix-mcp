@@ -99,6 +99,10 @@ pub struct AuthenticatedIdentity {
     pub mxid: String,
     pub device_id: Option<String>,
     pub raw_scope: Option<String>,
+    /// Expiry (Unix epoch seconds) reported by MAS in the introspection
+    /// response, when present. Surfaced via `GET /token/introspect`
+    /// so a user can see how long their bearer is valid for.
+    pub exp: Option<i64>,
 }
 
 #[derive(Debug, Error)]
@@ -311,6 +315,7 @@ impl MasIntrospectionClient {
             mxid,
             device_id,
             raw_scope: body.scope.clone(),
+            exp: body.exp,
         };
 
         self.cache_insert(key, &identity, body.exp);
