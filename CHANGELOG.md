@@ -19,6 +19,56 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 - `SECURITY.md`, `THREAT_MODEL.md` and a tightened `README.md` for the
   public release.
 - `docs/multi-user.md` documenting the per-mxid isolation guarantees.
+- `send_text_message` gained an optional `reply_to_event_id` so the
+  caller can reply or continue a thread; the reply is auto-promoted
+  into the original event's thread when the target is threaded.
+- `message_edit` tool – replace a previously-sent message via
+  `m.replace`. Matrix enforces sender ownership.
+- `message_forward` tool – forward the text body of a message into
+  another room. Text only; media is not re-uploaded.
+- `me_set_displayname` tool – set or clear this user's display name.
+- `me_set_avatar` tool – set or clear this user's avatar from an
+  HTTPS URL (re-uploaded to the homeserver media repo).
+- `users_get_profile` tool – fetch another user's public display
+  name + avatar.
+- `send_file`, `send_video`, `send_audio` tools – mirror
+  `send_image_from_url` for the other media `MessageType`s. The
+  underlying upload pipeline (HTTPS-only, redirect-limited, timeouted,
+  size-capped) is now shared via `MatrixMcpService::upload_from_url`.
+- `send_voice_note` deliberately omitted: it would require the
+  `unstable-msc3245-v1-compat` feature on `matrix-sdk` + `ruma`, and
+  without that marker it'd be an exact duplicate of `send_audio`.
+- `room_create` tool – create a new Matrix room. Defaults to private
+  + encrypted. Accepts name, topic, invite list, public/private,
+  is_direct, alias.
+- `room_create_dm` tool – convenience wrapper for 1:1 encrypted DMs.
+- `invites_list` tool – return pending invites.
+- `invites_accept` / `invites_reject` tools.
+- `room_kick` / `room_ban` / `room_unban` – membership-state changes
+  on a single user with an optional reason.
+- `admin_get_power_levels` / `admin_set_power_level` – inspect and
+  edit power-level assignments. The set tool flips one user's
+  level at a time; pass the default (`0`) to remove the explicit
+  entry.
+- `room_pin_message` / `room_unpin_message` – append to / remove
+  from `m.room.pinned_events`.
+- `send_bulk` tool – send the same body to up to 20 rooms in one
+  call. Per-room outcomes returned individually.
+- `send_broadcast` tool – send to every joined room. Refuses
+  without `confirm: true`, refuses if joined > 50 rooms, skips
+  rooms above `max_room_members` (default 10) so the blast radius
+  stays DM / small-group shaped.
+- `send_at` deliberately omitted: a durable scheduled-send needs a
+  persistent queue (survive pod restarts, replay on cold start),
+  which is more storage-layer work than belongs in this PR. An
+  in-memory `tokio::time::sleep + spawn` would silently drop sends
+  on the next pod rotation – worse than not shipping at all.
+- `examples/docker-compose.yml` + `examples/Caddyfile` – a
+  single-host setup with Let's Encrypt for users who don't want to
+  set up Talos and ArgoCD.
+- CI badge on the README.
+- `Plan.md` and `docs/plan.md` are now gitignored (internal notes,
+  not part of the public docs surface).
 
 ### Fixed
 - In-place token refresh on the cached matrix-sdk client. When

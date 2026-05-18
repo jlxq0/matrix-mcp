@@ -1,0 +1,68 @@
+# Single-host docker-compose example for matrix-mcp.
+#
+# Pairs the matrix-mcp container with a Caddy reverse proxy that
+# terminates HTTPS via Let's Encrypt. claude.ai's MCP transport
+# requires HTTPS, so a TLS-terminating fronting proxy is mandatory.
+#
+# Before bringing this up, set the variables in a .env file alongside
+# this compose file. Required:
+#
+#   MATRIX_MCP_HOSTNAME=matrix-mcp.your-domain.example
+#   MATRIX_MCP_AUTHORIZATION_SERVER=https://your-mas.example
+#   MATRIX_MCP_HOMESERVER_URL=https://matrix.your-domain.example
+#   MATRIX_MCP_SERVER_NAME=your-domain.example
+#   MATRIX_MCP_INTROSPECTION_CLIENT_ID=...
+#   MATRIX_MCP_INTROSPECTION_CLIENT_SECRET=...
+#   MATRIX_MCP_STORE_PEPPER=...  # openssl rand -hex 32
+#   CADDY_ACME_EMAIL=you@example.com
+#
+# Then: `docker compose up -d`. Browse to
+# https://${MATRIX_MCP_HOSTNAME}/health — should return `ok`.
+
+services:
+  matrix-mcp:
+    image: ghcr.io/jlxq0/matrix-mcp:latest
+    restart: unless-stopped
+    environment:
+      # The fully-qualified URL claude.ai will use to reach this
+      # server. Must match the hostname Caddy terminates TLS for.
+      MATRIX_MCP_RESOURCE_URL: https://${MATRIX_MCP_HOSTNAME}
+      MATRIX_MCP_AUTHORIZATION_SERVER: ${MATRIX_MCP_AUTHORIZATION_SERVER}
+      MATRIX_MCP_HOMESERVER_URL: ${MATRIX_MCP_HOMESERVER_URL}
+      MATRIX_MCP_SERVER_NAME: ${MATRIX_MCP_SERVER_NAME}
+      MATRIX_MCP_INTROSPECTION_CLIENT_ID: ${MATRIX_MCP_INTROSPECTION_CLIENT_ID}
+      MATRIX_MCP_INTROSPECTION_CLIENT_SECRET: ${MATRIX_MCP_INTROSPECTION_CLIENT_SECRET}
+      MATRIX_MCP_STORE_DIR: /var/lib/matrix-mcp
+      MATRIX_MCP_STORE_PEPPER: ${MATRIX_MCP_STORE_PEPPER}
+    volumes:
+      - matrix-mcp-store:/var/lib/matrix-mcp
+    expose:
+      - "3000"
+    networks:
+      - mcp-net
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL}
+      MATRIX_MCP_HOSTNAME: ${MATRIX_MCP_HOSTNAME}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - mcp-net
+    depends_on:
+      - matrix-mcp
+
+volumes:
+  matrix-mcp-store:
+  caddy-data:
+  caddy-config:
+
+networks:
+  mcp-net:

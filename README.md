@@ -1,5 +1,7 @@
 # matrix-mcp
 
+[![CI](https://github.com/jlxq0/matrix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jlxq0/matrix-mcp/actions/workflows/ci.yml)
+
 A remote MCP server that lets [claude.ai](https://claude.ai) (or any other
 MCP client) read, search, and write in your [Matrix](https://matrix.org)
 account – including in **end-to-end-encrypted rooms** – using your existing
@@ -61,7 +63,9 @@ Then point a public hostname at it over HTTPS (claude.ai requires
 `https://`) and follow [`docs/onboarding.md`](docs/onboarding.md) to
 connect. For a Kubernetes deployment with cert-manager, External
 Secrets, and Traefik Gateway API, see
-[`docs/installation.md`](docs/installation.md).
+[`docs/installation.md`](docs/installation.md). For a single-host
+homelab setup with Caddy or Traefik, see
+[`examples/docker-compose.yml`](examples/docker-compose.yml).
 
 ## Multi-user
 
