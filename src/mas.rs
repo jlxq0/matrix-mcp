@@ -363,22 +363,31 @@ impl MasIntrospectionClient {
         identity: &AuthenticatedIdentity,
         token_exp: Option<i64>,
     ) {
-        let token_ttl = token_exp.and_then(|exp| {
-            let secs = std::time::SystemTime::now()
+        // Translate the MAS-supplied `exp` (Unix seconds) into a TTL
+        // relative to now. The match here is load-bearing for cache
+        // correctness:
+        //
+        // - `Some(exp)` where `exp` is in the future → cache for the
+        //   `min(remaining, MAX_CACHE_TTL)` window.
+        // - `Some(exp)` where `exp` is already in the past →
+        //   `Duration::ZERO`. The entry will be inserted but read as
+        //   expired on the very next lookup. Previously this case fell
+        //   through to `MAX_CACHE_TTL` (60s) because `and_then` made it
+        //   indistinguishable from the "no exp at all" case, which
+        //   meant an already-expired token got the full TTL — the
+        //   opposite of what we want. Also surfaced as the
+        //   `cache_respects_short_token_exp` test flake when the test
+        //   straddled a wall-clock-second boundary.
+        // - `None` (MAS didn't share exp) → cache for `MAX_CACHE_TTL`.
+        let ttl = token_exp.map_or(MAX_CACHE_TTL, |exp| {
+            let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs();
-            // Cap at i64::MAX to make the subtraction safe; in practice
-            // `now` is nowhere near that.
-            let now = i64::try_from(secs).ok()?;
-            if exp <= now {
-                return None;
-            }
-            // exp - now is positive here, so the cast back to u64 is safe.
-            let remaining = u64::try_from(exp - now).ok()?;
-            Some(Duration::from_secs(remaining))
+                .map_or(0, |d| d.as_secs());
+            let now = i64::try_from(now_secs).unwrap_or(i64::MAX);
+            let remaining = (exp - now).max(0);
+            let remaining = u64::try_from(remaining).unwrap_or(0);
+            Duration::from_secs(remaining).min(MAX_CACHE_TTL)
         });
-        let ttl = token_ttl.unwrap_or(MAX_CACHE_TTL).min(MAX_CACHE_TTL);
         let entry = CacheEntry {
             identity: identity.clone(),
             expires_at: Instant::now() + ttl,
@@ -629,6 +638,48 @@ mod tests {
         assert!(second.is_some(), "second call must re-fetch");
         // The .expect(2) assertion on the mock verifies MAS was hit twice;
         // if the cache wrongly kept the entry past `exp`, MAS would only see 1.
+    }
+
+    /// Regression test for the `exp <= now` branch of `cache_insert`.
+    ///
+    /// Before the fix in 2026-05-18 this branch returned `None` from
+    /// `token_ttl`, which then fell through to `MAX_CACHE_TTL` (60 s)
+    /// — i.e. an already-expired token got the maximum cache lifetime.
+    /// The fix routes through `Duration::ZERO` instead, so an
+    /// already-past `exp` produces an entry that reads as expired on
+    /// the very next lookup.
+    ///
+    /// We exercise this deterministically (no `tokio::time::sleep`,
+    /// no boundary-straddle dance) by setting `exp` to a value firmly
+    /// in the past and verifying mocked MAS gets called twice.
+    #[tokio::test]
+    async fn already_expired_token_is_not_cached_for_max_ttl() {
+        let mock = server().await;
+        let body = json!({
+            "active": true,
+            "sub": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+            "username": "alice",
+            "aud": "https://matrix-mcp.example.test",
+            "scope": "openid urn:matrix:org.matrix.msc2967.client:api:*",
+            "exp": 1_000_000_000_i64, // 2001 — far in the past
+        });
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            // Two back-to-back introspects must BOTH hit MAS: the
+            // first cache entry is dead on arrival.
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        let client = client_against(&mock.uri());
+        let first = client.introspect("ancient-but-active").await.unwrap();
+        assert!(first.is_some(), "MAS said active, even if exp is past");
+        let second = client.introspect("ancient-but-active").await.unwrap();
+        assert!(
+            second.is_some(),
+            "second call must hit MAS, not the stale entry"
+        );
     }
 
     #[tokio::test]
