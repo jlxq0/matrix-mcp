@@ -1,0 +1,12 @@
+# Caddy config for the docker-compose example.
+#
+# Terminates TLS for ${MATRIX_MCP_HOSTNAME} via Let's Encrypt and
+# reverse-proxies to the matrix-mcp container on port 3000.
+
+{
+    email {$CADDY_ACME_EMAIL}
+}
+
+{$MATRIX_MCP_HOSTNAME} {
+    reverse_proxy matrix-mcp:3000
+}
