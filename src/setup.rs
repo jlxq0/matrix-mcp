@@ -473,7 +473,13 @@ pub async fn recover(
              (Why: /setup imports your cross-signing keys into the same SDK \
              instance claude.ai's connector uses. If claude.ai hasn't \
              triggered the client to be built yet, /setup has nothing to \
-             attach the keys to.)",
+             attach the keys to. \
+             \
+             Most likely cause: claude.ai's connector is holding a revoked \
+             bearer (typical after signing out the matrix-mcp device in \
+             Element) and is silently failing every tool call. Go to \
+             claude.ai → Settings → Connectors → remove and re-add \
+             \"claude.ai Matrix\", then re-run a tool, then come back here.)",
         );
     }
 
