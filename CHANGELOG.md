@@ -6,6 +6,23 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added (PR-C: state events + ignored users)
+- `get_room_state(room_id, event_type, state_key?)` tool. Fetch
+  state events of a given type (`m.room.name`, `m.room.topic`,
+  `m.room.member`, `m.room.power_levels`, `m.room.pinned_events`,
+  etc.). Optional `state_key` narrows to one event. Returns raw
+  state-event JSON for type-flexibility. Tool count 46 → 47.
+- `set_room_name(room_id, value)` tool. Sets the `m.room.name`
+  state event. Requires power to send that state event (default 50).
+  Tool count 47 → 48.
+- `set_room_topic(room_id, value)` tool. Same pattern for
+  `m.room.topic`. Tool count 48 → 49.
+- `ignore_user(user_id)` tool. Adds a user to the caller's
+  `m.ignored_user_list`. Tool count 49 → 50.
+- `unignore_user(user_id)` tool. Inverse. Tool count 50 → 51.
+- `list_ignored_users()` tool. Returns the caller's current
+  ignore-list MXIDs. Tool count 51 → 52.
+
 ### Added (latest-event differentiation)
 - `latest_event_type` field on `RecentActivityRoom` (`list_recent_activity`)
   and `UnreadRoomSummary` (`get_unread_summary`). The Matrix event type

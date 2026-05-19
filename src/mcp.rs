@@ -973,6 +973,82 @@ pub struct ListThreadsResult {
     pub prev_batch_token: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// State events + ignored users (PR-C)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetRoomStateParams {
+    pub room_id: String,
+    /// Matrix state event type to fetch (e.g. `m.room.name`,
+    /// `m.room.topic`, `m.room.member`, `m.room.power_levels`,
+    /// `m.room.pinned_events`). Required so the response is bounded
+    /// — `m.room.member` in a large room can be hundreds of events.
+    pub event_type: String,
+    /// When set, return only the state event whose `state_key`
+    /// equals this. Useful for `m.room.member` lookups by mxid.
+    /// When `null` (default), return all events of `event_type`.
+    #[serde(default)]
+    pub state_key: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct StateEventInfo {
+    /// The raw state event JSON as returned by Synapse. Includes
+    /// `type`, `state_key`, `sender`, `origin_server_ts`,
+    /// `content`, etc. Returned verbatim because the relevant
+    /// fields vary per state-event type — the caller knows what
+    /// to look at based on which `event_type` they asked for.
+    pub event: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GetRoomStateResult {
+    pub room_id: String,
+    pub event_type: String,
+    pub events: Vec<StateEventInfo>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetRoomTextParams {
+    pub room_id: String,
+    /// New value. For `set_room_name`: the new display name string.
+    /// For `set_room_topic`: the new topic. Empty string clears
+    /// (sends an `m.room.name` / `m.room.topic` state event with
+    /// empty content).
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SetRoomTextResult {
+    /// Event id of the resulting state event.
+    pub event_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IgnoreUserParams {
+    /// MXID to ignore / unignore. Adding a user to your ignore
+    /// list hides their events from your own timeline (across all
+    /// rooms) and prevents them from inviting you. Doesn't affect
+    /// them server-side — purely a per-user filter on your own
+    /// account.
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct IgnoreUserResult {
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListIgnoredUsersResult {
+    /// MXIDs you currently have on your ignore list. Empty when the
+    /// list is unset (which differs from "explicitly empty" only
+    /// at the protocol level; from the caller's perspective the
+    /// effect is the same).
+    pub user_ids: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestRoomKeysParams {
     /// Matrix room id (`!abc:server`) to request missing megolm
@@ -2645,6 +2721,388 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             Some(thread_count),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Fetch state events of a given type in a room. Required
+    /// `event_type` (e.g. `m.room.name`, `m.room.topic`,
+    /// `m.room.member`, `m.room.power_levels`, `m.room.pinned_events`).
+    /// Optional `state_key` narrows to a single state event.
+    ///
+    /// Returns raw event JSON. Schemas vary per state-event type;
+    /// the caller knows what to look at based on what they asked
+    /// for. State events are not message content, so the
+    /// `untrusted_body` sandboxing applied to read tools doesn't
+    /// apply here.
+    #[tool(
+        description = "Fetch state events of a given type in a room (e.g. m.room.name, \
+                       m.room.topic, m.room.member, m.room.power_levels). Pass an \
+                       optional state_key to narrow to a single event. Returns raw \
+                       state-event JSON.",
+        annotations(title = "Get room state", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn get_room_state(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<GetRoomStateParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::events::StateEventType;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("get_room_state", &mxid_for_audit, Some(&room_id_for_audit));
+        let (mut result, count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let event_type: StateEventType = params.event_type.as_str().into();
+            // SDK's get_state_events_for_keys takes an iterator of
+            // state_key strs; get_state_events with no key returns
+            // every event of that type. We branch to use the right
+            // API rather than always over-fetching.
+            let raws: Vec<matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState> =
+                if let Some(ref sk) = params.state_key {
+                    room.get_state_events_for_keys(event_type, &[sk.as_str()])
+                        .await
+                        .map_err(|e| {
+                            ErrorData::internal_error(
+                                format!("get_state_events_for_keys: {e}"),
+                                None,
+                            )
+                        })?
+                } else {
+                    room.get_state_events(event_type).await.map_err(|e| {
+                        ErrorData::internal_error(format!("get_state_events: {e}"), None)
+                    })?
+                };
+            let events: Vec<StateEventInfo> = raws
+                .into_iter()
+                .map(|raw| {
+                    // `RawAnySyncOrStrippedState` is a Sync/Stripped enum
+                    // around `Raw<…>`. Both variants serialize back to the
+                    // verbatim event JSON, so a serde round-trip hands the
+                    // caller the same bytes Synapse returned.
+                    let event = serde_json::to_value(&raw).unwrap_or(serde_json::Value::Null);
+                    StateEventInfo { event }
+                })
+                .collect();
+            let count = events.len();
+            let res = structured_result(&GetRoomStateResult {
+                room_id: room_id.to_string(),
+                event_type: params.event_type,
+                events,
+            });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .instrument(span.clone())
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "get_room_state",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(count),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Set a room's display name (the `m.room.name` state event).
+    /// Requires sufficient power level — typically 50+ in default
+    /// power-level settings.
+    #[tool(
+        description = "Set a Matrix room's name (m.room.name state event). Requires \
+                       power to send that state event (usually >= 50). Empty string \
+                       clears the name.",
+        annotations(
+            title = "Set room name",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn set_room_name(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetRoomTextParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("set_room_name", &mxid_for_audit, Some(&room_id_for_audit));
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let response = room
+                .set_name(params.value)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("set_name: {e}"), None))?;
+            structured_result(&SetRoomTextResult {
+                event_id: response.event_id.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "set_room_name",
+            Some(&room_id_for_audit),
+        )
+        .await;
+        emit_tool_audit(
+            "set_room_name",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Set a room's topic (the `m.room.topic` state event). Same
+    /// power-level requirement as `set_room_name`.
+    #[tool(
+        description = "Set a Matrix room's topic (m.room.topic state event). Requires \
+                       power to send that state event (usually >= 50). Empty string \
+                       clears the topic.",
+        annotations(
+            title = "Set room topic",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn set_room_topic(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetRoomTextParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("set_room_topic", &mxid_for_audit, Some(&room_id_for_audit));
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let response = room
+                .set_room_topic(&params.value)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("set_room_topic: {e}"), None))?;
+            structured_result(&SetRoomTextResult {
+                event_id: response.event_id.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "set_room_topic",
+            Some(&room_id_for_audit),
+        )
+        .await;
+        emit_tool_audit(
+            "set_room_topic",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Add a user to the caller's ignore list (`m.ignored_user_list`
+    /// global account-data event). Their events get hidden from
+    /// your own timeline across all rooms, and they cannot invite
+    /// you. Doesn't affect them server-side — purely a per-user
+    /// filter on your own account.
+    #[tool(
+        description = "Ignore a Matrix user. Hides their events from your timeline \
+                       across all rooms and blocks their invites. Affects only your \
+                       own account; nothing visible server-side to them.",
+        annotations(
+            title = "Ignore user",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn ignore_user(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<IgnoreUserParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("ignore_user", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let user_id = UserId::parse(&params.user_id).map_err(|e| {
+                ErrorData::invalid_params(format!("invalid user_id {}: {e}", params.user_id), None)
+            })?;
+            client
+                .account()
+                .ignore_user(&user_id)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("ignore_user: {e}"), None))?;
+            structured_result(&IgnoreUserResult {
+                user_id: user_id.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_write_notice(&result, &self.clients, &ctx, "ignore_user", None).await;
+        emit_tool_audit(
+            "ignore_user",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Remove a user from the caller's ignore list. Inverse of
+    /// `ignore_user`. Idempotent — unignoring a user who isn't
+    /// ignored is a successful no-op at the SDK level.
+    #[tool(
+        description = "Unignore a previously-ignored Matrix user. Their events become \
+                       visible in your timeline again. Idempotent.",
+        annotations(
+            title = "Unignore user",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn unignore_user(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<IgnoreUserParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("unignore_user", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let user_id = UserId::parse(&params.user_id).map_err(|e| {
+                ErrorData::invalid_params(format!("invalid user_id {}: {e}", params.user_id), None)
+            })?;
+            client
+                .account()
+                .unignore_user(&user_id)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("unignore_user: {e}"), None))?;
+            structured_result(&IgnoreUserResult {
+                user_id: user_id.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_write_notice(&result, &self.clients, &ctx, "unignore_user", None).await;
+        emit_tool_audit(
+            "unignore_user",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Return the caller's current ignore list — the MXIDs whose
+    /// events you've hidden from your own timeline. Reads from the
+    /// `m.ignored_user_list` global account-data event.
+    #[tool(
+        description = "List Matrix user IDs you currently have ignored. Reads from \
+                       your m.ignored_user_list global account data.",
+        annotations(title = "List ignored users", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn list_ignored_users(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::events::ignored_user_list::IgnoredUserListEventContent;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("list_ignored_users", &mxid_for_audit, None);
+        let (mut result, count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let user_ids: Vec<String> = client
+                .account()
+                .account_data::<IgnoredUserListEventContent>()
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("account_data: {e}"), None))?
+                .and_then(|raw| raw.deserialize().ok())
+                .map(|content| {
+                    content
+                        .ignored_users
+                        .keys()
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let count = user_ids.len();
+            let res = structured_result(&ListIgnoredUsersResult { user_ids });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .instrument(span.clone())
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "list_ignored_users",
+            &mxid_for_audit,
+            None,
+            started,
+            Some(count),
             &span,
             &result,
         );
