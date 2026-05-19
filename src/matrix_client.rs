@@ -87,14 +87,27 @@ impl Drop for CachedClient {
     }
 }
 
+/// Per-MXID async `OnceCell` holding the built-or-being-built client.
+type CachedClientCell = Arc<tokio::sync::OnceCell<Arc<CachedClient>>>;
+
 /// In-memory cache mapping stable MAS subject + Matrix device id ->
 /// `matrix_sdk::Client`. Clone-cheap:
 /// the inner `Arc<RwLock<...>>` is shared.
+///
+/// Per-MXID isolation: each entry wraps the cached client in
+/// [`tokio::sync::OnceCell`]. The global `RwLock` is held only for the
+/// fast `HashMap` lookups; the slow SDK-build path runs **off-lock**
+/// inside the cell's `get_or_try_init`. A first build for MXID A
+/// therefore never blocks an unrelated call for MXID B — and a second
+/// concurrent first-builder for MXID A waits on A's cell only, not on
+/// the global write lock. Single-tenant deployments only see this
+/// behaviour on cold start; multi-tenant deployments avoid global
+/// head-of-line blocking entirely.
 #[derive(Clone)]
 pub struct MatrixClientCache {
     homeserver_url: String,
     store: StoreConfig,
-    inner: Arc<RwLock<HashMap<String, Arc<CachedClient>>>>,
+    inner: Arc<RwLock<HashMap<String, CachedClientCell>>>,
 }
 
 impl MatrixClientCache {
@@ -106,15 +119,15 @@ impl MatrixClientCache {
         }
     }
 
-    /// Returns `true` iff a matrix-sdk client is already cached for
-    /// this mxid. Read-only; does **not** build a client. Used by the
-    /// /setup route as a precondition check — /setup must piggyback on
-    /// the device-bound client claude.ai's MCP tool calls built; it
-    /// must not build the client itself with /setup's own unbound
-    /// OAuth token, or `recover()` produces signatures against device
-    /// keys that never reach Synapse.
+    /// Returns `true` iff a matrix-sdk client is already cached *and
+    /// fully built* for this mxid. Read-only; does **not** build a
+    /// client. Used by the /setup route as a precondition check.
     pub async fn contains(&self, mxid: &str) -> bool {
-        self.inner.read().await.contains_key(mxid)
+        self.inner
+            .read()
+            .await
+            .get(mxid)
+            .is_some_and(|cell| cell.initialized())
     }
 
     /// Drop the cached `matrix_sdk::Client` for this mxid, if any.
@@ -124,12 +137,11 @@ impl MatrixClientCache {
     /// map. The next `for_user` call for this mxid will rebuild from
     /// scratch using whatever access token is presented at that time.
     ///
-    /// Called when Synapse reports `M_UNKNOWN_TOKEN` against any tool
-    /// call: the cached client is holding a now-invalid OAuth token
-    /// and there is no point letting subsequent tool calls reuse it.
-    /// The on-disk `SQLite` store and `OlmMachine` state are
-    /// preserved — only the in-memory token-bound client handle is
-    /// dropped.
+    /// If a build is currently in-flight on this MXID's `OnceCell`,
+    /// any task awaiting the cell still receives the in-flight build
+    /// result (we can't cancel it). The map entry, however, is gone,
+    /// so the *next* `for_user` will install a fresh cell and the
+    /// stale in-flight result becomes unreachable.
     pub async fn evict(&self, mxid: &str) {
         let removed = {
             let mut guard = self.inner.write().await;
@@ -140,15 +152,9 @@ impl MatrixClientCache {
         }
     }
 
-    /// Get-or-create the matrix-sdk `Client` for the authenticated user,
-    /// using the supplied OAuth access token as the Matrix session token.
-    ///
-    /// The first call for a given MAS subject/device pair is slow: it opens
-    /// the `SQLite` store (deriving the passphrase via HKDF), runs the SDK's session
-    /// restoration, and spawns the background sync task. Subsequent
-    /// calls return immediately.
     /// Return the cached `Client` for `mxid` without touching its
-    /// session state, or `None` if no client is cached for this user.
+    /// session state, or `None` if no fully-built client is cached for
+    /// this user.
     ///
     /// Use this when you have a bearer that is **not** suitable for
     /// installing onto the cached client — most importantly, `/setup`'s
@@ -159,9 +165,20 @@ impl MatrixClientCache {
     /// crashed the pod on 2026-05-18 when verifying device-binding
     /// recovery.
     pub async fn get_if_cached(&self, mxid: &str) -> Option<Arc<Client>> {
-        self.inner.read().await.get(mxid).map(|c| c.client.clone())
+        self.inner
+            .read()
+            .await
+            .get(mxid)
+            .and_then(|cell| cell.get().map(|c| c.client.clone()))
     }
 
+    /// Get-or-create the matrix-sdk `Client` for the authenticated user,
+    /// using the supplied OAuth access token as the Matrix session token.
+    ///
+    /// The first call for a given MAS subject/device pair is slow: it opens
+    /// the `SQLite` store (deriving the passphrase via HKDF), runs the SDK's session
+    /// restoration, and spawns the background sync task. Subsequent
+    /// calls return immediately.
     pub async fn for_user(
         &self,
         identity: &AuthenticatedIdentity,
@@ -169,43 +186,48 @@ impl MatrixClientCache {
     ) -> Result<Arc<Client>> {
         let incoming_hash = token_hash(access_token);
 
-        // Fast path: already cached. Verify the cached client's
-        // installed token matches what the caller just presented;
-        // claude.ai's OAuth flow refreshes the bearer roughly hourly,
-        // and a stale token in the cached `matrix-sdk` session
-        // causes the next Synapse call to fail with `M_UNKNOWN_TOKEN`
-        // — exactly the "session expired mid-call" UX. When the hashes
-        // disagree, swap the token in-place via `restore_session`
-        // rather than evicting and rebuilding the whole client (which
-        // would trigger a fresh sync, store reopen, and several
-        // seconds of latency).
+        // Fast path: cell exists AND is fully initialized. Holds the
+        // read lock only for the HashMap lookup, then drops it before
+        // running refresh_token_if_needed.
         {
             let guard = self.inner.read().await;
-            if let Some(cached) = guard.get(&identity.mxid) {
-                let cached_arc = cached.clone();
+            if let Some(cell) = guard.get(&identity.mxid)
+                && let Some(cached) = cell.get()
+            {
+                let cached = cached.clone();
                 drop(guard);
-                self.refresh_token_if_needed(&cached_arc, identity, access_token, incoming_hash)
+                self.refresh_token_if_needed(&cached, identity, access_token, incoming_hash)
                     .await?;
-                return Ok(cached_arc.client.clone());
+                return Ok(cached.client.clone());
             }
         }
 
-        // Slow path: take the write lock before building so concurrent
-        // first callers for the same mxid queue here and don't both spawn
-        // a sync task.
-        let mut guard = self.inner.write().await;
-        if let Some(existing) = guard.get(&identity.mxid) {
-            let cached_arc = existing.clone();
-            drop(guard);
-            self.refresh_token_if_needed(&cached_arc, identity, access_token, incoming_hash)
-                .await?;
-            return Ok(cached_arc.client.clone());
-        }
-        let cached = self.build_cached(identity, access_token).await?;
-        let client = cached.client.clone();
-        guard.insert(identity.mxid.clone(), Arc::new(cached));
-        drop(guard);
-        Ok(client)
+        // Slow path: get-or-insert the OnceCell under a brief write
+        // lock, then run the SDK build off-lock inside the cell. This
+        // means concurrent first-callers for *different* MXIDs no
+        // longer queue behind each other, and concurrent first-callers
+        // for the same MXID share one build via the cell's internal
+        // semaphore — only one task runs build_cached(), the rest
+        // await its result.
+        let cell = {
+            let mut guard = self.inner.write().await;
+            Arc::clone(
+                guard
+                    .entry(identity.mxid.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+        let cached: Arc<CachedClient> = cell
+            .get_or_try_init(|| async {
+                self.build_cached(identity, access_token)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?
+            .clone();
+        self.refresh_token_if_needed(&cached, identity, access_token, incoming_hash)
+            .await?;
+        Ok(cached.client.clone())
     }
 
     /// Swap the access token on a cached client in-place if the

@@ -52,10 +52,10 @@ use crate::config::Config;
 use crate::config::IntrospectionCredentials;
 use crate::mas::MasIntrospectionClient;
 use crate::matrix_client::MatrixClientCache;
-use crate::rate_limit::{InitializeLimiter, MAX_INITIALIZES_PER_IDENTITY};
 use crate::mcp::MatrixMcpService;
 use crate::oauth_metadata::protected_resource_metadata;
 use crate::rate_limit::Limiter;
+use crate::rate_limit::{InitializeLimiter, MAX_INITIALIZES_PER_IDENTITY};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -145,6 +145,7 @@ fn build_app(cfg: Config) -> Result<Router> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_router(
     cfg: Config,
     auth_state: AuthState,
@@ -480,7 +481,10 @@ mod tests {
     async fn initialize_then_call_whoami(
         app: &Router,
     ) -> Result<(StatusCode, Value), anyhow::Error> {
-        let init_response = app.clone().oneshot(initialize_request("test-token", 1)?).await?;
+        let init_response = app
+            .clone()
+            .oneshot(initialize_request("test-token", 1)?)
+            .await?;
 
         let session_id = init_response
             .headers()
@@ -623,7 +627,11 @@ mod tests {
                 .oneshot(initialize_request("test-token", id).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "init {id} should succeed");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "init {id} should succeed"
+            );
         }
         // The next fresh-session initialize from the same identity is
         // denied with 429 BEFORE rmcp ever sees it.

@@ -214,7 +214,7 @@ impl InitializeLimiter {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::duration_suboptimal_units)]
 mod tests {
     use super::*;
 

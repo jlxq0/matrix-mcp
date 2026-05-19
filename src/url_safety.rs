@@ -113,8 +113,8 @@ pub async fn validate_https_url(url: &str) -> Result<()> {
     // reqwest::Url is the only correct way to extract host+port across
     // all RFC 3986 cases (userinfo, IPv6 literal, default port, etc.).
     // It's already in the dep tree via reqwest.
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| anyhow::anyhow!("failed to parse URL {url}: {e}"))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("failed to parse URL {url}: {e}"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("URL {url} has no host"))?;
@@ -131,9 +131,7 @@ mod tests {
 
     #[test]
     fn ipv4_loopback_is_private() {
-        assert!(is_private_or_local_ip(IpAddr::V4(Ipv4Addr::new(
-            127, 0, 0, 1
-        ))));
+        assert!(is_private_or_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 
     #[test]
@@ -213,7 +211,9 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_non_https() {
-        let err = validate_https_url("http://example.com/foo").await.unwrap_err();
+        let err = validate_https_url("http://example.com/foo")
+            .await
+            .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("https"));
     }
 

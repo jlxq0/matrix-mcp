@@ -4018,8 +4018,10 @@ impl MatrixMcpService {
             // post-download size cap is still enforced below; the
             // timeout just bounds the *time* an oversize download has
             // to run before we abort and free the memory.
+            #[allow(clippy::duration_suboptimal_units)]
+            let download_timeout = Duration::from_secs(60);
             let bytes = tokio::time::timeout(
-                Duration::from_secs(60),
+                download_timeout,
                 client.media().get_media_content(
                     &MediaRequestParameters {
                         source,
@@ -4755,7 +4757,9 @@ impl MatrixMcpService {
             // results to compute; the previous `.take(limit)` only bounded
             // *our* serialization cost. With it, Synapse returns at most
             // `limit` results, bounding upstream work too.
-            criteria.filter.limit = Some(matrix_sdk::ruma::UInt::from(limit as u32));
+            criteria.filter.limit = Some(matrix_sdk::ruma::UInt::from(
+                u32::try_from(limit).unwrap_or(u32::MAX),
+            ));
 
             // When a room_id is provided, scope the search to that room only.
             if let Some(ref rid_str) = params.room_id {
@@ -5949,7 +5953,10 @@ impl MatrixMcpService {
             .map_err(|e| ErrorData::internal_error(format!("fetch url: {e}"), None))?;
         if !response.status().is_success() {
             return Err(ErrorData::invalid_params(
-                format!("remote URL returned non-success status {}", response.status()),
+                format!(
+                    "remote URL returned non-success status {}",
+                    response.status()
+                ),
                 None,
             ));
         }
@@ -6040,9 +6047,9 @@ async fn fetch_with_validated_redirects(
         let loc_str = loc
             .to_str()
             .map_err(|e| ErrorData::invalid_params(format!("Location is not ASCII: {e}"), None))?;
-        let next = current
-            .join(loc_str)
-            .map_err(|e| ErrorData::invalid_params(format!("invalid Location {loc_str}: {e}"), None))?;
+        let next = current.join(loc_str).map_err(|e| {
+            ErrorData::invalid_params(format!("invalid Location {loc_str}: {e}"), None)
+        })?;
         url_safety::validate_https_url(next.as_str())
             .await
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;

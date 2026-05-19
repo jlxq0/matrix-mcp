@@ -5,7 +5,7 @@
 //! Megolm session, and persists it to the SDK store. The work is
 //! linear in the number of backed-up sessions for that room — big
 //! rooms with long history can produce minutes-long downloads and
-//! megabytes of SQLite writes per call.
+//! megabytes of `SQLite` writes per call.
 //!
 //! Two independent secscan findings (#de85922e on the MCP tool side,
 //! #e4797214 on the /setup/recover side) flagged the same primitive
@@ -52,6 +52,7 @@ pub const MAX_CONCURRENT: usize = 4;
 /// that revisits a thread several times; long-running incident
 /// recovery should use `/setup/recover` (which has its own per-room
 /// loop bounded by total joined-room count).
+#[allow(clippy::duration_suboptimal_units)]
 pub const COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 /// Hard timeout on a single `download_room_keys_for_room` call.
@@ -116,14 +117,17 @@ impl KeyBackupGate {
         if self.in_cooldown(room_id) {
             return Ok(None);
         }
-        match self.inner.semaphore.clone().try_acquire_owned() {
-            Ok(p) => Ok(Some(PullPermit {
-                _semaphore_permit: p,
-                gate: self.clone(),
-                room_id: room_id.to_owned(),
-            })),
-            Err(_) => Err(GateBusy),
-        }
+        self.inner
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_or(Err(GateBusy), |p| {
+                Ok(Some(PullPermit {
+                    _semaphore_permit: p,
+                    gate: self.clone(),
+                    room_id: room_id.to_owned(),
+                }))
+            })
     }
 
     /// True when a successful pull for `room_id` happened less than
@@ -132,8 +136,7 @@ impl KeyBackupGate {
         let Ok(map) = self.inner.last_pull.read() else {
             return false;
         };
-        map.get(room_id)
-            .is_some_and(|t| t.elapsed() < COOLDOWN)
+        map.get(room_id).is_some_and(|t| t.elapsed() < COOLDOWN)
     }
 }
 
@@ -146,11 +149,7 @@ impl Default for KeyBackupGate {
 impl std::fmt::Debug for KeyBackupGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let available = self.inner.semaphore.available_permits();
-        let tracked = self
-            .inner
-            .last_pull
-            .read()
-            .map_or(0, |m| m.len());
+        let tracked = self.inner.last_pull.read().map_or(0, |m| m.len());
         f.debug_struct("KeyBackupGate")
             .field("available_permits", &available)
             .field("rooms_tracked", &tracked)
@@ -174,7 +173,11 @@ impl std::fmt::Display for GateBusy {
 impl std::error::Error for GateBusy {}
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::significant_drop_tightening,
+    clippy::needless_collect
+)]
 mod tests {
     use super::*;
 
