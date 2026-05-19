@@ -1,7 +1,5 @@
 # matrix-mcp
 
-[![CI](https://github.com/jlxq0/matrix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jlxq0/matrix-mcp/actions/workflows/ci.yml)
-
 A remote MCP server that lets [claude.ai](https://claude.ai) (or any other
 MCP client) read, search, and write in your [Matrix](https://matrix.org)
 account – including in **end-to-end-encrypted rooms** – using your existing
