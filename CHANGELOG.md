@@ -6,6 +6,18 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Fixed
+- `set_account_data` no longer rejects content from MCP clients that
+  JSON-encode the `content` argument as a string. claude.ai sends
+  e.g. `"{\"version\":\"v0.3.13\"}"` rather than the structured
+  object, which would reach Synapse as a JSON string literal and
+  trip `M_BAD_JSON: Content must be a JSON object`. The handler now
+  detects `Value::String`, parses it as JSON, and uses the result;
+  falls back to the literal string only if parsing fails. Non-object
+  content now returns a clear early-rejection error rather than
+  letting Synapse respond with the less-informative `M_BAD_JSON`.
+  Found during v0.3.13 smoke test on 2026-05-19.
+
 ### Added (PR-D: account data + presence + media + spaces)
 - `get_account_data(event_type)` / `set_account_data(event_type, content)`
   tools. Generic read/write for arbitrary global account-data event

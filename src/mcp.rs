@@ -5232,9 +5232,36 @@ impl MatrixMcpService {
             self.rate_limit_check(&ctx, Category::Write)?;
             let client = self.client_for(&ctx).await?;
             let event_type: GlobalAccountDataEventType = params.event_type.as_str().into();
+            // Some MCP clients (notably claude.ai) JSON-encode the
+            // `content` argument as a string rather than passing it
+            // through as a structured object. The bytes that then
+            // reach Synapse are `"{...}"` (a JSON string literal)
+            // instead of `{...}` (a JSON object), and Synapse rejects
+            // with `M_BAD_JSON: Content must be a JSON object`. When
+            // content arrives as a `Value::String`, try parsing it as
+            // JSON first; fall through to the literal string only if
+            // parsing fails (so explicit `Value::String("hi")` still
+            // works for the rare event types that accept a bare
+            // string).
+            let canonical_content: serde_json::Value = match &params.content {
+                serde_json::Value::String(s) => {
+                    serde_json::from_str(s).unwrap_or_else(|_| params.content.clone())
+                }
+                _ => params.content.clone(),
+            };
+            // Synapse's /account_data endpoint requires a JSON object
+            // body. Reject other shapes here with a clear error
+            // rather than letting the homeserver respond with the
+            // less-informative `M_BAD_JSON`.
+            if !canonical_content.is_object() {
+                return Err(ErrorData::invalid_params(
+                    "content must be a JSON object (or a string containing a JSON object)",
+                    None,
+                ));
+            }
             // set_account_data_raw expects Raw<AnyGlobalAccountDataEventContent>;
-            // serialize the user-supplied JSON value to bytes, then wrap.
-            let raw_bytes = serde_json::value::to_raw_value(&params.content)
+            // serialize the canonical value to bytes, then wrap.
+            let raw_bytes = serde_json::value::to_raw_value(&canonical_content)
                 .map_err(|e| ErrorData::invalid_params(format!("serialize content: {e}"), None))?;
             let raw: matrix_sdk::ruma::serde::Raw<
                 matrix_sdk::ruma::events::AnyGlobalAccountDataEventContent,
