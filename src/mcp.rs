@@ -4644,6 +4644,12 @@ impl MatrixMcpService {
             // Build the Criteria for the room_events search category.
             let mut criteria = search_events::v3::Criteria::new(params.query.clone());
             criteria.order_by = Some(search_events::v3::OrderBy::Rank);
+            // Push the cap upstream so Synapse paginates correctly. Without
+            // this, the homeserver's default pagination decides how many
+            // results to compute; the previous `.take(limit)` only bounded
+            // *our* serialization cost. With it, Synapse returns at most
+            // `limit` results, bounding upstream work too.
+            criteria.filter.limit = Some(matrix_sdk::ruma::UInt::from(limit as u32));
 
             // When a room_id is provided, scope the search to that room only.
             if let Some(ref rid_str) = params.room_id {
