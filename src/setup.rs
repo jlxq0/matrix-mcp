@@ -17,7 +17,7 @@
 //!      ↓
 //!  302 to MAS /authorize       — authorization_code grant with PKCE
 //!      ↓
-//!  (MAS auto-approves; user already signed in at id.example.com)
+//!  (MAS auto-approves; user already signed in at the configured MAS)
 //!      ↓
 //!  GET /setup/callback?code=…&state=…
 //!      ↓
@@ -184,8 +184,14 @@ impl SetupState {
 // ---------- handlers ----------
 
 #[allow(clippy::unused_async)]
-pub async fn index() -> impl IntoResponse {
-    Html(LANDING_HTML)
+pub async fn index(State(state): State<SetupState>) -> impl IntoResponse {
+    // Show the actual MAS authority so fork users see their own host
+    // in the "you'll be redirected to …" copy. Falls back to a
+    // placeholder if the configured URL has no parseable authority.
+    let mas_host = parse_authority(&state.config.authorization_server)
+        .unwrap_or_else(|| "your homeserver".to_owned());
+    let safe_host = html_escape(&mas_host);
+    Html(landing_html(&safe_host))
 }
 
 pub async fn login(State(state): State<SetupState>) -> Response {
@@ -895,8 +901,7 @@ fn url_encode(s: &str) -> String {
 }
 
 // ---------- HTML ----------
-// Kept inline; the templates are short and styling stays
-// dark-on-dark to match the rest of the example.com estate.
+// Kept inline; the templates are short and dark-on-dark.
 
 fn page(title: &str, body: &str) -> String {
     format!(
@@ -935,7 +940,30 @@ fn page(title: &str, body: &str) -> String {
     )
 }
 
-const LANDING_HTML: &str = r#"<!doctype html><html lang="en"><head>
+/// Best-effort `https://host:port/path` → `host[:port]` extraction.
+/// Matches the same parser shape used in `main.rs::parse_host`.
+fn parse_authority(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_owned())
+    }
+}
+
+/// Render the landing-page HTML with the actual MAS authority
+/// substituted in. The whole template lives here as a function rather
+/// than a const so fork operators see their own MAS host name in the
+/// "you'll be redirected to …" copy.
+fn landing_html(mas_host_escaped: &str) -> String {
+    LANDING_HTML_TEMPLATE.replace("{{MAS_HOST}}", mas_host_escaped)
+}
+
+const LANDING_HTML_TEMPLATE: &str = r#"<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <title>matrix-mcp setup</title>
@@ -949,7 +977,7 @@ a.btn:hover { background:#2a5dd0; }
 </style></head><body>
 <h1>matrix-mcp — unlock E2EE</h1>
 <p>Sign in once so matrix-mcp can import your cross-signing keys from
-Matrix Secret Storage. You'll be redirected to <code>id.example.com</code>
+Matrix Secret Storage. You'll be redirected to <code>{{MAS_HOST}}</code>
 to authenticate, then back here to paste your recovery key.</p>
 <p>The recovery key is used once and not stored on this server. The
 imported cross-signing private keys are encrypted at rest with a

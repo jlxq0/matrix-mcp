@@ -1,12 +1,16 @@
 # Onboarding
 
-How to connect claude.ai to your Matrix account on `example.com`.
+How to connect claude.ai to your Matrix account via matrix-mcp.
+
+> Examples below use `example.com` as the homeserver and
+> `matrix-mcp.example.com` as the matrix-mcp deployment. Substitute
+> your own host names throughout.
 
 ---
 
 ## Prerequisites
 
-- A `example.com` Matrix account.
+- A Matrix account on the homeserver matrix-mcp is configured to talk to.
 - Cross-signing set up in Element X (Settings → Security → Set up
   secure backup). You'll need the recovery key it shows you.
 - A claude.ai account with access to custom connectors.
@@ -16,12 +20,13 @@ How to connect claude.ai to your Matrix account on `example.com`.
 ## Step 1 – Add the connector in claude.ai
 
 1. Open claude.ai → Settings → Connectors → Add custom connector.
-2. Enter the URL: `https://matrix-mcp.example.com/mcp`
+2. Enter the URL: `https://<your-matrix-mcp-host>/mcp`
+   (e.g. `https://matrix-mcp.example.com/mcp`).
 3. Click Connect.
 
 Claude.ai will discover the MAS authorization server, register itself
-as a client via DCR, and redirect you to `id.example.com` to log in
-and approve the scopes.
+as a client via DCR, and redirect you to your homeserver's MAS to log
+in and approve the scopes.
 
 Approve the `openid`, Matrix C-S API (`urn:matrix:…`), and device scopes
 when prompted. These let matrix-mcp read/write your rooms on your behalf.
@@ -35,8 +40,8 @@ tell you if E2EE is already active. On first connection it won't be.
 
 To unlock E2EE:
 
-1. Open `https://matrix-mcp.example.com/setup` in a browser.
-2. Click "Sign in" – you're redirected to `id.example.com`.
+1. Open `https://<your-matrix-mcp-host>/setup` in a browser.
+2. Click "Sign in" – you're redirected to your MAS host.
 3. After signing in, you're redirected back to the recovery key form.
 4. Paste your Matrix Secret Storage recovery key (the 48-character
    string starting with `Esso…` that Element X showed you when you first
