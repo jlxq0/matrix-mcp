@@ -130,6 +130,21 @@ impl MatrixMcpService {
         let Err(err) = result else {
             return;
         };
+        // Only consider this an auth-expiry if the error came from the
+        // matrix-sdk / Synapse wrapping path (`internal_error`,
+        // JSON-RPC code -32603) — that's the only place where
+        // `M_UNKNOWN_TOKEN` / `Token is not active` can legitimately
+        // appear, originating from Synapse's 401 envelope.
+        //
+        // Without this guard, ANY tool error containing those strings
+        // trips the eviction — including `invalid_params` (-32602)
+        // errors that format caller-controlled fields back into the
+        // message. A caller could pass `room_id="M_UNKNOWN_TOKEN"`
+        // and force the cached SDK client to be evicted + rebuilt on
+        // every request, an authenticated cache-thrash DoS.
+        if err.code.0 != -32603 {
+            return;
+        }
         if !is_auth_expiry_signature(&err.message) {
             return;
         }
