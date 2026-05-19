@@ -770,6 +770,87 @@ pub struct UnreadRoomSummary {
     pub latest_origin_server_ts: Option<u64>,
 }
 
+/// Per-room activity entry returned by `list_recent_activity`. Same
+/// envelope-only metadata as [`UnreadRoomSummary`] minus the
+/// unread-specific counters, so the AI can sort/filter all joined
+/// rooms by recency regardless of read state.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RecentActivityRoom {
+    pub room_id: String,
+    pub display_name: Option<String>,
+    pub encrypted: bool,
+    /// Latest "interesting" event id per the SDK's `LatestEvents`
+    /// subsystem. `null` for rooms with no cached activity.
+    pub latest_event_id: Option<String>,
+    /// MXID of `latest_event_id`'s sender.
+    pub latest_sender: Option<String>,
+    /// `origin_server_ts` (ms since epoch) of the latest event.
+    /// Response is sorted by this field, newest first.
+    pub latest_origin_server_ts: Option<u64>,
+    /// Server-side unread-notification count (`notification_count`
+    /// from `/sync`). Surfaced for ergonomics so the caller can mix
+    /// activity sort with unread filter without a second tool call.
+    pub unread_notifications: u64,
+    /// Server-side highlight count (`@mentions`).
+    pub unread_mentions: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListRecentActivityParams {
+    /// Maximum number of rooms to return. Default 50, capped at
+    /// [`MAX_RECENT_ACTIVITY_LIMIT`] (200). Rooms with no cached
+    /// activity sort to the end and are dropped first if the limit
+    /// is reached.
+    #[serde(default = "default_recent_activity_limit")]
+    pub limit: u32,
+    /// When set, return only rooms whose `latest_origin_server_ts`
+    /// is greater than this value (milliseconds since the Unix
+    /// epoch). Use to scope to "any activity in the last N days".
+    #[serde(default)]
+    pub since_unix_ms: Option<u64>,
+    /// When `true`, restrict the response to E2EE rooms only.
+    /// Default `false`.
+    #[serde(default)]
+    pub encrypted_only: bool,
+}
+
+const fn default_recent_activity_limit() -> u32 {
+    50
+}
+
+const MAX_RECENT_ACTIVITY_LIMIT: u32 = 200;
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListRecentActivityResult {
+    /// Rooms with cached latest-event metadata, sorted by
+    /// `latest_origin_server_ts` descending. The list is truncated
+    /// to the requested `limit`.
+    pub rooms: Vec<RecentActivityRoom>,
+    /// Total number of joined rooms considered before truncation,
+    /// regardless of `since_unix_ms` / `encrypted_only` filters.
+    /// Lets the caller distinguish "no activity matched" from
+    /// "you joined no rooms".
+    pub total_joined_rooms: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestRoomKeysParams {
+    /// Matrix room id (`!abc:server`) to request missing megolm
+    /// session keys for from server-side key backup.
+    pub room_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RequestRoomKeysResult {
+    /// Room id the request was issued against (canonicalised).
+    pub room_id: String,
+    /// `true` if the backup download was kicked off successfully.
+    /// `false` if the user has no enabled key backup (or it failed
+    /// to start) — in that case there's no recovery path; the
+    /// missing sessions are lost to this device.
+    pub backup_requested: bool,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct UnreadSummaryResult {
     /// Rooms with at least one unread message, sorted by latest
@@ -1079,6 +1160,11 @@ impl MatrixMcpService {
                 .map_err(|e| ErrorData::internal_error(format!("fetch /messages: {e}"), None))?;
 
             let events = read_events_from_chunk(messages.chunk);
+            // If we surfaced any unable_to_decrypt events, kick a
+            // server-side key-backup pull in the background. Best-effort:
+            // sessions in backup self-heal on the next read; sessions
+            // that were never backed up stay opaque.
+            spawn_key_backup_pull_if_needed(&client, &room_id, &events);
             let count = events.len();
             let res = structured_result(&ReadRecentMessagesResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -1156,6 +1242,7 @@ impl MatrixMcpService {
             })?;
 
             let events = read_events_from_chunk(relations.chunk);
+            spawn_key_backup_pull_if_needed(&client, &room_id, &events);
             let count = events.len();
             let res = structured_result(&ReadThreadResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -1868,6 +1955,193 @@ impl MatrixMcpService {
             None,
             started,
             Some(room_count),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Return every joined room sorted by latest activity timestamp,
+    /// regardless of read state. Companion to `get_unread_summary`
+    /// (which only returns rooms with unread messages).
+    ///
+    /// Solves the "I read this but forgot to reply" use case: walk
+    /// the recent-activity list, look at each room's latest sender,
+    /// and decide whether you owe a response. Without this tool the
+    /// alternative is scanning hundreds of rooms one by one.
+    #[tool(
+        description = "List every joined room sorted by latest activity (newest first), \
+                       regardless of unread state. Supports an optional `since_unix_ms` \
+                       filter (e.g. \"last 7 days\") and `encrypted_only`. Each entry \
+                       carries the same envelope metadata as `get_unread_summary` — \
+                       latest_event_id, latest_sender, latest_origin_server_ts — plus \
+                       unread counts for ergonomics. Use this when the caller asks \
+                       \"what's been active recently?\" or \"which rooms have I forgotten \
+                       to follow up in?\".",
+        annotations(title = "List recent activity", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn list_recent_activity(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ListRecentActivityParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("list_recent_activity", &mxid_for_audit, None);
+        let (mut result, room_count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let limit = params.limit.min(MAX_RECENT_ACTIVITY_LIMIT) as usize;
+            let joined = client.joined_rooms();
+            let total_joined_rooms = joined.len();
+            let mut rooms: Vec<RecentActivityRoom> = joined
+                .iter()
+                .filter_map(|room| {
+                    if params.encrypted_only && !room.encryption_state().is_encrypted() {
+                        return None;
+                    }
+                    let latest = room.latest_event();
+                    let latest_event_id = latest.event_id().map(|id| id.to_string());
+                    let latest_origin_server_ts: Option<u64> =
+                        latest.timestamp().map(|ts| ts.get().into());
+                    if let Some(since) = params.since_unix_ms
+                        && latest_origin_server_ts.unwrap_or(0) <= since
+                    {
+                        return None;
+                    }
+                    // Same parse pattern as `get_unread_summary`.
+                    let latest_sender =
+                        if let matrix_sdk::latest_events::LatestEventValue::Remote(ref ev) = latest
+                        {
+                            ev.raw()
+                                .deserialize_as::<serde_json::Value>()
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("sender").and_then(|s| s.as_str()).map(str::to_owned)
+                                })
+                        } else {
+                            None
+                        };
+                    let server = room.unread_notification_counts();
+                    Some(RecentActivityRoom {
+                        room_id: room.room_id().to_string(),
+                        display_name: room.cached_display_name().map(|n| n.to_string()),
+                        encrypted: room.encryption_state().is_encrypted(),
+                        latest_event_id,
+                        latest_sender,
+                        latest_origin_server_ts,
+                        unread_notifications: server.notification_count,
+                        unread_mentions: server.highlight_count,
+                    })
+                })
+                .collect();
+            rooms.sort_by(|a, b| {
+                b.latest_origin_server_ts
+                    .unwrap_or(0)
+                    .cmp(&a.latest_origin_server_ts.unwrap_or(0))
+            });
+            rooms.truncate(limit);
+            let count = rooms.len();
+            let res = structured_result(&ListRecentActivityResult {
+                rooms,
+                total_joined_rooms,
+            });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .instrument(span.clone())
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "list_recent_activity",
+            &mxid_for_audit,
+            None,
+            started,
+            Some(room_count),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Ask the homeserver's encrypted key backup for any megolm
+    /// session keys the calling device is missing in `room_id`.
+    /// Equivalent to the per-room backup pull `/setup/recover` runs
+    /// once across the user's whole encrypted-room list, but
+    /// targeted at one room — useful when a read tool surfaces
+    /// `unable_to_decrypt` events and the caller wants to attempt
+    /// recovery on demand.
+    ///
+    /// Recovery is best-effort: if the user has no key backup, or
+    /// the missing sessions were never uploaded to backup (rare,
+    /// usually means the sending client opted out or the sessions
+    /// rotated before backup caught up), there is no in-protocol
+    /// way to retrieve them and this device cannot decrypt those
+    /// events. The response field `backup_requested` reports
+    /// whether the backup pull was kicked off, not whether it
+    /// recovered anything specific.
+    #[tool(
+        description = "Re-request missing megolm session keys for a Matrix room from \
+                       server-side key backup. Use when a read tool returned events with \
+                       status=unable_to_decrypt and you want to attempt recovery. \
+                       Returns once the backup pull has been kicked off; \
+                       newly-decrypted events show up in subsequent read calls.",
+        annotations(
+            title = "Request room keys",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn request_room_keys(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RequestRoomKeysParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "request_room_keys",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let backup_requested = client
+                .encryption()
+                .backups()
+                .download_room_keys_for_room(&room_id)
+                .await
+                .is_ok();
+            structured_result(&RequestRoomKeysResult {
+                room_id: room_id.to_string(),
+                backup_requested,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            "request_room_keys",
+            Some(&room_id_for_audit),
+        )
+        .await;
+        emit_tool_audit(
+            "request_room_keys",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
             &span,
             &result,
         );
@@ -4472,6 +4746,54 @@ pub fn identity_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<Authenticat
 pub fn token_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<AccessToken> {
     let parts = ctx.extensions.get::<http::request::Parts>()?;
     parts.extensions.get::<AccessToken>().cloned()
+}
+
+/// Fire-and-forget: if any of `events` came back as
+/// `unable_to_decrypt`, kick a server-side key-backup pull for that
+/// room so subsequent reads can decrypt. Backup downloads run async
+/// inside a spawned task; failures are logged at `warn!` and
+/// discarded. No-op when no undecryptable events are present.
+///
+/// This automates the recovery path the AI used to have to walk
+/// users through (Element → Settings → Sessions → verify, then
+/// re-pull key backup). For sessions that exist in backup this
+/// self-heals over the next sync cycle; for sessions that were
+/// never backed up there's no in-protocol recovery and the response
+/// to the caller still surfaces the undecryptable status.
+fn spawn_key_backup_pull_if_needed(
+    client: &matrix_sdk::Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+    events: &[ReadEvent],
+) {
+    let undecryptable = events
+        .iter()
+        .filter(|e| e.status == "unable_to_decrypt")
+        .count();
+    if undecryptable == 0 {
+        return;
+    }
+    let client = client.clone();
+    let room_id: OwnedRoomId = room_id.to_owned();
+    tokio::spawn(async move {
+        match client
+            .encryption()
+            .backups()
+            .download_room_keys_for_room(&room_id)
+            .await
+        {
+            Ok(()) => tracing::debug!(
+                %room_id,
+                undecryptable,
+                "kicked off key-backup pull for undecryptable events"
+            ),
+            Err(e) => tracing::warn!(
+                %room_id,
+                undecryptable,
+                error = %e,
+                "key-backup pull failed; undecryptable events stay undecryptable"
+            ),
+        }
+    });
 }
 
 /// Fire-and-forget: send an `m.notice` audit event into the user's

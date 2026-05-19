@@ -6,6 +6,23 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added
+- `list_recent_activity` tool. Returns every joined room sorted by
+  `latest_origin_server_ts` descending, with optional `since_unix_ms`
+  filter and `encrypted_only` flag. Companion to `get_unread_summary`
+  (which only returns the unread slice) — solves the "find rooms
+  where I read the message and forgot to reply" use case without
+  walking every joined room one at a time. Tool count 41 → 42.
+- `request_room_keys` tool. Asks the homeserver's encrypted key
+  backup for missing megolm session keys for a specific room. Used
+  on demand when a read tool returns `unable_to_decrypt` events.
+  Tool count 42 → 43.
+- Read tools (`read_recent_messages`, `read_thread`) now
+  automatically fire a background `download_room_keys_for_room` for
+  any room that returned at least one `unable_to_decrypt` event.
+  Best-effort: sessions in backup self-heal on the next read;
+  sessions never backed up stay opaque.
+
 ### Fixed
 - `/setup/recover` no longer panics the pod when claude.ai's connector
   has already built the matrix-sdk client for the user (which the
