@@ -6,7 +6,54 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Security (secscan Group D: rescan follow-ups)
+- `CappedSessionManager::create_session` now takes a `tokio::sync::Mutex`
+  gate before reading the session count and inserting. Previously the
+  check + insert could race under concurrent initialize load and
+  overshoot `MAX_SESSIONS`. Closes secscan #c3579fdc.
+- `react_to_auth_expiry` only fires on `internal_error` (JSON-RPC
+  -32603); previously any error containing `M_UNKNOWN_TOKEN` or
+  `Token is not active` (including `invalid_params` errors formatted
+  with caller-controlled fields) triggered cache eviction, a
+  trivially authenticated cache-thrash DoS. Closes secscan #795787a2.
+- `room_kick`/`room_ban`/`room_unban` reasons now share the 64 KiB
+  cap Group A added on `redact_message.reason`. Closes secscan
+  #7d95f605.
+- `invites_accept` requires `RoomState::Invited`. Previously a
+  generic join (any room id). Same shape as Group A's `invites_reject`
+  fix. Closes secscan #3596b649.
+- `audit::tool_call` sanitises `room_id` before emitting to the
+  structured Loki audit stream — replaces anything that isn't a
+  syntactically valid Matrix `RoomId` with `<invalid>`. Group A
+  fixed the user-visible audit-room equivalent; this is the
+  operational-audit twin. Closes secscan #01174866.
+- `KeyBackupGate` cooldown caller-id is now consistent across paths:
+  `/setup/recover` switched from `mxid` to `mas_subject` to match
+  the MCP `request_room_keys` / auto-pull paths. Mixing the two
+  identifiers used to let the same user bypass cooldown by hopping
+  between setup and MCP. Closes secscan #96461937.
+- `content_sandbox::escape_injection_markers` escapes the `</matrix:message`
+  opening prefix (without trailing `>`) in addition to the canonical
+  full close tag, so whitespace / self-close / tab variants of the
+  end-tag (`</matrix:message >`, `</matrix:message/>`) can no longer
+  bypass the wrap. The `is_suspicious` heuristic was broadened the
+  same way. Closes secscan #305700b8.
+- `bearer_auth` skips the `last_used.record(...)` call when the
+  request path is `/token/introspect`. Previously the act of calling
+  the audit endpoint overwrote the record it returned, hiding any
+  prior (potentially attacker-driven) use the owner was trying to
+  detect. The endpoint now returns `last_used: null` when no other
+  real use has been recorded. Closes secscan #845de87c.
+
 ### Changed
+- `docs/multi-user.md` rewritten to accurately describe the
+  MXID-keyed cache + store + passphrase derivation as a single-MAS
+  deployment tradeoff. Adds an explicit "MXID collision risk"
+  section spelling out what happens under localpart-reassignment
+  scenarios, and what would need to change in `for_user` /
+  `build_cached` for true multi-tenant safety. No code change.
+  Closes secscan #eafe9ef7.
+
 - Relicensed from AGPL-3.0-or-later to **MIT**. matrix-mcp was a
   single-author personal project from the start; MIT matches the
   "here's the source, do what you want with it" posture more
