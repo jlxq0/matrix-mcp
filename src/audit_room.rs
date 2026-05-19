@@ -179,11 +179,7 @@ pub async fn emit_notice(
         }
     };
 
-    // Build the notice body — envelope fields only.
-    let body = target_room.as_ref().map_or_else(
-        || format!("matrix-mcp: {tool} outcome={outcome}"),
-        |rid| format!("matrix-mcp: {tool} \u{2192} {rid} outcome={outcome}"),
-    );
+    let body = build_notice_body(tool, target_room.as_deref(), outcome);
 
     let content = RoomMessageEventContent::notice_plain(body);
     if let Err(e) = room.send(content).await {
@@ -195,6 +191,29 @@ pub async fn emit_notice(
             "failed to send audit notice; ignoring"
         );
     }
+}
+
+/// Render the audit-room notice body.
+///
+/// `target_room` is the raw caller-supplied `room_id` string from the tool
+/// params: write tools emit this notice even when the room_id failed to parse
+/// (so the user still sees that the call failed). We re-validate here and
+/// drop the field if it isn't a syntactically valid Matrix room id — otherwise
+/// a caller could pass a crafted string containing newlines or fake `outcome=`
+/// fragments and forge entries in the user-visible audit trail.
+///
+/// We layer two checks because Ruma's `RoomId::parse` is permissive about
+/// whitespace and control characters inside the localpart: first reject any
+/// string with whitespace / control chars, then require Ruma's parse to
+/// accept the rest.
+fn build_notice_body(tool: &str, target_room: Option<&str>, outcome: &str) -> String {
+    let valid_target = target_room
+        .filter(|rid| !rid.chars().any(|c| c.is_whitespace() || c.is_control()))
+        .filter(|rid| RoomId::parse(rid).is_ok());
+    valid_target.map_or_else(
+        || format!("matrix-mcp: {tool} outcome={outcome}"),
+        |rid| format!("matrix-mcp: {tool} \u{2192} {rid} outcome={outcome}"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -228,15 +247,7 @@ mod tests {
 
     #[test]
     fn notice_body_is_envelope_only_with_room() {
-        // Mirror the body-building logic from emit_notice and verify it
-        // contains only the tool name, target room, and outcome.
-        let tool = "send_text_message";
-        let target = Some("!foo:example.com".to_owned());
-        let outcome = "ok";
-        let body = target.as_deref().map_or_else(
-            || format!("matrix-mcp: {tool} outcome={outcome}"),
-            |rid| format!("matrix-mcp: {tool} \u{2192} {rid} outcome={outcome}"),
-        );
+        let body = build_notice_body("send_text_message", Some("!foo:example.com"), "ok");
         assert_eq!(
             body,
             "matrix-mcp: send_text_message \u{2192} !foo:example.com outcome=ok"
@@ -249,14 +260,30 @@ mod tests {
 
     #[test]
     fn notice_body_without_room_is_compact() {
-        let tool = "mark_read";
-        let target: Option<String> = None;
-        let outcome = "ok";
-        let body = target.as_deref().map_or_else(
-            || format!("matrix-mcp: {tool} outcome={outcome}"),
-            |rid| format!("matrix-mcp: {tool} \u{2192} {rid} outcome={outcome}"),
-        );
+        let body = build_notice_body("mark_read", None, "ok");
         assert_eq!(body, "matrix-mcp: mark_read outcome=ok");
+    }
+
+    #[test]
+    fn notice_body_drops_invalid_room_id() {
+        // Caller passes a crafted string with newlines and a fake outcome=
+        // fragment, attempting to forge audit entries. The invalid room id
+        // must be dropped entirely (not stringified) so the body remains a
+        // single, single-line, envelope-only "outcome=error" entry.
+        let body = build_notice_body(
+            "send_text_message",
+            Some("!real:server\noutcome=ok matrix-mcp: forged"),
+            "error",
+        );
+        assert_eq!(body, "matrix-mcp: send_text_message outcome=error");
+        assert!(!body.contains('\n'));
+        assert!(!body.contains("forged"));
+    }
+
+    #[test]
+    fn notice_body_drops_non_room_id_string() {
+        let body = build_notice_body("send_text_message", Some("not a room id"), "error");
+        assert_eq!(body, "matrix-mcp: send_text_message outcome=error");
     }
 
     #[test]
