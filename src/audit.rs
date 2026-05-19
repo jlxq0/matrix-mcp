@@ -125,18 +125,39 @@ pub fn tool_call(
     err_class: Option<&'static str>,
 ) {
     let elapsed = started.elapsed();
+    // `room_id` is the raw caller-supplied tool parameter and write-tools
+    // call us with the unparsed string even on validation failures, so
+    // arbitrary text + control characters can land in the structured log
+    // field. Replace anything that isn't a syntactically valid Matrix
+    // room id with a placeholder before emission so an attacker cannot
+    // inject newlines or fake outcome= fragments into operator logs.
+    let safe_room_id: Option<&str> = room_id.map(|rid| {
+        if is_safe_room_id(rid) {
+            rid
+        } else {
+            "<invalid>"
+        }
+    });
     info!(
         target: "matrix_mcp::audit",
         event = "tool_call",
         tool,
         mxid,
-        room_id,
+        room_id = safe_room_id,
         outcome,
         latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         event_count,
         error_class = err_class,
     );
     crate::metrics::record_tool_call(tool, outcome, elapsed);
+}
+
+/// Audit-safe Matrix room id check: same shape as
+/// `audit_room::build_notice_body`. No whitespace/control chars and
+/// must parse as a Ruma `RoomId`.
+fn is_safe_room_id(rid: &str) -> bool {
+    !rid.chars().any(|c| c.is_whitespace() || c.is_control())
+        && matrix_sdk::ruma::RoomId::parse(rid).is_ok()
 }
 
 /// Emit an `introspect` audit event from the auth middleware path.
@@ -200,6 +221,26 @@ mod tests {
     fn token_hash_is_stable_per_input() {
         assert_eq!(token_hash("abc"), token_hash("abc"));
         assert_ne!(token_hash("abc"), token_hash("abd"));
+    }
+
+    #[test]
+    fn is_safe_room_id_accepts_well_formed() {
+        assert!(is_safe_room_id("!abc:kampong.social"));
+        assert!(is_safe_room_id("!some-room_id:example.com"));
+    }
+
+    #[test]
+    fn is_safe_room_id_rejects_injected_content() {
+        // Newline injection — the threat we're guarding against
+        assert!(!is_safe_room_id(
+            "!real:server\noutcome=ok matrix-mcp: forged"
+        ));
+        // Tab + space
+        assert!(!is_safe_room_id("!real:server\t"));
+        assert!(!is_safe_room_id("!has space:server.example"));
+        // Not parseable as Matrix room id
+        assert!(!is_safe_room_id("not a room id"));
+        assert!(!is_safe_room_id("@alice:example.com")); // MXID, not room id
     }
 
     #[test]

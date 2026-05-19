@@ -569,6 +569,15 @@ pub async fn recover(
             // network and store work even for users with a very large
             // room list.
             let mxid_for_log = session.mxid.clone();
+            // KeyBackupGate cooldown key must be the SAME identifier
+            // every code path uses for the same physical user. MCP
+            // (request_room_keys + auto-pull) keys by MAS subject; we
+            // do the same here so a /setup/recover pull and an MCP
+            // pull for the same user share cooldown state. The
+            // comment used to say MXID is "stable per-user" — true
+            // in steady state, but it doesn't match what MCP uses,
+            // so the cooldown was bypassable by alternating paths.
+            let caller_sub = session.mas_subject.clone();
             let client_for_download = client.clone();
             let key_backup_gate = state.key_backup_gate.clone();
             let download_span = info_span!(
@@ -609,11 +618,11 @@ pub async fn recover(
                         // second concurrent /setup/recover invocation
                         // can't double-pull the same room and our
                         // global concurrency cap also applies to the
-                        // MCP `request_room_keys` tool.
-                        // Caller key is the MXID (we don't have the
-                        // MAS subject here; MXID is stable per-user
-                        // for the lifetime of the cooldown window).
-                        let permit = match key_backup_gate.try_acquire(&mxid_for_log, &room_id) {
+                        // MCP `request_room_keys` tool. Caller key
+                        // matches MCP's MAS-subject so the cooldown is
+                        // consistent across /setup/recover and MCP
+                        // paths for the same physical user.
+                        let permit = match key_backup_gate.try_acquire(&caller_sub, &room_id) {
                             Ok(Some(p)) => p,
                             Ok(None) => {
                                 skipped_cooldown += 1;

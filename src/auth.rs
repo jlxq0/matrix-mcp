@@ -55,6 +55,17 @@ pub async fn bearer_auth(
 
     let started = std::time::Instant::now();
     let token_hash = audit::token_hash(&token);
+    // Don't overwrite the last_used record when the request itself
+    // is `/token/introspect` — the whole point of that endpoint is to
+    // return what the LAST real use was. If we recorded here, the act
+    // of checking the audit signal would immediately overwrite it
+    // with the auditor's own request, hiding the prior (potentially
+    // attacker-driven) use the owner is trying to detect.
+    //
+    // We use `eq_ignore_ascii_case` and an exact-path check rather
+    // than `starts_with` so unrelated future paths like
+    // `/token/introspect/foo` would not inherit the skip.
+    let is_introspect_path = request.uri().path() == "/token/introspect";
     match state.mas.introspect(&token).await {
         Ok(Some(identity)) => {
             debug!(mxid = %identity.mxid, "authenticated request");
@@ -66,14 +77,16 @@ pub async fn bearer_auth(
             // real client IP. The leftmost entry can be set by any HTTP
             // client and is therefore spoofable by an attacker holding a
             // stolen bearer; never use it as an audit signal.
-            let client_ip = last_used::parse_client_ip(
-                request
-                    .headers()
-                    .get("x-forwarded-for")
-                    .and_then(|v| v.to_str().ok()),
-                state.config.trusted_proxy_hops,
-            );
-            state.last_used.record(&token_hash, client_ip);
+            if !is_introspect_path {
+                let client_ip = last_used::parse_client_ip(
+                    request
+                        .headers()
+                        .get("x-forwarded-for")
+                        .and_then(|v| v.to_str().ok()),
+                    state.config.trusted_proxy_hops,
+                );
+                state.last_used.record(&token_hash, client_ip);
+            }
             // Stash both the identity and the raw OAuth token on the request
             // extensions. rmcp's streamable-http tower layer wraps the
             // request's `Parts` (including our extensions) into the tool

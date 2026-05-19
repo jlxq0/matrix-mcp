@@ -130,6 +130,21 @@ impl MatrixMcpService {
         let Err(err) = result else {
             return;
         };
+        // Only consider this an auth-expiry if the error came from the
+        // matrix-sdk / Synapse wrapping path (`internal_error`,
+        // JSON-RPC code -32603) — that's the only place where
+        // `M_UNKNOWN_TOKEN` / `Token is not active` can legitimately
+        // appear, originating from Synapse's 401 envelope.
+        //
+        // Without this guard, ANY tool error containing those strings
+        // trips the eviction — including `invalid_params` (-32602)
+        // errors that format caller-controlled fields back into the
+        // message. A caller could pass `room_id="M_UNKNOWN_TOKEN"`
+        // and force the cached SDK client to be evicted + rebuilt on
+        // every request, an authenticated cache-thrash DoS.
+        if err.code.0 != -32603 {
+            return;
+        }
         if !is_auth_expiry_signature(&err.message) {
             return;
         }
@@ -5303,6 +5318,28 @@ impl MatrixMcpService {
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
             })?;
+            // join_room_by_id works on ANY room id — it would happily
+            // join a non-invited public room. The tool is advertised as
+            // "accept a pending invite", so require Invited state to
+            // match that contract and prevent the tool from being used
+            // as a generic join (use `join_room` for that).
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("no pending invite for {room_id} in the SDK cache"),
+                    None,
+                )
+            })?;
+            if room.state() != matrix_sdk::RoomState::Invited {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "room {room_id} is not in the Invited state \
+                         (current state: {:?}); use `join_room` to join an \
+                         already-public or knock room",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
             client
                 .join_room_by_id(&room_id)
                 .await
@@ -6188,6 +6225,10 @@ impl MatrixMcpService {
         );
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            // Same byte cap as redact_message.reason (Group A) — these are
+            // both free-form strings that flow into Matrix event content,
+            // and an unbounded reason on kick/ban/unban was a leftover gap.
+            validate_redaction_reason(params.reason.as_deref())?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)

@@ -106,8 +106,18 @@ impl From<CappedSessionError> for std::io::Error {
 /// once [`MAX_SESSIONS`] are already live (Mitigation B, audit finding #13).
 ///
 /// All methods except `create_session` are pure pass-throughs.
+///
+/// The cap is enforced atomically: concurrent `create_session` calls
+/// serialize on `create_gate`, so the check-then-insert sequence
+/// cannot be interleaved by another task. Without the gate, N parallel
+/// initialize requests could each read `count = MAX_SESSIONS - 1`,
+/// each see room, and each create a session — overshooting the cap
+/// by up to N. The gate adds zero contention on the read-heavy
+/// session-lookup paths (`has_session`, `accept_message`, etc.) because
+/// they do not take it.
 pub struct CappedSessionManager {
     inner: LocalSessionManager,
+    create_gate: tokio::sync::Mutex<()>,
 }
 
 impl CappedSessionManager {
@@ -116,6 +126,7 @@ impl CappedSessionManager {
     pub fn new() -> Self {
         Self {
             inner: inner_manager(),
+            create_gate: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -136,6 +147,11 @@ impl SessionManager for CappedSessionManager {
     type Transport = SessionTransport;
 
     async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        // Serialize check-and-create so concurrent initializes cannot
+        // all observe `count < MAX_SESSIONS` and then each insert. The
+        // gate is held only across the count + inner.create_session
+        // call (both fast). Other manager operations don't take it.
+        let _create_guard = self.create_gate.lock().await;
         let count = self.inner.sessions.read().await.len();
         if count >= MAX_SESSIONS {
             warn!(
