@@ -554,6 +554,11 @@ mod tests {
                     .method("GET")
                     .uri("/token/introspect")
                     .header(header::AUTHORIZATION, "Bearer test-token")
+                    // XFF chain shape: the leftmost entry is what the
+                    // external client claimed (spoofable), 10.0.0.1 is
+                    // what our trusted upstream proxy (Traefik in
+                    // production) appended. With trusted_proxy_hops=1
+                    // we record `10.0.0.1`, not the spoofable leftmost.
                     .header("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
                     .body(Body::empty())
                     .unwrap(),
@@ -578,8 +583,10 @@ mod tests {
             body["token_hash"]
         );
         // last_used was populated by the auth middleware on this same
-        // request; ip is the leftmost X-Forwarded-For entry.
-        assert_eq!(body["last_used"]["ip"], "203.0.113.7");
+        // request. With the default trusted_proxy_hops=1, the recorded
+        // IP is the **rightmost** XFF entry (the one our trusted proxy
+        // appended) — NOT the leftmost (which an attacker could spoof).
+        assert_eq!(body["last_used"]["ip"], "10.0.0.1");
         assert!(
             body["last_used"]["at_unix"].as_i64().is_some(),
             "at_unix should be an integer; body: {body}"

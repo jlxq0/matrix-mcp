@@ -110,15 +110,37 @@ impl LastUsedTracker {
 }
 
 /// Best-effort parser for the client IP from an `X-Forwarded-For`
-/// header value. Traefik appends each hop's IP comma-separated; the
-/// **leftmost** value is the original client, the rightmost values
-/// are proxies closer to us. Returns `None` if the header is absent
-/// or contains no parseable IP.
+/// header value.
+///
+/// `X-Forwarded-For` is the comma-separated chain of IPs each proxy
+/// has *appended* on the way in. The leftmost entry is **claimed** by
+/// the original client (and is therefore attacker-controllable on a
+/// public service — any HTTP client can set the header to whatever it
+/// wants before talking to us). Reading the leftmost entry produces
+/// audit signals that an attacker holding a stolen bearer can trivially
+/// spoof.
+///
+/// Instead, count `trusted_proxy_hops` entries in from the right. Each
+/// trusted proxy on the path is expected to *append* the IP it saw
+/// when the request arrived at it; the rightmost N entries are
+/// therefore the ones we trust. The defaults assume exactly one trusted
+/// proxy (the Gruyere Traefik gateway).
+///
+/// Returns `None` when the header is absent, has fewer entries than
+/// the trusted-hops count, or contains no parseable IP at the trusted
+/// position.
 #[must_use]
-pub fn parse_client_ip(xff: Option<&str>) -> Option<IpAddr> {
-    xff.and_then(|h| h.split(',').next())
-        .map(str::trim)
-        .and_then(|s| s.parse::<IpAddr>().ok())
+pub fn parse_client_ip(xff: Option<&str>, trusted_proxy_hops: usize) -> Option<IpAddr> {
+    let raw = xff?;
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    let len = parts.len();
+    if trusted_proxy_hops == 0 || len < trusted_proxy_hops {
+        return None;
+    }
+    // The entry immediately upstream of the last `trusted_proxy_hops`
+    // proxies is the real client IP — i.e., index `len - trusted_proxy_hops`.
+    let idx = len - trusted_proxy_hops;
+    parts.get(idx)?.parse::<IpAddr>().ok()
 }
 
 #[cfg(test)]
@@ -173,29 +195,63 @@ mod tests {
     }
 
     #[test]
-    fn parse_client_ip_handles_typical_xff_values() {
+    fn parse_client_ip_with_one_trusted_hop_takes_rightmost() {
+        // Single-entry XFF with one trusted hop → that's the IP Traefik saw.
         assert_eq!(
-            parse_client_ip(Some("203.0.113.5")),
+            parse_client_ip(Some("203.0.113.5"), 1),
             Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
         );
-        // Traefik adds the next-hop IP to the right; leftmost is the
-        // original client.
+        // The leftmost entry is the **claimed** client IP and may be
+        // spoofed; with one trusted proxy in front, the rightmost is
+        // the real one (Traefik appends what it saw).
         assert_eq!(
-            parse_client_ip(Some("203.0.113.5, 10.0.0.1, 10.0.0.2")),
-            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
+            parse_client_ip(Some("1.2.3.4, 10.0.0.1, 198.51.100.7"), 1),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
         );
         // Surrounding whitespace.
         assert_eq!(
-            parse_client_ip(Some("  198.51.100.7  ,  10.0.0.1")),
+            parse_client_ip(Some("  198.51.100.7  ,  10.0.0.1  "), 1),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+    }
+
+    #[test]
+    fn parse_client_ip_with_two_trusted_hops_takes_third_from_right() {
+        // Clean chain (no spoof): client → trustedA → trustedB → us
+        // produces exactly 2 entries, and the leftmost is the real
+        // client IP (because trustedA appended what it saw of the
+        // client, trustedB appended trustedA's IP, and we never put
+        // ourselves into XFF).
+        assert_eq!(
+            parse_client_ip(Some("198.51.100.7, 10.0.0.1"), 2),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
+        );
+        // Spoofed: the client put `1.2.3.4` in XFF themselves. Now we
+        // see 3 entries; the trusted ones are the last 2, so the real
+        // client IP is the one at position `len - 2 = 1`.
+        assert_eq!(
+            parse_client_ip(Some("1.2.3.4, 198.51.100.7, 10.0.0.1"), 2),
             Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
         );
     }
 
     #[test]
+    fn parse_client_ip_returns_none_when_chain_shorter_than_trust() {
+        // We expect 2 trusted hops but only got 1 entry: refuse to trust.
+        assert_eq!(parse_client_ip(Some("198.51.100.7"), 2), None);
+    }
+
+    #[test]
+    fn parse_client_ip_returns_none_when_no_proxies_trusted() {
+        // Defence-in-depth: trust_hops=0 means "don't read XFF at all".
+        assert_eq!(parse_client_ip(Some("198.51.100.7"), 0), None);
+    }
+
+    #[test]
     fn parse_client_ip_returns_none_for_garbage() {
-        assert_eq!(parse_client_ip(None), None);
-        assert_eq!(parse_client_ip(Some("")), None);
-        assert_eq!(parse_client_ip(Some("not an ip")), None);
-        assert_eq!(parse_client_ip(Some(", , ,")), None);
+        assert_eq!(parse_client_ip(None, 1), None);
+        assert_eq!(parse_client_ip(Some(""), 1), None);
+        assert_eq!(parse_client_ip(Some("not an ip"), 1), None);
+        assert_eq!(parse_client_ip(Some(", , ,"), 1), None);
     }
 }
