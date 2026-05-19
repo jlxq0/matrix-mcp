@@ -4120,102 +4120,30 @@ impl MatrixMcpService {
         );
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
-
-            // --- URL validation -----------------------------------------
-            if !params.image_url.starts_with("https://") {
-                return Err(ErrorData::invalid_params(
-                    "image_url must be an HTTPS URL \
-                     (http:// is rejected to prevent credential exposure over cleartext)",
-                    None,
-                ));
-            }
-
-            // --- Fetch --------------------------------------------------
-            // SSRF note: we require HTTPS (above), cap the body to
-            // `upload_max_bytes`, limit redirects to 3 hops, and apply a
-            // 15 s timeout. Blocking RFC-1918 / loopback destinations is a
-            // future hardening item — do NOT remove this comment before
-            // that work is done.
-            let http = reqwest::Client::builder()
-                .use_rustls_tls()
-                .redirect(reqwest::redirect::Policy::limited(3))
-                .timeout(Duration::from_secs(15))
-                .build()
-                .map_err(|e| ErrorData::internal_error(format!("build http client: {e}"), None))?;
-
-            let response =
-                http.get(&params.image_url).send().await.map_err(|e| {
-                    ErrorData::internal_error(format!("fetch image_url: {e}"), None)
-                })?;
-
-            // --- Content-Type guard -------------------------------------
-            let ct = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_owned();
-            if !ct.starts_with("image/") {
-                return Err(ErrorData::invalid_params(
-                    format!("remote URL returned Content-Type `{ct}`; expected `image/*`"),
-                    None,
-                ));
-            }
-            // Parse to a typed Mime; fall back to image/jpeg on failure
-            // (shouldn't occur after the prefix guard above).
-            let mime_type: mime::Mime = ct.parse().unwrap_or(mime::IMAGE_JPEG);
-
-            // --- Size cap -----------------------------------------------
-            let cap = self.upload_max_bytes;
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("read image body: {e}"), None))?;
-            if bytes.len() > cap {
-                return Err(ErrorData::invalid_params(
-                    format!(
-                        "image body {} bytes exceeds the configured cap of {} bytes \
-                         (set MATRIX_MCP_UPLOAD_MAX_BYTES to raise it)",
-                        bytes.len(),
-                        cap
-                    ),
-                    None,
-                ));
-            }
-
-            // --- Upload to homeserver media repo ------------------------
+            // Route through upload_from_url so this tool inherits the
+            // SSRF defence in src/url_safety.rs (RFC1918 / loopback /
+            // link-local / cloud-metadata denylist, manual redirect
+            // revalidation). The previous inline fetcher only checked
+            // `starts_with("https://")` — a known gap left over from
+            // Group B that this commit closes.
             let client = self.client_for(&ctx).await?;
-            let upload_resp = client
-                .media()
-                .upload(&mime_type, bytes.to_vec(), None)
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("media upload: {e}"), None))?;
-            let mxc_uri: OwnedMxcUri = upload_resp.content_uri;
+            let uploaded = self
+                .upload_from_url(&params.image_url, &client, Some("image/"), mime::IMAGE_JPEG)
+                .await?;
+            let mxc_uri = uploaded.mxc_uri.clone();
 
-            // --- Derive filename from URL path --------------------------
-            // Take the last non-empty path segment; strip any query string.
-            let url_filename = params
-                .image_url
-                .split('/')
-                .next_back()
-                .and_then(|s| s.split('?').next())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("image")
-                .to_owned();
-
-            // --- Build ImageMessageEventContent -------------------------
-            // Per Matrix spec: when `filename` ≠ `body`, `body` is the
-            // caption. When there is no caption, use the filename as `body`
-            // (no separate `filename` field) so clients show a file name.
+            // Build ImageMessageEventContent. Per Matrix spec: when
+            // `filename` ≠ `body`, `body` is the caption. When there is
+            // no caption, use the filename as `body` (no separate
+            // `filename` field) so clients show a file name.
             let img_content = if let Some(ref caption) = params.caption {
                 let mut img = ImageMessageEventContent::plain(caption.clone(), mxc_uri.clone());
-                img.filename = Some(url_filename);
+                img.filename = Some(uploaded.filename.clone());
                 img
             } else {
-                ImageMessageEventContent::plain(url_filename, mxc_uri.clone())
+                ImageMessageEventContent::plain(uploaded.filename.clone(), mxc_uri.clone())
             };
 
-            // --- Send ---------------------------------------------------
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
             })?;
