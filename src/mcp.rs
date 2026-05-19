@@ -76,6 +76,10 @@ pub struct MatrixMcpService {
     /// Maximum image size (bytes) `send_image_from_url` will fetch from a
     /// remote HTTPS URL before uploading to the homeserver media repo.
     upload_max_bytes: usize,
+    /// Concurrency + cooldown gate shared across every code path that
+    /// can trigger a Matrix room-key backup pull. Used by the explicit
+    /// `request_room_keys` tool and the auto-pull helper.
+    key_backup_gate: crate::key_backup_gate::KeyBackupGate,
     tool_router: ToolRouter<Self>,
 }
 
@@ -92,6 +96,7 @@ impl MatrixMcpService {
         rate_limiter: Arc<Limiter>,
         download_max_bytes: u64,
         upload_max_bytes: usize,
+        key_backup_gate: crate::key_backup_gate::KeyBackupGate,
     ) -> Self {
         Self {
             clients,
@@ -99,6 +104,7 @@ impl MatrixMcpService {
             rate_limiter,
             download_max_bytes,
             upload_max_bytes,
+            key_backup_gate,
             tool_router: Self::tool_router(),
         }
     }
@@ -1611,7 +1617,7 @@ impl MatrixMcpService {
             // server-side key-backup pull in the background. Best-effort:
             // sessions in backup self-heal on the next read; sessions
             // that were never backed up stay opaque.
-            spawn_key_backup_pull_if_needed(&client, &room_id, &events);
+            spawn_key_backup_pull_if_needed(&self.key_backup_gate, &client, &room_id, &events);
             let count = events.len();
             let res = structured_result(&ReadRecentMessagesResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -1702,7 +1708,7 @@ impl MatrixMcpService {
             })?;
 
             let events = read_events_from_chunk(relations.chunk);
-            spawn_key_backup_pull_if_needed(&client, &room_id, &events);
+            spawn_key_backup_pull_if_needed(&self.key_backup_gate, &client, &room_id, &events);
             let count = events.len();
             let res = structured_result(&ReadThreadResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -2624,12 +2630,65 @@ impl MatrixMcpService {
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
             })?;
-            let backup_requested = client
-                .encryption()
-                .backups()
-                .download_room_keys_for_room(&room_id)
-                .await
-                .is_ok();
+            // Require the room to be currently Joined + encrypted before
+            // touching the key-backup endpoint. Without these checks
+            // (secscan #de85922e) a caller could trigger pulls for any
+            // room id in the SDK cache including left/banned rooms.
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            if room.state() != matrix_sdk::RoomState::Joined {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "not joined to {room_id} (current state: {:?})",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
+            if !room.encryption_state().is_encrypted() {
+                return Err(ErrorData::invalid_params(
+                    format!("{room_id} is not encrypted; nothing to pull from key backup"),
+                    None,
+                ));
+            }
+            // Per-room cooldown + global concurrency. Surface a clear
+            // rate-limited / cooldown rejection to the explicit tool
+            // caller instead of silently skipping (the auto-pull
+            // helper does silent-skip).
+            let permit = match self.key_backup_gate.try_acquire(&room_id) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "key-backup pull for {room_id} ran within the last \
+                             {}s; wait and retry",
+                            crate::key_backup_gate::COOLDOWN.as_secs()
+                        ),
+                        None,
+                    ));
+                }
+                Err(busy) => {
+                    return Err(ErrorData::new(
+                        rmcp::model::ErrorCode(audit::RATE_LIMITED_CODE),
+                        busy.to_string(),
+                        None,
+                    ));
+                }
+            };
+            let outcome = tokio::time::timeout(
+                crate::key_backup_gate::PER_PULL_TIMEOUT,
+                client
+                    .encryption()
+                    .backups()
+                    .download_room_keys_for_room(&room_id),
+            )
+            .await;
+            let backup_requested = matches!(outcome, Ok(Ok(())));
+            if backup_requested {
+                permit.record_success();
+            }
+            drop(permit);
             structured_result(&RequestRoomKeysResult {
                 room_id: room_id.to_string(),
                 backup_requested,
@@ -6507,6 +6566,7 @@ pub fn token_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<AccessToken> {
 /// never backed up there's no in-protocol recovery and the response
 /// to the caller still surfaces the undecryptable status.
 fn spawn_key_backup_pull_if_needed(
+    gate: &crate::key_backup_gate::KeyBackupGate,
     client: &matrix_sdk::Client,
     room_id: &matrix_sdk::ruma::RoomId,
     events: &[ReadEvent],
@@ -6518,27 +6578,57 @@ fn spawn_key_backup_pull_if_needed(
     if undecryptable == 0 {
         return;
     }
+    // Per-room cooldown + global concurrency. Auto-pull is best-effort
+    // recovery for self-healing reads, so we silently skip when either
+    // bound is hit — the caller will see undecryptable status and can
+    // invoke `request_room_keys` explicitly to surface the rejection.
+    let permit = match gate.try_acquire(room_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::debug!(
+                %room_id,
+                undecryptable,
+                "skip auto key-backup pull: per-room cooldown active"
+            );
+            return;
+        }
+        Err(busy) => {
+            tracing::debug!(
+                %room_id,
+                undecryptable,
+                "skip auto key-backup pull: {busy}"
+            );
+            return;
+        }
+    };
     let client = client.clone();
     let room_id: OwnedRoomId = room_id.to_owned();
     tokio::spawn(async move {
-        match client
-            .encryption()
-            .backups()
-            .download_room_keys_for_room(&room_id)
-            .await
-        {
-            Ok(()) => tracing::debug!(
-                %room_id,
-                undecryptable,
-                "kicked off key-backup pull for undecryptable events"
-            ),
-            Err(e) => tracing::warn!(
+        let backups = client.encryption().backups();
+        let pull = backups.download_room_keys_for_room(&room_id);
+        match tokio::time::timeout(crate::key_backup_gate::PER_PULL_TIMEOUT, pull).await {
+            Ok(Ok(())) => {
+                permit.record_success();
+                tracing::debug!(
+                    %room_id,
+                    undecryptable,
+                    "kicked off key-backup pull for undecryptable events"
+                );
+            }
+            Ok(Err(e)) => tracing::warn!(
                 %room_id,
                 undecryptable,
                 error = %e,
                 "key-backup pull failed; undecryptable events stay undecryptable"
             ),
+            Err(_) => tracing::warn!(
+                %room_id,
+                undecryptable,
+                timeout_secs = crate::key_backup_gate::PER_PULL_TIMEOUT.as_secs(),
+                "key-backup pull timed out; aborting to free the gate permit"
+            ),
         }
+        drop(permit);
     });
 }
 

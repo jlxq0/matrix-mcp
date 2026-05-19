@@ -17,6 +17,7 @@ mod auth;
 mod config;
 mod content_sandbox;
 mod device_identity;
+mod key_backup_gate;
 mod last_used;
 mod mas;
 mod matrix_client;
@@ -115,7 +116,17 @@ fn build_app(cfg: Config) -> Result<Router> {
         "E2EE store config missing — set MATRIX_MCP_STORE_DIR and MATRIX_MCP_STORE_PEPPER",
     )?;
     let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
-    let setup_state = setup::SetupState::new(cfg.clone(), mas.clone(), clients.clone());
+    // Shared across SetupState (recover flow) and MatrixMcpService
+    // (request_room_keys tool + auto-pull helper) so all room-key
+    // backup pulls go through the same concurrency cap + per-room
+    // cooldown.
+    let key_backup_gate = key_backup_gate::KeyBackupGate::new();
+    let setup_state = setup::SetupState::new(
+        cfg.clone(),
+        mas.clone(),
+        clients.clone(),
+        key_backup_gate.clone(),
+    );
     let limiter = Arc::new(
         Limiter::new(cfg.rate_limit_reads_per_min, cfg.rate_limit_writes_per_min).context(
             "rate-limit quotas must be > 0; check MATRIX_MCP_RATE_LIMIT_{READS,WRITES}_PER_MIN",
@@ -130,6 +141,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         setup_state,
         limiter,
         download_max_bytes,
+        key_backup_gate,
     ))
 }
 
@@ -141,6 +153,7 @@ fn build_router(
     setup_state: setup::SetupState,
     limiter: Arc<Limiter>,
     download_max_bytes: u64,
+    key_backup_gate: key_backup_gate::KeyBackupGate,
 ) -> Router {
     // rmcp's StreamableHttpService is a tower::Service that handles all the
     // MCP transport details (initialize, tools/list, tools/call, SSE
@@ -166,12 +179,14 @@ fn build_router(
             let mas = mas.clone();
             let clients = clients.clone();
             let limiter = Arc::clone(&limiter);
+            let key_backup_gate = key_backup_gate.clone();
             Ok(MatrixMcpService::new(
                 clients,
                 mas,
                 limiter,
                 download_max_bytes,
                 upload_max_bytes,
+                key_backup_gate,
             ))
         },
         Arc::new(session::CappedSessionManager::new()),
@@ -395,7 +410,13 @@ mod tests {
             pepper: "a".repeat(64),
         };
         let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
-        let setup_state = setup::SetupState::new(cfg.clone(), mas.clone(), clients.clone());
+        let key_backup_gate = key_backup_gate::KeyBackupGate::new();
+        let setup_state = setup::SetupState::new(
+            cfg.clone(),
+            mas.clone(),
+            clients.clone(),
+            key_backup_gate.clone(),
+        );
         // Wide-open limiter for tests — we don't exercise rate-limit
         // behaviour here; dedicated tests live in `rate_limit::tests`.
         let limiter = Arc::new(crate::rate_limit::Limiter::new(100_000, 100_000).unwrap());
@@ -411,6 +432,7 @@ mod tests {
             setup_state,
             limiter,
             5 * 1024 * 1024, // default 5 MiB cap in tests
+            key_backup_gate,
         )
     }
 
