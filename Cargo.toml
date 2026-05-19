@@ -3,8 +3,8 @@ name = "matrix-mcp"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.93"
-description = "Remote MCP server exposing Matrix (example.com) to claude.ai"
-license = "AGPL-3.0-or-later"
+description = "Remote MCP server exposing Matrix to claude.ai"
+license = "MIT"
 repository = "https://github.com/jlxq0/matrix-mcp"
 publish = false
 

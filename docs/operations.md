@@ -1,7 +1,7 @@
 # Operations
 
-Debug recipes, rotation procedures, and env var reference for
-matrix-mcp on Gruyere.
+Debug recipes, rotation procedures, and env var reference for a
+matrix-mcp deployment.
 
 ---
 

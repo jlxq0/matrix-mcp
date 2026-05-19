@@ -15,9 +15,11 @@ whether peer Matrix clients will trust this device.
 Usage:
     python3 verify-device-signature.py @user:server DEVICE_ID
 
-You must have `kubectl` access to the Gruyere cluster and read
-permission on the `synapse` database in the `postgres-rescue`
-CNPG cluster. Three SELECTs total, all read-only.
+You must have `kubectl` access to the cluster hosting Synapse and
+read permission on the `synapse` database. Three SELECTs total, all
+read-only. The script hard-codes the pod name + namespace conventions
+the author uses (see POSTGRES_POD / POSTGRES_NS at the top of the
+file); edit those for your deployment.
 
 Requirements: PyNaCl, canonicaljson
     pip install --user PyNaCl canonicaljson

@@ -36,8 +36,9 @@ FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f7
 WORKDIR /app
 COPY --from=builder /build/target/release/matrix-mcp /app/matrix-mcp
 
-# Non-root by default (distroless `nonroot` user, UID 65532). Matches the
-# PSS-restricted security context we use everywhere else on Gruyere.
+# Non-root by default (distroless `nonroot` user, UID 65532). Matches
+# a typical PSS-restricted Kubernetes security context (no privilege
+# escalation, drop ALL capabilities, read-only root filesystem).
 USER nonroot:nonroot
 
 EXPOSE 3000

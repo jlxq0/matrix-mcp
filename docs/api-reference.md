@@ -1,12 +1,20 @@
 # API Reference
 
-All 17 MCP tools exposed by matrix-mcp at `/mcp`.
+A subset of the MCP tools exposed by matrix-mcp at `/mcp`. The full
+current list is what `tools/list` returns from the running server
+(currently ~58 tools); this document covers the most commonly used
+ones with full argument and return-shape detail. For undocumented
+tools, the tool annotations + JSON schema in `src/mcp.rs` are the
+source of truth.
 
 Tools use Streamable HTTP (JSON-RPC 2.0). Authentication: Bearer token
 issued by MAS, passed in the `Authorization` header.
 
 Rate limits: 60 reads/min, 30 writes/min per identity (defaults).
-Returns error code `-32001` (`RATE_LIMITED`) when exceeded.
+Returns error code `-32001` (`RATE_LIMITED`) when exceeded. A
+per-bearer initialize rate-limit also applies to fresh `/mcp` session
+creation (8/burst, refilling at the session keep-alive rate) and
+returns HTTP 429 when exceeded.
 
 ---
 

@@ -190,20 +190,26 @@ spec:
 
 ---
 
-## 5. Deployment: Gruyere (our cluster)
+## 5. Deployment: reference k8s manifests
 
-The Gruyere manifests live in
-`clusters/gruyere/apps/matrix-mcp-www/` in the argocd repo.
-They use:
+A reference Kubernetes deployment looks like:
 
-- ExternalSecret pulling from 1Password (`matrix-mcp-www` item in
-  `Gruyere k8s Cluster` vault).
-- Traefik HTTPRoute with IP allowlist middleware for the `/mcp` path.
-- `PodDisruptionBudget minAvailable: 1`.
-- Alloy sidecar for Prometheus metrics scraping (pod IP annotation).
+- A `Deployment` with `replicas: 1`, the matrix-mcp container image,
+  and a `PodDisruptionBudget minAvailable: 1`.
+- A `Service` exposing port 3000 (not 9090 — metrics stays internal).
+- An `Ingress` / Gateway-API `HTTPRoute` terminating TLS for your
+  public matrix-mcp hostname, optionally with an IP-allowlist
+  middleware on `/mcp`.
+- A `PersistentVolumeClaim` backed by your block-storage class for
+  the encrypted Matrix store.
+- Secrets pulled in via your platform's secret manager (ExternalSecrets
+  Operator + 1Password Connect / Vault / sealed-secrets / etc.) for
+  `MATRIX_MCP_INTROSPECTION_CLIENT_SECRET` and
+  `MATRIX_MCP_STORE_PEPPER`.
 
-For the initial deploy procedure (pre-existing), see
-`clusters/gruyere/apps/matrix-mcp-www/RUNBOOK.md`.
+The author's production deployment uses ExternalSecrets +
+1Password Connect + Traefik Gateway API + Longhorn-backed PVCs.
+Substitute the equivalents for your platform.
 
 ---
 
@@ -212,9 +218,8 @@ For the initial deploy procedure (pre-existing), see
 The server's public URL (`MATRIX_MCP_RESOURCE_URL`) must match the
 hostname in your TLS certificate and must be reachable by claude.ai.
 
-For the Gruyere deployment, Bunny DNS + cert-manager handle this.
-For a generic k8s deployment, configure an Ingress/HTTPRoute with
-your own cert-manager issuer or static cert.
+Configure an Ingress / HTTPRoute with your own cert-manager issuer
+or static cert.
 
 ---
 

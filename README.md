@@ -15,19 +15,32 @@ the device is cross-signed, which `/setup` arranges with your recovery key.
 
 ## What you get
 
-19 tools, all carrying MCP annotations (`read_only_hint`,
+~58 tools, all carrying MCP annotations (`read_only_hint`,
 `destructive_hint`, `idempotent_hint`) so client UIs can auto-approve reads
 and warn before writes.
 
 - **Reads**: `read_recent_messages`, `read_thread`, `search_messages`,
-  `get_unread_summary`, `list_joined_rooms`, `room_info`, `room_members`,
-  `download_attachment`, `verify_status`, `whoami`
-- **Writes**: `send_text_message`, `send_image_from_url`, `send_reaction`,
-  `mark_read`
-- **Room management**: `join_room`, `leave_room`, `invite_user`,
-  `redact_message`
-- **Self-audit**: `set_audit_room` – designate a room where matrix-mcp
-  posts an `m.notice` for every write it makes on your behalf
+  `get_unread_summary`, `list_joined_rooms`, `list_recent_activity`,
+  `room_info`, `room_members`, `list_threads_in_room`,
+  `download_attachment`, `verify_status`, `whoami`, `users_get_profile`,
+  `get_room_state`, `get_space_hierarchy`, `get_account_data`,
+  `get_user_receipts`, `get_event_receipts`, `get_presence`,
+  `list_ignored_users`, `invites_list`
+- **Writes**: `send_text_message`, `send_image_from_url`, `send_file`,
+  `send_audio`, `send_video`, `send_reaction`, `send_bulk`,
+  `send_broadcast`, `mark_read`, `message_edit`, `message_forward`,
+  `redact_message`, `upload_media_from_url`, `set_account_data`,
+  `set_presence`, `set_room_name`, `set_room_topic`,
+  `me_set_displayname`, `me_set_avatar`, `ignore_user`, `unignore_user`,
+  `request_room_keys`
+- **Room management**: `room_create`, `room_create_dm`, `join_room`,
+  `leave_room`, `invite_user`, `invites_accept`, `invites_reject`,
+  `room_pin_message`, `room_unpin_message`
+- **Moderation / admin**: `room_kick`, `room_ban`, `room_unban`,
+  `admin_get_power_levels`, `admin_set_power_level` (constrained by
+  the user's Matrix power level on the room)
+- **Self-audit**: `set_audit_room` – designate a Matrix room where
+  matrix-mcp posts an `m.notice` for every write it makes on your behalf
 
 See [`docs/api-reference.md`](docs/api-reference.md) for arguments and
 return shapes.
@@ -126,9 +139,14 @@ otherwise. Conventional Commits for messages.
 
 ## Licence
 
-[AGPL-3.0-or-later](LICENSE). If you run a modified version as a
-network service, the licence requires you to make the modified source
-available to your users.
+[MIT](LICENSE).
 
-<!-- Source migrated to forge.oddie.app/julian/matrix-mcp on 2026-05-17; GitHub jlxq0/matrix-mcp is now a push-mirror for CI continuity -->
+## Where this code lives
+
+The canonical source repository is
+[`forge.oddie.app/julian/matrix-mcp`](https://forge.oddie.app/julian/matrix-mcp).
+[`github.com/jlxq0/matrix-mcp`](https://github.com/jlxq0/matrix-mcp) is
+a public push-mirror so the code is discoverable and forkable from
+GitHub. PRs opened on either side are fine; merges happen on Forgejo
+and are mirrored.
 
