@@ -21,7 +21,7 @@
 
 services:
   matrix-mcp:
-    image: ghcr.io/jlxq0/matrix-mcp:latest
+    image: ghcr.io/jlxq0/matrix-mcp:v0.3.14
     restart: unless-stopped
     environment:
       # The fully-qualified URL claude.ai will use to reach this
