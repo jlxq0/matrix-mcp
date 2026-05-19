@@ -6188,6 +6188,10 @@ impl MatrixMcpService {
         );
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            // Same byte cap as redact_message.reason (Group A) — these are
+            // both free-form strings that flow into Matrix event content,
+            // and an unbounded reason on kick/ban/unban was a leftover gap.
+            validate_redaction_reason(params.reason.as_deref())?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
