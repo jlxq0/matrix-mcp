@@ -118,6 +118,11 @@ pub struct SetupState {
     pub clients: MatrixClientCache,
     pub pkce_states: Arc<RwLock<HashMap<String, PendingPkce>>>,
     pub sessions: Arc<RwLock<HashMap<String, SetupSession>>>,
+    /// Shared key-backup-pull gate. Threaded through here so two
+    /// concurrent `/setup/recover` invocations can't double-pull the
+    /// same room and a global concurrency limit applies across both
+    /// /setup and the MCP `request_room_keys` tool.
+    pub key_backup_gate: crate::key_backup_gate::KeyBackupGate,
 }
 
 #[derive(Clone)]
@@ -159,13 +164,19 @@ pub struct SetupSession {
 }
 
 impl SetupState {
-    pub fn new(config: Config, mas: MasIntrospectionClient, clients: MatrixClientCache) -> Self {
+    pub fn new(
+        config: Config,
+        mas: MasIntrospectionClient,
+        clients: MatrixClientCache,
+        key_backup_gate: crate::key_backup_gate::KeyBackupGate,
+    ) -> Self {
         Self {
             config,
             mas,
             clients,
             pkce_states: Arc::new(RwLock::new(HashMap::new())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            key_backup_gate,
         }
     }
 }
@@ -553,6 +564,7 @@ pub async fn recover(
             // room list.
             let mxid_for_log = session.mxid.clone();
             let client_for_download = client.clone();
+            let key_backup_gate = state.key_backup_gate.clone();
             let download_span = info_span!(
                 "setup.step",
                 step = "key_backup_download",
@@ -582,9 +594,37 @@ pub async fn recover(
                     let mut total = 0usize;
                     let mut succeeded = 0usize;
                     let mut failed = 0usize;
+                    let mut skipped_cooldown = 0usize;
+                    let mut skipped_gate_busy = 0usize;
                     for room in encrypted_rooms.iter().take(KEY_BACKUP_MAX_ROOMS) {
                         total += 1;
                         let room_id = room.room_id().to_owned();
+                        // Goes through the shared KeyBackupGate so a
+                        // second concurrent /setup/recover invocation
+                        // can't double-pull the same room and our
+                        // global concurrency cap also applies to the
+                        // MCP `request_room_keys` tool.
+                        let permit = match key_backup_gate.try_acquire(&room_id) {
+                            Ok(Some(p)) => p,
+                            Ok(None) => {
+                                skipped_cooldown += 1;
+                                debug!(
+                                    mxid = %mxid_for_log,
+                                    %room_id,
+                                    "skip: per-room cooldown active"
+                                );
+                                continue;
+                            }
+                            Err(busy) => {
+                                skipped_gate_busy += 1;
+                                debug!(
+                                    mxid = %mxid_for_log,
+                                    %room_id,
+                                    "skip: {busy}"
+                                );
+                                continue;
+                            }
+                        };
                         let result = timeout(KEY_BACKUP_ROOM_TIMEOUT, async {
                             client_for_download
                                 .encryption()
@@ -596,6 +636,7 @@ pub async fn recover(
                         match result {
                             Ok(Ok(())) => {
                                 succeeded += 1;
+                                permit.record_success();
                                 debug!(mxid = %mxid_for_log, %room_id, "backed-up keys downloaded");
                             }
                             Ok(Err(e)) => {
@@ -617,7 +658,9 @@ pub async fn recover(
                                 );
                             }
                         }
+                        drop(permit);
                     }
+                    let _ = (skipped_cooldown, skipped_gate_busy);
                     let dl_outcome = if failed == 0 {
                         outcome::OK
                     } else {

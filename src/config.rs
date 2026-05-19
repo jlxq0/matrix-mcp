@@ -80,11 +80,17 @@ const ENV_DOWNLOAD_MAX_BYTES: &str = "MATRIX_MCP_DOWNLOAD_MAX_BYTES";
 /// remote HTTPS URL before uploading to the homeserver media repo.
 /// Default: 10 MiB. Set higher only if the homeserver allows larger uploads.
 pub const ENV_UPLOAD_MAX_BYTES: &str = "MATRIX_MCP_UPLOAD_MAX_BYTES";
+/// Number of trusted proxies in front of matrix-mcp. Used by the
+/// `/token/introspect` audit endpoint to pick the trustworthy entry
+/// out of `X-Forwarded-For`. Default 1 (assumes Traefik in front in
+/// production).
+const ENV_TRUSTED_PROXY_HOPS: &str = "MATRIX_MCP_TRUSTED_PROXY_HOPS";
 
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -127,6 +133,13 @@ pub struct Config {
     /// from a remote URL before uploading to the homeserver media repo.
     /// Defaults to 10 MiB.
     pub upload_max_bytes: usize,
+    /// Number of trusted proxies in front of matrix-mcp. Used to pick
+    /// the real client IP out of `X-Forwarded-For` for the
+    /// `/token/introspect` audit endpoint. Defaults to 1 (Traefik in
+    /// front in production); set to 0 in dev / direct-hosted setups so
+    /// that an attacker-supplied XFF header is never recorded as the
+    /// client IP.
+    pub trusted_proxy_hops: usize,
     /// Persistent Matrix device id for this matrix-mcp instance. Resolved
     /// from `<store_root>/.device-id` at startup, with one-shot env-var
     /// bootstrap and random fallback. See [`crate::device_identity`].
@@ -214,6 +227,7 @@ impl Config {
             rate_limit_writes_per_min: DEFAULT_RATE_LIMIT_WRITES,
             download_max_bytes: DEFAULT_DOWNLOAD_MAX_BYTES,
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
+            trusted_proxy_hops: DEFAULT_TRUSTED_PROXY_HOPS,
             // Tests and `from_env` overwrite this; the placeholder makes
             // it obvious in any accidental dump that resolution hasn't
             // run yet.
@@ -290,6 +304,7 @@ impl Config {
             parse_rate_limit(ENV_RATE_LIMIT_WRITES, DEFAULT_RATE_LIMIT_WRITES)?;
         cfg.download_max_bytes = parse_download_max_bytes()?;
         cfg.upload_max_bytes = parse_upload_max_bytes()?;
+        cfg.trusted_proxy_hops = parse_trusted_proxy_hops()?;
         cfg.device_id = device_id;
         Ok(cfg
             .with_introspection(IntrospectionCredentials {
@@ -355,6 +370,15 @@ fn parse_download_max_bytes() -> Result<u64> {
     };
     raw.parse().with_context(|| {
         format!("{ENV_DOWNLOAD_MAX_BYTES} must be a non-negative integer, got `{raw}`")
+    })
+}
+
+fn parse_trusted_proxy_hops() -> Result<usize> {
+    let Ok(raw) = std::env::var(ENV_TRUSTED_PROXY_HOPS) else {
+        return Ok(DEFAULT_TRUSTED_PROXY_HOPS);
+    };
+    raw.parse().with_context(|| {
+        format!("{ENV_TRUSTED_PROXY_HOPS} must be a non-negative integer, got `{raw}`")
     })
 }
 

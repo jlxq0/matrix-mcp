@@ -52,6 +52,7 @@ use crate::content_sandbox;
 use crate::mas::AuthenticatedIdentity;
 use crate::matrix_client::MatrixClientCache;
 use crate::rate_limit::{Category, Limiter};
+use crate::url_safety;
 
 /// The MCP service. Per-session state is a reference to the shared
 /// `MatrixClientCache`. The per-request identity + token come from
@@ -75,6 +76,10 @@ pub struct MatrixMcpService {
     /// Maximum image size (bytes) `send_image_from_url` will fetch from a
     /// remote HTTPS URL before uploading to the homeserver media repo.
     upload_max_bytes: usize,
+    /// Concurrency + cooldown gate shared across every code path that
+    /// can trigger a Matrix room-key backup pull. Used by the explicit
+    /// `request_room_keys` tool and the auto-pull helper.
+    key_backup_gate: crate::key_backup_gate::KeyBackupGate,
     tool_router: ToolRouter<Self>,
 }
 
@@ -91,6 +96,7 @@ impl MatrixMcpService {
         rate_limiter: Arc<Limiter>,
         download_max_bytes: u64,
         upload_max_bytes: usize,
+        key_backup_gate: crate::key_backup_gate::KeyBackupGate,
     ) -> Self {
         Self {
             clients,
@@ -98,6 +104,7 @@ impl MatrixMcpService {
             rate_limiter,
             download_max_bytes,
             upload_max_bytes,
+            key_backup_gate,
             tool_router: Self::tool_router(),
         }
     }
@@ -137,11 +144,13 @@ impl MatrixMcpService {
             mxid = mxid.as_deref().unwrap_or("<unknown>"),
             "Synapse reported M_UNKNOWN_TOKEN; evicted SDK client + introspect caches"
         );
-        *err = ErrorData::invalid_request(
+        *err = ErrorData::new(
+            rmcp::model::ErrorCode(audit::AUTH_EXPIRED_CODE),
             "Your matrix-mcp OAuth session has expired or been revoked. \
              In claude.ai → Connectors → Matrix, click Disconnect and then \
              Connect again to get a fresh session, then retry. Your \
-             cross-signing identity is preserved — no need to re-run /setup.",
+             cross-signing identity is preserved — no need to re-run /setup."
+                .to_owned(),
             None,
         );
     }
@@ -1608,7 +1617,7 @@ impl MatrixMcpService {
             // server-side key-backup pull in the background. Best-effort:
             // sessions in backup self-heal on the next read; sessions
             // that were never backed up stay opaque.
-            spawn_key_backup_pull_if_needed(&client, &room_id, &events);
+            spawn_key_backup_pull_if_needed(&self.key_backup_gate, &client, &room_id, &events);
             let count = events.len();
             let res = structured_result(&ReadRecentMessagesResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -1699,7 +1708,7 @@ impl MatrixMcpService {
             })?;
 
             let events = read_events_from_chunk(relations.chunk);
-            spawn_key_backup_pull_if_needed(&client, &room_id, &events);
+            spawn_key_backup_pull_if_needed(&self.key_backup_gate, &client, &room_id, &events);
             let count = events.len();
             let res = structured_result(&ReadThreadResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -2621,12 +2630,65 @@ impl MatrixMcpService {
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
             })?;
-            let backup_requested = client
-                .encryption()
-                .backups()
-                .download_room_keys_for_room(&room_id)
-                .await
-                .is_ok();
+            // Require the room to be currently Joined + encrypted before
+            // touching the key-backup endpoint. Without these checks
+            // (secscan #de85922e) a caller could trigger pulls for any
+            // room id in the SDK cache including left/banned rooms.
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            if room.state() != matrix_sdk::RoomState::Joined {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "not joined to {room_id} (current state: {:?})",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
+            if !room.encryption_state().is_encrypted() {
+                return Err(ErrorData::invalid_params(
+                    format!("{room_id} is not encrypted; nothing to pull from key backup"),
+                    None,
+                ));
+            }
+            // Per-room cooldown + global concurrency. Surface a clear
+            // rate-limited / cooldown rejection to the explicit tool
+            // caller instead of silently skipping (the auto-pull
+            // helper does silent-skip).
+            let permit = match self.key_backup_gate.try_acquire(&room_id) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "key-backup pull for {room_id} ran within the last \
+                             {}s; wait and retry",
+                            crate::key_backup_gate::COOLDOWN.as_secs()
+                        ),
+                        None,
+                    ));
+                }
+                Err(busy) => {
+                    return Err(ErrorData::new(
+                        rmcp::model::ErrorCode(audit::RATE_LIMITED_CODE),
+                        busy.to_string(),
+                        None,
+                    ));
+                }
+            };
+            let outcome = tokio::time::timeout(
+                crate::key_backup_gate::PER_PULL_TIMEOUT,
+                client
+                    .encryption()
+                    .backups()
+                    .download_room_keys_for_room(&room_id),
+            )
+            .await;
+            let backup_requested = matches!(outcome, Ok(Ok(())));
+            if backup_requested {
+                permit.record_success();
+            }
+            drop(permit);
             structured_result(&RequestRoomKeysResult {
                 room_id: room_id.to_string(),
                 backup_requested,
@@ -3944,17 +4006,38 @@ impl MatrixMcpService {
             // `use_cache = false` so we always get a fresh copy;
             // the SDK media cache is an optimisation for display,
             // not for this export path.
-            let bytes = client
-                .media()
-                .get_media_content(
+            //
+            // SSRF / OOM note: matrix-sdk 0.17 has no streaming media
+            // download — get_media_content returns the full Vec<u8>
+            // before we can re-check size. The pre-download check
+            // above uses event-supplied `info.size`, which Matrix
+            // protocol leaves attacker-influenced. We wrap the call in
+            // a generous timeout so a malicious sender can't combine
+            // "lie about info.size" + "stream a 100 GB body slowly"
+            // into an unbounded fetch that ties up the pod. The actual
+            // post-download size cap is still enforced below; the
+            // timeout just bounds the *time* an oversize download has
+            // to run before we abort and free the memory.
+            #[allow(clippy::duration_suboptimal_units)]
+            let download_timeout = Duration::from_secs(60);
+            let bytes = tokio::time::timeout(
+                download_timeout,
+                client.media().get_media_content(
                     &MediaRequestParameters {
                         source,
                         format: MediaFormat::File,
                     },
                     false,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ErrorData::internal_error(
+                    "media download timed out after 60s; aborting to bound memory use",
+                    None,
                 )
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("media download: {e}"), None))?;
+            })?
+            .map_err(|e| ErrorData::internal_error(format!("media download: {e}"), None))?;
 
             // Post-download size check — protects against missing or
             // incorrect info.size in the event.
@@ -4284,6 +4367,10 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let span = make_tool_span("send_bulk", &mxid_for_audit, None);
         let mut result = async {
+            // Pre-flight: one bucket-token charged just to enter the
+            // tool. Per-room charges happen below in the loop, so a
+            // single call can't fan out cheaper than `N` discrete
+            // send_text_message calls.
             self.rate_limit_check(&ctx, Category::Write)?;
             validate_text_message_body(&params.body)?;
             if params.room_ids.is_empty() {
@@ -4304,6 +4391,18 @@ impl MatrixMcpService {
             let client = self.client_for(&ctx).await?;
             let mut outcomes: Vec<SendBulkOutcome> = Vec::with_capacity(params.room_ids.len());
             for rid_str in &params.room_ids {
+                // Charge one write-token per actual room send. When the
+                // bucket runs dry mid-loop, remaining rooms are recorded
+                // as rate-limited outcomes and the call returns; no
+                // partial state is hidden from the caller.
+                if self.rate_limit_check(&ctx, Category::Write).is_err() {
+                    outcomes.push(SendBulkOutcome {
+                        room_id: rid_str.clone(),
+                        event_id: None,
+                        error: Some("rate_limited".to_owned()),
+                    });
+                    continue;
+                }
                 let outcome = match self.send_text_to_room(&client, rid_str, &params.body).await {
                     Ok(event_id) => SendBulkOutcome {
                         room_id: rid_str.clone(),
@@ -4395,6 +4494,15 @@ impl MatrixMcpService {
                         error: Some(format!(
                             "skipped: {member_count} joined members exceeds max_room_members {max_members}"
                         )),
+                    });
+                    continue;
+                }
+                // Charge one write-token per actual room send.
+                if self.rate_limit_check(&ctx, Category::Write).is_err() {
+                    outcomes.push(SendBulkOutcome {
+                        room_id: rid_str,
+                        event_id: None,
+                        error: Some("rate_limited".to_owned()),
                     });
                     continue;
                 }
@@ -4644,6 +4752,14 @@ impl MatrixMcpService {
             // Build the Criteria for the room_events search category.
             let mut criteria = search_events::v3::Criteria::new(params.query.clone());
             criteria.order_by = Some(search_events::v3::OrderBy::Rank);
+            // Push the cap upstream so Synapse paginates correctly. Without
+            // this, the homeserver's default pagination decides how many
+            // results to compute; the previous `.take(limit)` only bounded
+            // *our* serialization cost. With it, Synapse returns at most
+            // `limit` results, bounding upstream work too.
+            criteria.filter.limit = Some(matrix_sdk::ruma::UInt::from(
+                u32::try_from(limit).unwrap_or(u32::MAX),
+            ));
 
             // When a room_id is provided, scope the search to that room only.
             if let Some(ref rid_str) = params.room_id {
@@ -5813,23 +5929,37 @@ impl MatrixMcpService {
         expected_prefix: Option<&str>,
         default_mime: mime::Mime,
     ) -> Result<UploadedMedia, ErrorData> {
-        if !url.starts_with("https://") {
-            return Err(ErrorData::invalid_params(
-                "url must be HTTPS (http:// is rejected to prevent credential exposure over cleartext)",
-                None,
-            ));
-        }
+        // SSRF defence: validate the URL up-front, then disable
+        // reqwest's automatic redirect handling and re-validate each
+        // hop in [`fetch_with_validated_redirects`]. Without the
+        // post-redirect check, an attacker-controlled HTTPS host could
+        // 30x-redirect us to http://10.0.0.1/internal-secret or
+        // http://169.254.169.254/latest/meta-data/.
+        url_safety::validate_https_url(url)
+            .await
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+
         let http = reqwest::Client::builder()
             .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::limited(3))
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| ErrorData::internal_error(format!("build http client: {e}"), None))?;
+        let final_url = fetch_with_validated_redirects(&http, url, 3).await?;
         let response = http
-            .get(url)
+            .get(final_url.as_str())
             .send()
             .await
             .map_err(|e| ErrorData::internal_error(format!("fetch url: {e}"), None))?;
+        if !response.status().is_success() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "remote URL returned non-success status {}",
+                    response.status()
+                ),
+                None,
+            ));
+        }
         let ct = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -5867,7 +5997,8 @@ impl MatrixMcpService {
             .upload(&mime_type, bytes.to_vec(), None)
             .await
             .map_err(|e| ErrorData::internal_error(format!("media upload: {e}"), None))?;
-        let filename = url
+        let filename = final_url
+            .as_str()
             .split('/')
             .next_back()
             .and_then(|s| s.split('?').next())
@@ -5881,6 +6012,53 @@ impl MatrixMcpService {
             filename,
         })
     }
+}
+
+/// Follow up to `max_hops` HTTP redirects manually, validating each
+/// `Location` against the SSRF denylist before requesting it. Returns
+/// the final URL whose body is safe to fetch.
+///
+/// We use HEAD for the redirect probes so an attacker can't make us
+/// download a large body just to read a `Location` header. The body
+/// fetch in the caller uses GET on the validated final URL.
+async fn fetch_with_validated_redirects(
+    http: &reqwest::Client,
+    initial: &str,
+    max_hops: u32,
+) -> Result<reqwest::Url, ErrorData> {
+    let mut current = reqwest::Url::parse(initial)
+        .map_err(|e| ErrorData::invalid_params(format!("invalid url {initial}: {e}"), None))?;
+    for _ in 0..=max_hops {
+        let resp = http
+            .head(current.as_str())
+            .send()
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("HEAD {current}: {e}"), None))?;
+        let status = resp.status();
+        if !status.is_redirection() {
+            return Ok(current);
+        }
+        let Some(loc) = resp.headers().get(reqwest::header::LOCATION) else {
+            return Err(ErrorData::invalid_params(
+                format!("URL {current} returned {status} with no Location header"),
+                None,
+            ));
+        };
+        let loc_str = loc
+            .to_str()
+            .map_err(|e| ErrorData::invalid_params(format!("Location is not ASCII: {e}"), None))?;
+        let next = current.join(loc_str).map_err(|e| {
+            ErrorData::invalid_params(format!("invalid Location {loc_str}: {e}"), None)
+        })?;
+        url_safety::validate_https_url(next.as_str())
+            .await
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        current = next;
+    }
+    Err(ErrorData::invalid_params(
+        format!("redirect chain exceeded {max_hops} hops at {current}"),
+        None,
+    ))
 }
 
 /// Outcome of `upload_from_url`. The fields are everything the
@@ -6395,6 +6573,7 @@ pub fn token_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<AccessToken> {
 /// never backed up there's no in-protocol recovery and the response
 /// to the caller still surfaces the undecryptable status.
 fn spawn_key_backup_pull_if_needed(
+    gate: &crate::key_backup_gate::KeyBackupGate,
     client: &matrix_sdk::Client,
     room_id: &matrix_sdk::ruma::RoomId,
     events: &[ReadEvent],
@@ -6406,27 +6585,57 @@ fn spawn_key_backup_pull_if_needed(
     if undecryptable == 0 {
         return;
     }
+    // Per-room cooldown + global concurrency. Auto-pull is best-effort
+    // recovery for self-healing reads, so we silently skip when either
+    // bound is hit — the caller will see undecryptable status and can
+    // invoke `request_room_keys` explicitly to surface the rejection.
+    let permit = match gate.try_acquire(room_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::debug!(
+                %room_id,
+                undecryptable,
+                "skip auto key-backup pull: per-room cooldown active"
+            );
+            return;
+        }
+        Err(busy) => {
+            tracing::debug!(
+                %room_id,
+                undecryptable,
+                "skip auto key-backup pull: {busy}"
+            );
+            return;
+        }
+    };
     let client = client.clone();
     let room_id: OwnedRoomId = room_id.to_owned();
     tokio::spawn(async move {
-        match client
-            .encryption()
-            .backups()
-            .download_room_keys_for_room(&room_id)
-            .await
-        {
-            Ok(()) => tracing::debug!(
-                %room_id,
-                undecryptable,
-                "kicked off key-backup pull for undecryptable events"
-            ),
-            Err(e) => tracing::warn!(
+        let backups = client.encryption().backups();
+        let pull = backups.download_room_keys_for_room(&room_id);
+        match tokio::time::timeout(crate::key_backup_gate::PER_PULL_TIMEOUT, pull).await {
+            Ok(Ok(())) => {
+                permit.record_success();
+                tracing::debug!(
+                    %room_id,
+                    undecryptable,
+                    "kicked off key-backup pull for undecryptable events"
+                );
+            }
+            Ok(Err(e)) => tracing::warn!(
                 %room_id,
                 undecryptable,
                 error = %e,
                 "key-backup pull failed; undecryptable events stay undecryptable"
             ),
+            Err(_) => tracing::warn!(
+                %room_id,
+                undecryptable,
+                timeout_secs = crate::key_backup_gate::PER_PULL_TIMEOUT.as_secs(),
+                "key-backup pull timed out; aborting to free the gate permit"
+            ),
         }
+        drop(permit);
     });
 }
 
@@ -6444,8 +6653,13 @@ async fn emit_write_notice(
     room_id: Option<&str>,
 ) {
     if let Err(e) = result
-        && e.code.0 == audit::RATE_LIMITED_CODE
+        && (e.code.0 == audit::RATE_LIMITED_CODE || e.code.0 == audit::AUTH_EXPIRED_CODE)
     {
+        // Rate-limited: don't bother. Auth-expired: react_to_auth_expiry
+        // has just evicted the cached SDK client and dropped the MAS
+        // introspection cache; calling for_user here with the same
+        // (now-dead) bearer would restore_session the dead token onto a
+        // freshly built client, undoing the eviction. Skip.
         return;
     }
     let Some(id) = identity_from_ctx(ctx) else {

@@ -60,13 +60,18 @@ pub async fn bearer_auth(
             debug!(mxid = %identity.mxid, "authenticated request");
             audit::introspect(&token_hash, outcome::ACTIVE, started, Some(&identity.mxid));
             // Record last-used for the audit/introspect endpoint. IP comes
-            // from `X-Forwarded-For` (Traefik appends each hop; the leftmost
-            // value is the original client). Absent / unparseable header → None.
+            // from `X-Forwarded-For`, but only the entry **N positions from
+            // the right** where N is the number of trusted proxies in front
+            // of us — Traefik appends what it saw, so that entry is the
+            // real client IP. The leftmost entry can be set by any HTTP
+            // client and is therefore spoofable by an attacker holding a
+            // stolen bearer; never use it as an audit signal.
             let client_ip = last_used::parse_client_ip(
                 request
                     .headers()
                     .get("x-forwarded-for")
                     .and_then(|v| v.to_str().ok()),
+                state.config.trusted_proxy_hops,
             );
             state.last_used.record(&token_hash, client_ip);
             // Stash both the identity and the raw OAuth token on the request

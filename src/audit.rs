@@ -87,6 +87,14 @@ pub fn token_hash(token: &str) -> String {
 /// from other 5xx-ish failures.
 pub const RATE_LIMITED_CODE: i32 = -32029;
 
+/// JSON-RPC server-error code for "the matrix-mcp bearer token has
+/// expired or been revoked at the homeserver". Used by
+/// `react_to_auth_expiry` to mark the rewritten error so downstream
+/// audit helpers (notably `emit_write_notice`) can skip the
+/// for-user/restore-session round-trip that would otherwise re-cache
+/// the dead token.
+pub const AUTH_EXPIRED_CODE: i32 = -32028;
+
 #[must_use]
 pub const fn error_class(err: &ErrorData) -> &'static str {
     // `ErrorCode` is a thin newtype around `i32` — see rmcp's
@@ -99,6 +107,7 @@ pub const fn error_class(err: &ErrorData) -> &'static str {
         -32602 => "invalid_params",
         -32603 => "internal",
         RATE_LIMITED_CODE => "rate_limited",
+        AUTH_EXPIRED_CODE => "auth_expired",
         _ => "other",
     }
 }

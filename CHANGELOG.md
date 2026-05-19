@@ -6,6 +6,65 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Security (secscan Group B: rate-limit / SSRF / availability)
+- Per-identity initialize rate-limit: a new middleware on `/mcp` charges
+  one bucket-token per fresh-session POST keyed by bearer-hash AND MAS
+  subject. Refill period matches `session::SESSION_KEEP_ALIVE` (30 min)
+  so an attacker who has filled their slots can only open new ones at
+  the rate their existing ones idle out. Burst = 8 covers legitimate
+  Claude reconnect bursts. Closes secscan #83350ed0.
+- `send_bulk` + `send_broadcast` charge the write rate-limit per actual
+  room send (not once per call). Burst-rate is now identical to N
+  discrete `send_text_message` calls. Mid-loop denials appear as
+  per-room `rate_limited` outcomes. Closes secscan #885d2ecc.
+- SSRF defence (`src/url_safety.rs`): every URL-fetch tool
+  (`send_image_from_url`, `send_file`/`_audio`/`_video`, `me_set_avatar`,
+  `upload_media_from_url`) now resolves the host and refuses if any
+  resolved IP is non-publicly-routable (RFC1918, loopback, link-local
+  incl. 169.254.169.254, ULA, CGNAT, multicast, unspecified, IPv4-mapped
+  IPv6 of the above). reqwest's auto-redirect handling is disabled and
+  each `Location` is re-validated against the same denylist before
+  follow. Closes secscan #38b3701b, #bc9b30b0, #9ed16733.
+- `download_attachment` wraps the SDK `get_media_content` call in a
+  60-second timeout to bound the OOM blast-radius when event-supplied
+  `info.size` is missing or under-reports. The proper fix requires
+  upstream streaming media-download in matrix-sdk; this is the best
+  mitigation without forking the SDK. Closes secscan #6244d14c.
+- Room-key backup pulls go through a shared `KeyBackupGate`
+  (`src/key_backup_gate.rs`): per-room cooldown (5 min), global
+  concurrency cap (4), per-pull timeout (30 s). Applies to the
+  `request_room_keys` tool, the auto-pull helper, and the
+  `/setup/recover` loop. The explicit tool surfaces cooldown +
+  gate-busy as user-visible errors; the auto-pull helper silent-skips.
+  Closes secscan #de85922e, #e4797214.
+- `sync_watchdog` exits cleanly when matrix-sdk's background sync
+  reports `M_UNKNOWN_TOKEN` or `Token is not active` — no more
+  indefinite retry of permanent auth failures hammering Synapse.
+  Closes secscan #8141aba3.
+- `search_messages` pushes the result limit upstream via
+  `Criteria.filter.limit` so Synapse paginates at the cap instead of
+  paginating at its default and letting us truncate locally.
+  Closes secscan #8741a8de.
+- `/token/introspect` last_used.ip reads the trusted XFF position
+  instead of the spoofable leftmost. New env
+  `MATRIX_MCP_TRUSTED_PROXY_HOPS` (default 1, matches Traefik in front
+  in production). Closes secscan #37478d02.
+- `react_to_auth_expiry` tags rewritten errors with a stable
+  `AUTH_EXPIRED_CODE = -32028`; `emit_write_notice` now skips the
+  `for_user` round-trip for that code so a write-tool path can't
+  re-cache the just-evicted client with the same (still-expired)
+  bearer. Closes secscan #353a2b4e.
+- `MatrixClientCache` switches to per-MXID `tokio::sync::OnceCell`:
+  the global `RwLock` is held only for the `HashMap` lookup, the SDK
+  build runs **off-lock** inside each cell. A first build for MXID A
+  no longer blocks unrelated calls for MXID B. Closes secscan #65c9b8f0.
+
+### Changed
+- New env `MATRIX_MCP_TRUSTED_PROXY_HOPS` (default `1`): number of
+  trusted proxies in front of matrix-mcp. Used to pick the real client
+  IP out of `X-Forwarded-For`. Set to `0` in dev / direct-hosted
+  setups; raise to `2`+ behind multiple trusted hops.
+
 ### Security (secscan Group A: validation/clamp fixes)
 - `audit_room::emit_notice` drops the `target_room` field from the
   user-visible audit-room notice body when the raw `room_id` string
