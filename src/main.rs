@@ -28,6 +28,7 @@ mod session;
 mod setup;
 mod telemetry;
 mod token_introspect;
+mod url_safety;
 
 use std::sync::Arc;
 

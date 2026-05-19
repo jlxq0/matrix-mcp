@@ -52,6 +52,7 @@ use crate::content_sandbox;
 use crate::mas::AuthenticatedIdentity;
 use crate::matrix_client::MatrixClientCache;
 use crate::rate_limit::{Category, Limiter};
+use crate::url_safety;
 
 /// The MCP service. Per-session state is a reference to the shared
 /// `MatrixClientCache`. The per-request identity + token come from
@@ -5846,23 +5847,34 @@ impl MatrixMcpService {
         expected_prefix: Option<&str>,
         default_mime: mime::Mime,
     ) -> Result<UploadedMedia, ErrorData> {
-        if !url.starts_with("https://") {
-            return Err(ErrorData::invalid_params(
-                "url must be HTTPS (http:// is rejected to prevent credential exposure over cleartext)",
-                None,
-            ));
-        }
+        // SSRF defence: validate the URL up-front, then disable
+        // reqwest's automatic redirect handling and re-validate each
+        // hop in [`fetch_with_validated_redirects`]. Without the
+        // post-redirect check, an attacker-controlled HTTPS host could
+        // 30x-redirect us to http://10.0.0.1/internal-secret or
+        // http://169.254.169.254/latest/meta-data/.
+        url_safety::validate_https_url(url)
+            .await
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+
         let http = reqwest::Client::builder()
             .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::limited(3))
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| ErrorData::internal_error(format!("build http client: {e}"), None))?;
+        let final_url = fetch_with_validated_redirects(&http, url, 3).await?;
         let response = http
-            .get(url)
+            .get(final_url.as_str())
             .send()
             .await
             .map_err(|e| ErrorData::internal_error(format!("fetch url: {e}"), None))?;
+        if !response.status().is_success() {
+            return Err(ErrorData::invalid_params(
+                format!("remote URL returned non-success status {}", response.status()),
+                None,
+            ));
+        }
         let ct = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -5900,7 +5912,8 @@ impl MatrixMcpService {
             .upload(&mime_type, bytes.to_vec(), None)
             .await
             .map_err(|e| ErrorData::internal_error(format!("media upload: {e}"), None))?;
-        let filename = url
+        let filename = final_url
+            .as_str()
             .split('/')
             .next_back()
             .and_then(|s| s.split('?').next())
@@ -5914,6 +5927,53 @@ impl MatrixMcpService {
             filename,
         })
     }
+}
+
+/// Follow up to `max_hops` HTTP redirects manually, validating each
+/// `Location` against the SSRF denylist before requesting it. Returns
+/// the final URL whose body is safe to fetch.
+///
+/// We use HEAD for the redirect probes so an attacker can't make us
+/// download a large body just to read a `Location` header. The body
+/// fetch in the caller uses GET on the validated final URL.
+async fn fetch_with_validated_redirects(
+    http: &reqwest::Client,
+    initial: &str,
+    max_hops: u32,
+) -> Result<reqwest::Url, ErrorData> {
+    let mut current = reqwest::Url::parse(initial)
+        .map_err(|e| ErrorData::invalid_params(format!("invalid url {initial}: {e}"), None))?;
+    for _ in 0..=max_hops {
+        let resp = http
+            .head(current.as_str())
+            .send()
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("HEAD {current}: {e}"), None))?;
+        let status = resp.status();
+        if !status.is_redirection() {
+            return Ok(current);
+        }
+        let Some(loc) = resp.headers().get(reqwest::header::LOCATION) else {
+            return Err(ErrorData::invalid_params(
+                format!("URL {current} returned {status} with no Location header"),
+                None,
+            ));
+        };
+        let loc_str = loc
+            .to_str()
+            .map_err(|e| ErrorData::invalid_params(format!("Location is not ASCII: {e}"), None))?;
+        let next = current
+            .join(loc_str)
+            .map_err(|e| ErrorData::invalid_params(format!("invalid Location {loc_str}: {e}"), None))?;
+        url_safety::validate_https_url(next.as_str())
+            .await
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        current = next;
+    }
+    Err(ErrorData::invalid_params(
+        format!("redirect chain exceeded {max_hops} hops at {current}"),
+        None,
+    ))
 }
 
 /// Outcome of `upload_from_url`. The fields are everything the
