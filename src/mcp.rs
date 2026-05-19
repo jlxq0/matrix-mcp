@@ -137,11 +137,13 @@ impl MatrixMcpService {
             mxid = mxid.as_deref().unwrap_or("<unknown>"),
             "Synapse reported M_UNKNOWN_TOKEN; evicted SDK client + introspect caches"
         );
-        *err = ErrorData::invalid_request(
+        *err = ErrorData::new(
+            rmcp::model::ErrorCode(audit::AUTH_EXPIRED_CODE),
             "Your matrix-mcp OAuth session has expired or been revoked. \
              In claude.ai → Connectors → Matrix, click Disconnect and then \
              Connect again to get a fresh session, then retry. Your \
-             cross-signing identity is preserved — no need to re-run /setup.",
+             cross-signing identity is preserved — no need to re-run /setup."
+                .to_owned(),
             None,
         );
     }
@@ -6450,8 +6452,13 @@ async fn emit_write_notice(
     room_id: Option<&str>,
 ) {
     if let Err(e) = result
-        && e.code.0 == audit::RATE_LIMITED_CODE
+        && (e.code.0 == audit::RATE_LIMITED_CODE || e.code.0 == audit::AUTH_EXPIRED_CODE)
     {
+        // Rate-limited: don't bother. Auth-expired: react_to_auth_expiry
+        // has just evicted the cached SDK client and dropped the MAS
+        // introspection cache; calling for_user here with the same
+        // (now-dead) bearer would restore_session the dead token onto a
+        // freshly built client, undoing the eviction. Skip.
         return;
     }
     let Some(id) = identity_from_ctx(ctx) else {
