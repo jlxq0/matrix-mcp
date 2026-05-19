@@ -20,13 +20,15 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use matrix_sdk::Room;
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
-use matrix_sdk::room::{IncludeRelations, MessagesOptions, RelationsOptions};
+use matrix_sdk::room::{IncludeRelations, ListThreadsOptions, MessagesOptions, RelationsOptions};
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::OwnedMxcUri;
 use matrix_sdk::ruma::OwnedRoomId;
 use matrix_sdk::ruma::UserId;
 use matrix_sdk::ruma::api::Direction;
 use matrix_sdk::ruma::api::client::search::search_events;
+use matrix_sdk::ruma::api::client::threads::get_threads::v1::IncludeThreads;
+use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType};
 use matrix_sdk::ruma::events::relation::RelationType;
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::room::message::{
@@ -831,6 +833,120 @@ pub struct ListRecentActivityResult {
     /// Lets the caller distinguish "no activity matched" from
     /// "you joined no rooms".
     pub total_joined_rooms: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Receipts + threads (PR-B)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetUserReceiptsParams {
+    /// Matrix room id whose receipts you want to load.
+    pub room_id: String,
+    /// MXIDs to look up. Defaults to `[caller]` if omitted, which
+    /// is the common "did *I* read up to X" question. Pass an
+    /// explicit list (e.g. `["@bob:example.com"]`) to ask
+    /// about other room members.
+    #[serde(default)]
+    pub user_ids: Option<Vec<String>>,
+}
+
+/// One user's most recent public read receipt in a room.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct UserReceiptInfo {
+    pub user_id: String,
+    /// Event id the user has most recently sent a read receipt for.
+    /// `null` if the user has no receipt in this room (e.g. they
+    /// joined and never read anything, or read receipts are
+    /// disabled).
+    pub event_id: Option<String>,
+    /// `origin_server_ts` (ms since epoch) of the receipt itself
+    /// (i.e. when the user emitted it). `null` when MAS / Synapse
+    /// didn't record a timestamp.
+    pub ts_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GetUserReceiptsResult {
+    pub room_id: String,
+    pub receipts: Vec<UserReceiptInfo>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetEventReceiptsParams {
+    pub room_id: String,
+    /// The event id whose receipts you want to list.
+    pub event_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EventReceiptInfo {
+    pub user_id: String,
+    pub ts_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GetEventReceiptsResult {
+    pub room_id: String,
+    pub event_id: String,
+    /// MXIDs (with timestamps) of room members who have a public
+    /// read receipt pointing at this event. Empty when nobody has
+    /// signalled having read up to it. Private receipts are NOT
+    /// included — only the caller could ever see those for
+    /// themselves, and Synapse only exposes public ones to
+    /// general-purpose `/read_markers` queries.
+    pub readers: Vec<EventReceiptInfo>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListThreadsParams {
+    pub room_id: String,
+    /// Maximum number of threads to return. Default 25, capped at
+    /// [`MAX_THREADS_LIMIT`] (100).
+    #[serde(default = "default_threads_limit")]
+    pub limit: u32,
+    /// When `true`, only return threads the caller has participated
+    /// in. Default `false` (return all thread roots).
+    #[serde(default)]
+    pub only_participated: bool,
+}
+
+const fn default_threads_limit() -> u32 {
+    25
+}
+
+const MAX_THREADS_LIMIT: u32 = 100;
+
+/// One thread root entry from `list_threads_in_room`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ThreadRootInfo {
+    /// Event id of the message that anchors this thread (the
+    /// "root"). Pass to `read_thread` to fetch the replies.
+    pub root_event_id: Option<String>,
+    /// `origin_server_ts` of the root, ms since epoch.
+    pub root_origin_server_ts: Option<u64>,
+    /// MXID who sent the root message.
+    pub root_sender: Option<String>,
+    /// Plaintext body of the root, sandbox-wrapped via
+    /// [`crate::content_sandbox`] so the AI doesn't treat it as
+    /// instructions. `null` for non-message roots (rare) or
+    /// undecryptable events.
+    pub root_untrusted_body: Option<String>,
+    /// Heuristic prompt-injection flag on the root body.
+    pub root_suspicious: bool,
+    /// Reply count surfaced by Synapse's bundled
+    /// `m.relations.m.thread.count`, when available.
+    pub reply_count: Option<u64>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListThreadsResult {
+    pub room_id: String,
+    pub threads: Vec<ThreadRootInfo>,
+    /// Opaque pagination token from Synapse. When present, pass
+    /// nothing for now (matrix-mcp doesn't expose pagination on
+    /// this tool yet) — surfaced for future extension.
+    pub prev_batch_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2142,6 +2258,313 @@ impl MatrixMcpService {
             Some(&room_id_for_audit),
             started,
             None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Return the most recent public read receipts for one or more
+    /// users in a room. Pass `user_ids = ["@alice:server", ...]` to
+    /// look up specific members; omit `user_ids` for the
+    /// caller-only case ("did *I* read up to X").
+    ///
+    /// Use this with the room's latest event id (from
+    /// `list_recent_activity` or `read_recent_messages`) to detect
+    /// "I saw this but never replied" — the core "ball in my
+    /// court" signal that no other tool provides.
+    #[tool(
+        description = "Fetch each user's most recent public read receipt in a room. \
+                       Defaults to the caller. Combine with `list_recent_activity`'s \
+                       latest_event_id to detect 'I read this but forgot to reply'.",
+        annotations(title = "Get user receipts", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn get_user_receipts(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<GetUserReceiptsParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let identity = identity_from_ctx(&ctx);
+        let mxid_for_audit = identity
+            .as_ref()
+            .map_or_else(String::new, |i| i.mxid.clone());
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "get_user_receipts",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
+        let (mut result, count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            // Default to the caller. The owned mxid is parsed below.
+            let raw_user_ids: Vec<String> = params.user_ids.unwrap_or_else(|| {
+                identity
+                    .as_ref()
+                    .map(|i| vec![i.mxid.clone()])
+                    .unwrap_or_default()
+            });
+            let mut receipts: Vec<UserReceiptInfo> = Vec::with_capacity(raw_user_ids.len());
+            for raw in raw_user_ids {
+                let user_id = match UserId::parse(&raw) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        return Err(ErrorData::invalid_params(
+                            format!("invalid user_id {raw}: {e}"),
+                            None,
+                        ));
+                    }
+                };
+                let entry = room
+                    .load_user_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, &user_id)
+                    .await
+                    .map_err(|e| {
+                        ErrorData::internal_error(
+                            format!("load_user_receipt for {user_id}: {e}"),
+                            None,
+                        )
+                    })?;
+                let (event_id, ts_unix_ms) = match entry {
+                    Some((eid, receipt)) => (
+                        Some(eid.to_string()),
+                        receipt.ts.map(|ts| u64::from(ts.get())),
+                    ),
+                    None => (None, None),
+                };
+                receipts.push(UserReceiptInfo {
+                    user_id: user_id.to_string(),
+                    event_id,
+                    ts_unix_ms,
+                });
+            }
+            let count = receipts.len();
+            let res = structured_result(&GetUserReceiptsResult {
+                room_id: room_id.to_string(),
+                receipts,
+            });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .instrument(span.clone())
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "get_user_receipts",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(count),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Return every public read receipt pointing at a specific
+    /// event in a room. Inverse of `get_user_receipts`: instead of
+    /// "what has this user read", it's "who has read this".
+    ///
+    /// Useful when you know an event id and want to see if the
+    /// recipient has acknowledged it — e.g. "did Hatim ever read
+    /// that message I sent him three days ago?".
+    #[tool(
+        description = "List every public read receipt for a specific event id. \
+                       Inverse of `get_user_receipts`. Use to confirm whether a \
+                       specific recipient has read a specific message.",
+        annotations(title = "Get event receipts", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn get_event_receipts(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<GetEventReceiptsParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "get_event_receipts",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
+        let (mut result, count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let event_id: OwnedEventId = params.event_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid event_id {}: {e}", params.event_id),
+                    None,
+                )
+            })?;
+            let pairs = room
+                .load_event_receipts(ReceiptType::Read, ReceiptThread::Unthreaded, &event_id)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("load_event_receipts: {e}"), None)
+                })?;
+            let readers: Vec<EventReceiptInfo> = pairs
+                .into_iter()
+                .map(|(user_id, receipt)| EventReceiptInfo {
+                    user_id: user_id.to_string(),
+                    ts_unix_ms: receipt.ts.map(|ts| u64::from(ts.get())),
+                })
+                .collect();
+            let count = readers.len();
+            let res = structured_result(&GetEventReceiptsResult {
+                room_id: room_id.to_string(),
+                event_id: event_id.to_string(),
+                readers,
+            });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .instrument(span.clone())
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "get_event_receipts",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(count),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// List threads in a Matrix room (MSC3856 `/threads`). Returns
+    /// thread roots, newest-first, with the same envelope-only
+    /// metadata + sandbox wrap as `read_recent_messages`. Each
+    /// entry's `root_event_id` is what you'd pass to `read_thread`
+    /// to fetch the actual reply chain.
+    #[tool(
+        description = "List threads in a room (newest first). Each entry includes the \
+                       thread root's event id, sender, timestamp, and a sandbox-wrapped \
+                       body so the caller can pick which threads to dive into via \
+                       `read_thread`. Optional `only_participated` filter restricts to \
+                       threads the caller has replied in.",
+        annotations(title = "List threads", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn list_threads_in_room(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ListThreadsParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "list_threads_in_room",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
+        let (mut result, thread_count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let limit = params.limit.clamp(1, MAX_THREADS_LIMIT);
+            let opts = ListThreadsOptions {
+                include_threads: if params.only_participated {
+                    IncludeThreads::Participated
+                } else {
+                    IncludeThreads::All
+                },
+                limit: Some(limit.into()),
+                ..Default::default()
+            };
+            let roots = room
+                .list_threads(opts)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("list_threads: {e}"), None))?;
+
+            let threads: Vec<ThreadRootInfo> = roots
+                .chunk
+                .into_iter()
+                .map(|tle| {
+                    let value: serde_json::Value = tle
+                        .raw()
+                        .deserialize_as::<serde_json::Value>()
+                        .unwrap_or(serde_json::Value::Null);
+                    let root_event_id = value
+                        .get("event_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    let root_origin_server_ts = value
+                        .get("origin_server_ts")
+                        .and_then(serde_json::Value::as_u64);
+                    let root_sender = value
+                        .get("sender")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    let reply_count = value
+                        .get("unsigned")
+                        .and_then(|u| u.get("m.relations"))
+                        .and_then(|r| r.get("m.thread"))
+                        .and_then(|t| t.get("count"))
+                        .and_then(serde_json::Value::as_u64);
+                    let body_text = value
+                        .get("content")
+                        .and_then(|c| c.get("body"))
+                        .and_then(|v| v.as_str());
+                    let (root_untrusted_body, root_suspicious) =
+                        body_text.map_or((None, false), |b| {
+                            let v = content_sandbox::evaluate(
+                                Some(room_id.as_str()),
+                                root_sender.as_deref(),
+                                root_event_id.as_deref(),
+                                b,
+                            );
+                            (Some(v.wrapped), v.suspicious)
+                        });
+                    ThreadRootInfo {
+                        root_event_id,
+                        root_origin_server_ts,
+                        root_sender,
+                        root_untrusted_body,
+                        root_suspicious,
+                        reply_count,
+                    }
+                })
+                .collect();
+            let count = threads.len();
+            let res = structured_result(&ListThreadsResult {
+                room_id: room_id.to_string(),
+                threads,
+                prev_batch_token: roots.prev_batch_token,
+            });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .instrument(span.clone())
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "list_threads_in_room",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(thread_count),
             &span,
             &result,
         );

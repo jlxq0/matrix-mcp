@@ -6,6 +6,24 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added (PR-B: receipts + threads)
+- `get_user_receipts(room_id, user_ids?)` tool. Returns each named
+  user's most recent public read receipt in a room (default:
+  caller). The "ball in my court" primitive: combine the room's
+  `latest_event_id` from `list_recent_activity` with the caller's
+  own receipt to detect "I read this but never replied". Tool
+  count 43 → 44.
+- `get_event_receipts(room_id, event_id)` tool. Inverse of the
+  above: returns every public read receipt pointing at a specific
+  event. Use to confirm whether a specific recipient has read a
+  specific message. Tool count 44 → 45.
+- `list_threads_in_room(room_id, limit?, only_participated?)`
+  tool. Wraps the MSC3856 `/threads` endpoint and returns thread
+  roots newest-first, with the same envelope-only metadata and
+  `untrusted_body` sandbox wrap as `read_recent_messages`. Each
+  entry's `root_event_id` feeds straight into `read_thread` to
+  fetch the actual reply chain. Tool count 45 → 46.
+
 ### Added
 - `list_recent_activity` tool. Returns every joined room sorted by
   `latest_origin_server_ts` descending, with optional `since_unix_ms`
