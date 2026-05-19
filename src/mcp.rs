@@ -1861,6 +1861,28 @@ impl MatrixMcpService {
                         None,
                     )
                 })?;
+            // Matrix homeservers authorize an m.replace as an ordinary
+            // m.room.message send; the spec-required check that
+            // `m.relates_to.event_id`'s sender matches the editor is a
+            // client-side responsibility. Standards-compliant clients
+            // (Element et al.) ignore replacements whose sender differs
+            // from the original event's sender — but buggy clients,
+            // bridges, bots, and downstream message consumers do not.
+            // Refuse to send the edit if the caller is not the original
+            // sender, so matrix-mcp never produces a forged-edit event
+            // that those consumers might honour.
+            let caller_user_id = client.user_id().ok_or_else(|| {
+                ErrorData::internal_error("matrix client has no user_id", None)
+            })?;
+            if original.sender != caller_user_id {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "cannot edit event {event_id}: original sender is {} but caller is {}",
+                        original.sender, caller_user_id
+                    ),
+                    None,
+                ));
+            }
             let new_content = RoomMessageEventContent::text_markdown(&params.new_body)
                 .make_replacement(&original);
             let response = room
