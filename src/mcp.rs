@@ -1609,6 +1609,19 @@ impl MatrixMcpService {
             let room = client.get_room(&room_id).ok_or_else(|| {
                 ErrorData::invalid_params(format!("not joined to {room_id}"), None)
             })?;
+            // get_room() returns any room known to the SDK cache (invited,
+            // left, knocked, banned) — not only joined rooms. Require
+            // Joined to match the tool description and the behaviour of
+            // sibling read tools (room_info, etc.).
+            if room.state() != matrix_sdk::RoomState::Joined {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "not joined to {room_id} (current state: {:?})",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
             let root_event_id: OwnedEventId = params.root_event_id.parse().map_err(|e| {
                 ErrorData::invalid_params(
                     format!("invalid root_event_id {}: {e}", params.root_event_id),
