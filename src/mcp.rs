@@ -765,6 +765,12 @@ pub struct UnreadRoomSummary {
     /// call invite/notify, knock state). May be `null` if the room
     /// has no such event cached.
     pub latest_event_id: Option<String>,
+    /// Matrix event type of `latest_event_id` (e.g. `m.room.message`,
+    /// `m.sticker`, `m.room.encrypted`, `m.poll.start`,
+    /// `m.call.invite`). `null` when no latest event is cached. Use
+    /// to filter out non-chat noise like poll-ends and call invites
+    /// when scanning for "real" conversation activity.
+    pub latest_event_type: Option<String>,
     /// MXID of the sender of `latest_event_id`.
     pub latest_sender: Option<String>,
     /// `origin_server_ts` (ms since epoch) of the latest event. Used
@@ -784,6 +790,15 @@ pub struct RecentActivityRoom {
     /// Latest "interesting" event id per the SDK's `LatestEvents`
     /// subsystem. `null` for rooms with no cached activity.
     pub latest_event_id: Option<String>,
+    /// Matrix event type of `latest_event_id` (e.g. `m.room.message`,
+    /// `m.sticker`, `m.room.encrypted`, `m.poll.start`,
+    /// `m.call.invite`). `null` when no latest event is cached. The
+    /// SDK's preview filter already excludes joins / avatar changes
+    /// / reactions / redactions, so this is one of a small set of
+    /// "preview-worthy" types — useful for distinguishing real chat
+    /// (`m.room.message`, `m.sticker`) from non-chat signals
+    /// (`m.call.*`, `m.poll.*`) when the caller wants the former.
+    pub latest_event_type: Option<String>,
     /// MXID of `latest_event_id`'s sender.
     pub latest_sender: Option<String>,
     /// `origin_server_ts` (ms since epoch) of the latest event.
@@ -814,6 +829,15 @@ pub struct ListRecentActivityParams {
     /// Default `false`.
     #[serde(default)]
     pub encrypted_only: bool,
+    /// When `true`, drop rooms whose latest event isn't a real chat
+    /// message — i.e. only keep `m.room.message`, `m.sticker`, and
+    /// `m.room.encrypted` (encrypted-may-be-a-message). Filters out
+    /// `m.call.*` (call invites/notifies) and `m.poll.*` (poll
+    /// lifecycle), which are usually not what the caller means when
+    /// asking "what conversations have been active". Default
+    /// `false` — opt-in so the existing behaviour stays stable.
+    #[serde(default)]
+    pub message_events_only: bool,
 }
 
 const fn default_recent_activity_limit() -> u32 {
@@ -965,6 +989,34 @@ pub struct RequestRoomKeysResult {
     /// to start) — in that case there's no recovery path; the
     /// missing sessions are lost to this device.
     pub backup_requested: bool,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct GetUnreadSummaryParams {
+    /// When `true`, drop rooms whose latest event isn't a real chat
+    /// message. See `ListRecentActivityParams::message_events_only`
+    /// for the exact accepted set. Default `false` so callers that
+    /// don't know about the flag keep getting the old behaviour.
+    #[serde(default)]
+    pub message_events_only: bool,
+}
+
+/// Predicate used by the `message_events_only` filter on
+/// `list_recent_activity` and `get_unread_summary`. Returns `true`
+/// for event types that represent real chat content; `false` for
+/// call invites, poll lifecycle, and anything else the SDK's
+/// preview filter happens to surface as "latest".
+///
+/// `m.room.encrypted` passes here because we can't tell if the
+/// decrypted body is a message without decrypting — being permissive
+/// is safer than dropping potentially-relevant rooms. The
+/// auto-backup-pull on the read path will eventually fill in the
+/// blanks for missing session keys.
+fn is_chat_message_type(event_type: Option<&str>) -> bool {
+    matches!(
+        event_type,
+        Some("m.room.message" | "m.sticker" | "m.room.encrypted")
+    )
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -1961,16 +2013,24 @@ impl MatrixMcpService {
 
     /// Return a summary of rooms with unread messages, sorted by latest
     /// activity. Each entry includes unread counts, the latest event
-    /// preview (id + sender + display name + timestamp), and whether
-    /// the room is encrypted.
+    /// preview (id + sender + type + timestamp), and whether the room
+    /// is encrypted.
+    ///
+    /// Setting `message_events_only=true` drops rooms whose latest
+    /// event isn't a real chat message (filters out call invites,
+    /// poll lifecycle, etc.). Useful when scanning for "real
+    /// conversations" vs ambient noise.
     #[tool(
-        description = "Summarise rooms with unread messages, sorted by latest activity.",
+        description = "Summarise rooms with unread messages, sorted by latest activity. \
+                       Pass message_events_only=true to drop rooms whose latest event is a \
+                       call invite or poll lifecycle rather than a real message.",
         annotations(title = "Unread summary", read_only_hint = true)
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn get_unread_summary(
         &self,
         ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<GetUnreadSummaryParams>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
@@ -2017,23 +2077,31 @@ impl MatrixMcpService {
                     }
                     // `latest_event()` returns `LatestEventValue` (an
                     // enum, not Option). `event_id()`, `timestamp()`,
-                    // and the parsed sender come out of the
+                    // and the parsed sender/type come out of the
                     // matching `Remote(TimelineEvent)` variant.
                     let latest = room.latest_event();
                     let latest_event_id = latest.event_id().map(|id| id.to_string());
                     let latest_origin_server_ts = latest.timestamp().map(|ts| ts.get().into());
-                    let latest_sender =
+                    let (latest_sender, latest_event_type) =
                         if let matrix_sdk::latest_events::LatestEventValue::Remote(ref ev) = latest
                         {
-                            ev.raw()
-                                .deserialize_as::<serde_json::Value>()
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("sender").and_then(|s| s.as_str()).map(str::to_owned)
-                                })
+                            ev.raw().deserialize_as::<serde_json::Value>().ok().map_or(
+                                (None, None),
+                                |v| {
+                                    (
+                                        v.get("sender").and_then(|s| s.as_str()).map(str::to_owned),
+                                        v.get("type").and_then(|s| s.as_str()).map(str::to_owned),
+                                    )
+                                },
+                            )
                         } else {
-                            None
+                            (None, None)
                         };
+                    if params.message_events_only
+                        && !is_chat_message_type(latest_event_type.as_deref())
+                    {
+                        return None;
+                    }
                     Some(UnreadRoomSummary {
                         room_id: room.room_id().to_string(),
                         display_name: room.cached_display_name().map(|n| n.to_string()),
@@ -2042,6 +2110,7 @@ impl MatrixMcpService {
                         unread_notifications,
                         unread_mentions,
                         latest_event_id,
+                        latest_event_type,
                         latest_sender,
                         latest_origin_server_ts,
                     })
@@ -2126,25 +2195,36 @@ impl MatrixMcpService {
                     {
                         return None;
                     }
-                    // Same parse pattern as `get_unread_summary`.
-                    let latest_sender =
+                    // Same parse pattern as `get_unread_summary`. Both
+                    // sender and event type come out of the
+                    // `LatestEventValue::Remote(TimelineEvent)` raw JSON.
+                    let (latest_sender, latest_event_type) =
                         if let matrix_sdk::latest_events::LatestEventValue::Remote(ref ev) = latest
                         {
-                            ev.raw()
-                                .deserialize_as::<serde_json::Value>()
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("sender").and_then(|s| s.as_str()).map(str::to_owned)
-                                })
+                            ev.raw().deserialize_as::<serde_json::Value>().ok().map_or(
+                                (None, None),
+                                |v| {
+                                    (
+                                        v.get("sender").and_then(|s| s.as_str()).map(str::to_owned),
+                                        v.get("type").and_then(|s| s.as_str()).map(str::to_owned),
+                                    )
+                                },
+                            )
                         } else {
-                            None
+                            (None, None)
                         };
+                    if params.message_events_only
+                        && !is_chat_message_type(latest_event_type.as_deref())
+                    {
+                        return None;
+                    }
                     let server = room.unread_notification_counts();
                     Some(RecentActivityRoom {
                         room_id: room.room_id().to_string(),
                         display_name: room.cached_display_name().map(|n| n.to_string()),
                         encrypted: room.encryption_state().is_encrypted(),
                         latest_event_id,
+                        latest_event_type,
                         latest_sender,
                         latest_origin_server_ts,
                         unread_notifications: server.notification_count,

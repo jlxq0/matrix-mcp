@@ -6,6 +6,22 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added (latest-event differentiation)
+- `latest_event_type` field on `RecentActivityRoom` (`list_recent_activity`)
+  and `UnreadRoomSummary` (`get_unread_summary`). The Matrix event type
+  of the room's "latest interesting" event, e.g. `m.room.message`,
+  `m.sticker`, `m.room.encrypted`, `m.poll.start`, `m.call.invite`.
+  Lets the caller tell real chat apart from poll/call/encrypted-unknown
+  noise without an extra read.
+- `message_events_only: bool` parameter on both tools (default `false`
+  for back-compat). When `true`, rooms whose latest event is not in
+  `{m.room.message, m.sticker, m.room.encrypted}` are dropped from
+  the response. Filters out call invites and poll lifecycle, the
+  most common non-chat-but-still-"latest" events. Encrypted events
+  are preserved because we can't tell their decrypted type without
+  decrypting — being permissive is safer than hiding rooms where the
+  caller might have a real message they can't see.
+
 ### Added (PR-B: receipts + threads)
 - `get_user_receipts(room_id, user_ids?)` tool. Returns each named
   user's most recent public read receipt in a room (default:
