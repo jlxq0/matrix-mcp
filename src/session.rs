@@ -113,7 +113,7 @@ impl From<CappedSessionError> for std::io::Error {
 /// initialize requests could each read `count = MAX_SESSIONS - 1`,
 /// each see room, and each create a session — overshooting the cap
 /// by up to N. The gate adds zero contention on the read-heavy
-/// session-lookup paths (has_session, accept_message, etc.) because
+/// session-lookup paths (`has_session`, `accept_message`, etc.) because
 /// they do not take it.
 pub struct CappedSessionManager {
     inner: LocalSessionManager,
