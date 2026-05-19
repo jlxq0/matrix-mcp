@@ -44,15 +44,15 @@ backing store for the SDK is not supported upstream.
 ### Decision
 
 Use SQLite files on a PVC. Each user gets their own directory under
-`MATRIX_MCP_STORE_DIR`. Longhorn backs the PVC on Gruyere.
+`MATRIX_MCP_STORE_DIR`.
 
 ### Consequences
 
 - Simple: no separate DB to provision or migrate.
 - Single-replica only (see ADR-04).
-- PVC is ephemeral by design (see `gruyere_state_lives_in_r2_or_postgres`
-  memory note) – if the PVC is lost, users re-run /setup. Acceptable
-  because key backup can restore history.
+- PVC is treated as ephemeral by design — if the PVC is lost, users
+  re-run /setup. Acceptable because Matrix Secret Storage key backup
+  can restore history.
 
 ---
 

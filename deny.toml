@@ -15,7 +15,10 @@ wildcards = "deny"
 
 [licenses]
 version = 2
-# Permissive licenses + our own AGPL-3.0. Add to this list deliberately.
+# Permissive licenses only. Add to this list deliberately. matrix-mcp
+# itself is MIT-licensed; allowing strong-copyleft (AGPL/GPL) deps
+# would force the whole crate into the same posture, which we don't
+# want for a permissive project.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -35,8 +38,6 @@ allow = [
     # for our use case: attribution required, no patent grant claims, no
     # share-alike. https://cdla.dev/permissive-2-0/
     "CDLA-Permissive-2.0",
-    "AGPL-3.0",
-    "AGPL-3.0-or-later",
 ]
 confidence-threshold = 0.8
 

@@ -123,8 +123,9 @@ impl LastUsedTracker {
 /// Instead, count `trusted_proxy_hops` entries in from the right. Each
 /// trusted proxy on the path is expected to *append* the IP it saw
 /// when the request arrived at it; the rightmost N entries are
-/// therefore the ones we trust. The defaults assume exactly one trusted
-/// proxy (the Gruyere Traefik gateway).
+/// therefore the ones we trust. The default of 1 trusted proxy assumes
+/// a typical "ingress (Traefik / nginx / etc.) in front of the matrix-mcp
+/// pod" deployment; override via `MATRIX_MCP_TRUSTED_PROXY_HOPS`.
 ///
 /// Returns `None` when the header is absent, has fewer entries than
 /// the trusted-hops count, or contains no parseable IP at the trusted

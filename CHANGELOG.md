@@ -6,6 +6,25 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Changed
+- Relicensed from AGPL-3.0-or-later to **MIT**. matrix-mcp was a
+  single-author personal project from the start; MIT matches the
+  "here's the source, do what you want with it" posture more
+  honestly than the network-copyleft AGPL. `deny.toml` updated to
+  drop AGPL from the allow-list (the strong-copyleft viral effect
+  was the whole reason it was there).
+- README rewritten to be generic — tool list updated from "19 tools"
+  (accurate around v0.1.x) to the current ~58, with a forward-facing
+  pointer to the canonical Forgejo repo and the GitHub push-mirror.
+- `docs/api-reference.md` header honest about coverage: it documents
+  a subset; `tools/list` against the running server is the source of
+  truth for the complete current set.
+- `docs/installation.md` and `docs/decisions.md` generalized — the
+  reference Kubernetes deployment is described in platform-agnostic
+  terms; the operator's specific choices (ExternalSecrets +
+  1Password Connect + Traefik Gateway API + Longhorn) are mentioned
+  as one working example rather than the prescription.
+
 ### Security (secscan Group C: rescan follow-ups)
 - `set_account_data` rejects reserved global account-data event types
   (`m.audit_room`, `m.ignored_user_list`, `m.push_rules`, `m.direct`,
