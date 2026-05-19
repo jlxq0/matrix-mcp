@@ -3947,17 +3947,36 @@ impl MatrixMcpService {
             // `use_cache = false` so we always get a fresh copy;
             // the SDK media cache is an optimisation for display,
             // not for this export path.
-            let bytes = client
-                .media()
-                .get_media_content(
+            //
+            // SSRF / OOM note: matrix-sdk 0.17 has no streaming media
+            // download — get_media_content returns the full Vec<u8>
+            // before we can re-check size. The pre-download check
+            // above uses event-supplied `info.size`, which Matrix
+            // protocol leaves attacker-influenced. We wrap the call in
+            // a generous timeout so a malicious sender can't combine
+            // "lie about info.size" + "stream a 100 GB body slowly"
+            // into an unbounded fetch that ties up the pod. The actual
+            // post-download size cap is still enforced below; the
+            // timeout just bounds the *time* an oversize download has
+            // to run before we abort and free the memory.
+            let bytes = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.media().get_media_content(
                     &MediaRequestParameters {
                         source,
                         format: MediaFormat::File,
                     },
                     false,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ErrorData::internal_error(
+                    "media download timed out after 60s; aborting to bound memory use",
+                    None,
                 )
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("media download: {e}"), None))?;
+            })?
+            .map_err(|e| ErrorData::internal_error(format!("media download: {e}"), None))?;
 
             // Post-download size check — protects against missing or
             // incorrect info.size in the event.
