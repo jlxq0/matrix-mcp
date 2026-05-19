@@ -196,11 +196,11 @@ pub async fn emit_notice(
 /// Render the audit-room notice body.
 ///
 /// `target_room` is the raw caller-supplied `room_id` string from the tool
-/// params: write tools emit this notice even when the room_id failed to parse
-/// (so the user still sees that the call failed). We re-validate here and
-/// drop the field if it isn't a syntactically valid Matrix room id — otherwise
-/// a caller could pass a crafted string containing newlines or fake `outcome=`
-/// fragments and forge entries in the user-visible audit trail.
+/// params: write tools emit this notice even when the `room_id` failed to
+/// parse (so the user still sees that the call failed). We re-validate here
+/// and drop the field if it isn't a syntactically valid Matrix room id —
+/// otherwise a caller could pass a crafted string containing newlines or fake
+/// `outcome=` fragments and forge entries in the user-visible audit trail.
 ///
 /// We layer two checks because Ruma's `RoomId::parse` is permissive about
 /// whitespace and control characters inside the localpart: first reject any

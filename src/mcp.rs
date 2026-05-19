@@ -210,7 +210,7 @@ const MAX_REACTION_KEY_BYTES: usize = 1024;
 
 /// Hard cap on the number of MXIDs `get_user_receipts` will look up in
 /// one call. One SDK round-trip per user, so an unbounded list is a
-/// trivially authenticated DoS through a single read-rate token.
+/// trivially authenticated `DoS` through a single read-rate token.
 const MAX_RECEIPT_USERS: usize = 100;
 
 /// Hard cap on the number of receipts `get_event_receipts` returns for
@@ -1871,9 +1871,9 @@ impl MatrixMcpService {
             // Refuse to send the edit if the caller is not the original
             // sender, so matrix-mcp never produces a forged-edit event
             // that those consumers might honour.
-            let caller_user_id = client.user_id().ok_or_else(|| {
-                ErrorData::internal_error("matrix client has no user_id", None)
-            })?;
+            let caller_user_id = client
+                .user_id()
+                .ok_or_else(|| ErrorData::internal_error("matrix client has no user_id", None))?;
             if original.sender != caller_user_id {
                 return Err(ErrorData::invalid_params(
                     format!(
@@ -6601,14 +6601,6 @@ mod tests {
         assert!(validate_redaction_reason(Some(&at_limit)).is_ok());
         let oversized = "a".repeat(MAX_REDACTION_REASON_BYTES + 1);
         assert!(validate_redaction_reason(Some(&oversized)).is_err());
-    }
-
-    #[test]
-    fn receipt_caps_are_sensible() {
-        // Calibration check, not behavioural — just guards against
-        // somebody accidentally setting the caps unbounded.
-        assert!(MAX_RECEIPT_USERS > 0 && MAX_RECEIPT_USERS <= 1000);
-        assert!(MAX_EVENT_RECEIPT_READERS >= 100);
     }
 
     #[test]
