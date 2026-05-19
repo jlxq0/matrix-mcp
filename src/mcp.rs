@@ -203,6 +203,15 @@ const MAX_MESSAGE_LIMIT: u32 = 50;
 /// uploads.
 const MAX_TEXT_MESSAGE_BODY_BYTES: usize = 64 * 1024;
 
+/// Hard cap on the byte length of a `send_reaction` key. Real reactions
+/// are short (typically a single emoji); this is generous headroom for
+/// custom-emoji shortcodes without leaving the field unbounded.
+const MAX_REACTION_KEY_BYTES: usize = 1024;
+
+/// Hard cap on the byte length of a `redact_message` reason. Matches the
+/// same envelope-size bound applied to text-message bodies.
+const MAX_REDACTION_REASON_BYTES: usize = MAX_TEXT_MESSAGE_BODY_BYTES;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadRecentMessagesParams {
     /// Matrix room id, e.g. `!abc:example.com`.
@@ -232,6 +241,35 @@ fn validate_text_message_body(body: &str) -> Result<(), ErrorData> {
     if len > MAX_TEXT_MESSAGE_BODY_BYTES {
         return Err(ErrorData::invalid_params(
             format!("message body is {len} bytes; maximum is {MAX_TEXT_MESSAGE_BODY_BYTES} bytes"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Reject reaction keys longer than [`MAX_REACTION_KEY_BYTES`].
+fn validate_reaction_key(key: &str) -> Result<(), ErrorData> {
+    let len = key.len();
+    if len > MAX_REACTION_KEY_BYTES {
+        return Err(ErrorData::invalid_params(
+            format!("reaction key is {len} bytes; maximum is {MAX_REACTION_KEY_BYTES} bytes"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Reject redaction reasons longer than [`MAX_REDACTION_REASON_BYTES`].
+fn validate_redaction_reason(reason: Option<&str>) -> Result<(), ErrorData> {
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    let len = reason.len();
+    if len > MAX_REDACTION_REASON_BYTES {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "redaction reason is {len} bytes; maximum is {MAX_REDACTION_REASON_BYTES} bytes"
+            ),
             None,
         ));
     }
@@ -3370,6 +3408,7 @@ impl MatrixMcpService {
         let span = make_tool_span("send_reaction", &mxid_for_audit, Some(&room_id_for_audit));
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            validate_reaction_key(&params.key)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
@@ -3444,6 +3483,7 @@ impl MatrixMcpService {
         let span = make_tool_span("redact_message", &mxid_for_audit, Some(&room_id_for_audit));
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            validate_redaction_reason(params.reason.as_deref())?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
@@ -6491,6 +6531,23 @@ mod tests {
 
         let oversized = "a".repeat(MAX_TEXT_MESSAGE_BODY_BYTES + 1);
         assert!(validate_text_message_body(&oversized).is_err());
+    }
+
+    #[test]
+    fn oversized_reaction_key_is_rejected() {
+        let at_limit = "a".repeat(MAX_REACTION_KEY_BYTES);
+        assert!(validate_reaction_key(&at_limit).is_ok());
+        let oversized = "a".repeat(MAX_REACTION_KEY_BYTES + 1);
+        assert!(validate_reaction_key(&oversized).is_err());
+    }
+
+    #[test]
+    fn oversized_redaction_reason_is_rejected() {
+        assert!(validate_redaction_reason(None).is_ok());
+        let at_limit = "a".repeat(MAX_REDACTION_REASON_BYTES);
+        assert!(validate_redaction_reason(Some(&at_limit)).is_ok());
+        let oversized = "a".repeat(MAX_REDACTION_REASON_BYTES + 1);
+        assert!(validate_redaction_reason(Some(&oversized)).is_err());
     }
 
     #[test]
