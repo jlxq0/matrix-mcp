@@ -231,6 +231,44 @@ const MAX_EVENT_RECEIPT_READERS: usize = 1000;
 /// same envelope-size bound applied to text-message bodies.
 const MAX_REDACTION_REASON_BYTES: usize = MAX_TEXT_MESSAGE_BODY_BYTES;
 
+/// Hard cap on the serialized byte length of an account-data content
+/// blob. Synapse's own server-side cap is in the same order of magnitude;
+/// matrix-mcp clamps lower to bound per-request allocations.
+const MAX_ACCOUNT_DATA_CONTENT_BYTES: usize = 32 * 1024;
+
+/// Global account-data event types that matrix-mcp refuses to write
+/// through the generic `set_account_data` tool. Two categories:
+///
+/// * **Dedicated-tool-managed** — the existing tool validates shape /
+///   joined-room state / etc. that the generic writer cannot. Bypassing
+///   them lets a caller corrupt the invariant the dedicated tool
+///   enforces (the audit-room notice path silently drops on a malformed
+///   `m.audit_room`, so a malicious overwrite disables future audit
+///   notices).
+/// * **Matrix security-sensitive** — secret-storage default key and per-key
+///   entries, cross-signing master / `self_signing` / `user_signing`
+///   container types. matrix-sdk uses these for E2EE recovery; arbitrary
+///   writes can corrupt the client's security state.
+///
+/// `m.direct` is included even though it's not directly security-relevant
+/// — the SDK manages it for DM detection and a stomped value confuses
+/// downstream clients.
+fn account_data_event_type_is_reserved(event_type: &str) -> bool {
+    // Exact-match reserved types.
+    matches!(
+        event_type,
+        "m.audit_room"
+            | "m.ignored_user_list"
+            | "m.push_rules"
+            | "m.direct"
+            | "m.secret_storage.default_key"
+            | "m.cross_signing.master"
+            | "m.cross_signing.self_signing"
+            | "m.cross_signing.user_signing"
+            | "m.megolm_backup.v1"
+    ) || event_type.starts_with("m.secret_storage.key.")
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadRecentMessagesParams {
     /// Matrix room id, e.g. `!abc:example.com`.
@@ -5397,6 +5435,22 @@ impl MatrixMcpService {
         let span = make_tool_span("set_account_data", &mxid_for_audit, None);
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            // Reserved event types: the generic writer cannot enforce
+            // the shape invariants the dedicated tools rely on, and
+            // certain Matrix-managed types (secret-storage keys,
+            // cross-signing containers) must not be writable as
+            // arbitrary JSON. Reject before reaching the homeserver.
+            if account_data_event_type_is_reserved(&params.event_type) {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "event_type `{}` is reserved; use the dedicated tool \
+                         (set_audit_room / ignore_user / etc.) or pick a custom \
+                         `org.<your-namespace>.<key>` event type",
+                        params.event_type
+                    ),
+                    None,
+                ));
+            }
             let client = self.client_for(&ctx).await?;
             let event_type: GlobalAccountDataEventType = params.event_type.as_str().into();
             // Some MCP clients (notably claude.ai) JSON-encode the
@@ -5430,6 +5484,19 @@ impl MatrixMcpService {
             // serialize the canonical value to bytes, then wrap.
             let raw_bytes = serde_json::value::to_raw_value(&canonical_content)
                 .map_err(|e| ErrorData::invalid_params(format!("serialize content: {e}"), None))?;
+            // Reject oversized content blobs before they reach the
+            // homeserver. The check is on the serialized bytes (not the
+            // input Value), so deeply-nested or repeated keys can't
+            // smuggle past via the Value representation.
+            if raw_bytes.get().len() > MAX_ACCOUNT_DATA_CONTENT_BYTES {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "serialized content is {} bytes; maximum is {MAX_ACCOUNT_DATA_CONTENT_BYTES} bytes",
+                        raw_bytes.get().len()
+                    ),
+                    None,
+                ));
+            }
             let raw: matrix_sdk::ruma::serde::Raw<
                 matrix_sdk::ruma::events::AnyGlobalAccountDataEventContent,
             > = matrix_sdk::ruma::serde::Raw::from_json(raw_bytes);
@@ -6743,6 +6810,46 @@ mod tests {
         assert!(validate_redaction_reason(Some(&at_limit)).is_ok());
         let oversized = "a".repeat(MAX_REDACTION_REASON_BYTES + 1);
         assert!(validate_redaction_reason(Some(&oversized)).is_err());
+    }
+
+    #[test]
+    fn account_data_reserved_types_blocked() {
+        // Dedicated-tool-managed
+        assert!(account_data_event_type_is_reserved("m.audit_room"));
+        assert!(account_data_event_type_is_reserved("m.ignored_user_list"));
+        assert!(account_data_event_type_is_reserved("m.push_rules"));
+        assert!(account_data_event_type_is_reserved("m.direct"));
+        // Matrix security-sensitive
+        assert!(account_data_event_type_is_reserved(
+            "m.secret_storage.default_key"
+        ));
+        assert!(account_data_event_type_is_reserved(
+            "m.secret_storage.key.AbCdEf123456"
+        ));
+        assert!(account_data_event_type_is_reserved(
+            "m.cross_signing.master"
+        ));
+        assert!(account_data_event_type_is_reserved(
+            "m.cross_signing.self_signing"
+        ));
+        assert!(account_data_event_type_is_reserved(
+            "m.cross_signing.user_signing"
+        ));
+        assert!(account_data_event_type_is_reserved("m.megolm_backup.v1"));
+        // Custom namespaces remain writable
+        assert!(!account_data_event_type_is_reserved("org.julian.foo"));
+        assert!(!account_data_event_type_is_reserved("io.matrix_mcp.smoke"));
+        // Other m.* types not in the list are NOT blocked (we don't
+        // want to over-block: the user might be using a non-managed
+        // standard type the SDK doesn't touch).
+        assert!(!account_data_event_type_is_reserved("m.fully_read"));
+        // Case-sensitive: a typo with capitals doesn't bypass the check
+        // because Matrix event types are spec-defined as lowercase.
+        assert!(!account_data_event_type_is_reserved("M.audit_room"));
+        // Prefix check is exact: a longer string that starts with the
+        // reserved name but isn't a key-store entry passes through.
+        // (m.secret_storage.key.* is the only intentional prefix match.)
+        assert!(!account_data_event_type_is_reserved("m.audit_roomy"));
     }
 
     #[test]
