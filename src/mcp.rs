@@ -231,6 +231,52 @@ const MAX_EVENT_RECEIPT_READERS: usize = 1000;
 /// same envelope-size bound applied to text-message bodies.
 const MAX_REDACTION_REASON_BYTES: usize = MAX_TEXT_MESSAGE_BODY_BYTES;
 
+/// Hard cap on the serialized byte length of an account-data content
+/// blob. Synapse's own server-side cap is in the same order of magnitude;
+/// matrix-mcp clamps lower to bound per-request allocations.
+const MAX_ACCOUNT_DATA_CONTENT_BYTES: usize = 32 * 1024;
+
+/// Hard cap on the number of state events `get_room_state` returns when
+/// `state_key` is omitted. Public/federated rooms can have tens of
+/// thousands of state events of certain types (member, ACL rule sets);
+/// the cap bounds per-call memory + serialization without rejecting
+/// outright. Callers needing more should narrow with a `state_key` or
+/// use a typed tool like `room_members`.
+const MAX_STATE_EVENTS: usize = 500;
+
+/// Global account-data event types that matrix-mcp refuses to write
+/// through the generic `set_account_data` tool. Two categories:
+///
+/// * **Dedicated-tool-managed** — the existing tool validates shape /
+///   joined-room state / etc. that the generic writer cannot. Bypassing
+///   them lets a caller corrupt the invariant the dedicated tool
+///   enforces (the audit-room notice path silently drops on a malformed
+///   `m.audit_room`, so a malicious overwrite disables future audit
+///   notices).
+/// * **Matrix security-sensitive** — secret-storage default key and per-key
+///   entries, cross-signing master / `self_signing` / `user_signing`
+///   container types. matrix-sdk uses these for E2EE recovery; arbitrary
+///   writes can corrupt the client's security state.
+///
+/// `m.direct` is included even though it's not directly security-relevant
+/// — the SDK manages it for DM detection and a stomped value confuses
+/// downstream clients.
+fn account_data_event_type_is_reserved(event_type: &str) -> bool {
+    // Exact-match reserved types.
+    matches!(
+        event_type,
+        "m.audit_room"
+            | "m.ignored_user_list"
+            | "m.push_rules"
+            | "m.direct"
+            | "m.secret_storage.default_key"
+            | "m.cross_signing.master"
+            | "m.cross_signing.self_signing"
+            | "m.cross_signing.user_signing"
+            | "m.megolm_backup.v1"
+    ) || event_type.starts_with("m.secret_storage.key.")
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadRecentMessagesParams {
     /// Matrix room id, e.g. `!abc:example.com`.
@@ -1047,12 +1093,16 @@ pub struct GetRoomStateParams {
     pub room_id: String,
     /// Matrix state event type to fetch (e.g. `m.room.name`,
     /// `m.room.topic`, `m.room.member`, `m.room.power_levels`,
-    /// `m.room.pinned_events`). Required so the response is bounded
-    /// — `m.room.member` in a large room can be hundreds of events.
+    /// `m.room.pinned_events`). Required so the response is bounded.
+    /// `m.room.member` specifically is rejected when `state_key` is
+    /// omitted — public/federated rooms can have tens of thousands of
+    /// member events; use `room_members` for bounded listing or pass a
+    /// concrete MXID as `state_key`.
     pub event_type: String,
     /// When set, return only the state event whose `state_key`
     /// equals this. Useful for `m.room.member` lookups by mxid.
-    /// When `null` (default), return all events of `event_type`.
+    /// When `null` (default), return all events of `event_type`,
+    /// truncated at [`MAX_STATE_EVENTS`].
     #[serde(default)]
     pub state_key: Option<String>,
 }
@@ -1071,7 +1121,17 @@ pub struct StateEventInfo {
 pub struct GetRoomStateResult {
     pub room_id: String,
     pub event_type: String,
+    /// State events of the requested type. Capped at
+    /// [`MAX_STATE_EVENTS`]; when the upstream list is longer,
+    /// `truncated` is set and the array contains the first N entries
+    /// in iteration order (matrix-sdk does not expose a stable sort
+    /// for state queries, so the truncation point is best-effort).
     pub events: Vec<StateEventInfo>,
+    /// True iff the upstream state list was longer than
+    /// [`MAX_STATE_EVENTS`] and `events` was truncated. When `true`,
+    /// the caller should narrow the query with a concrete
+    /// `state_key` (or use a typed tool like `room_members`).
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1617,7 +1677,16 @@ impl MatrixMcpService {
             // server-side key-backup pull in the background. Best-effort:
             // sessions in backup self-heal on the next read; sessions
             // that were never backed up stay opaque.
-            spawn_key_backup_pull_if_needed(&self.key_backup_gate, &client, &room_id, &events);
+            let caller_sub = identity_from_ctx(&ctx)
+                .map(|i| i.mas_subject)
+                .unwrap_or_default();
+            spawn_key_backup_pull_if_needed(
+                &self.key_backup_gate,
+                &caller_sub,
+                &client,
+                &room_id,
+                &events,
+            );
             let count = events.len();
             let res = structured_result(&ReadRecentMessagesResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -1708,7 +1777,16 @@ impl MatrixMcpService {
             })?;
 
             let events = read_events_from_chunk(relations.chunk);
-            spawn_key_backup_pull_if_needed(&self.key_backup_gate, &client, &room_id, &events);
+            let caller_sub = identity_from_ctx(&ctx)
+                .map(|i| i.mas_subject)
+                .unwrap_or_default();
+            spawn_key_backup_pull_if_needed(
+                &self.key_backup_gate,
+                &caller_sub,
+                &client,
+                &room_id,
+                &events,
+            );
             let count = events.len();
             let res = structured_result(&ReadThreadResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -2652,11 +2730,14 @@ impl MatrixMcpService {
                     None,
                 ));
             }
-            // Per-room cooldown + global concurrency. Surface a clear
-            // rate-limited / cooldown rejection to the explicit tool
-            // caller instead of silently skipping (the auto-pull
-            // helper does silent-skip).
-            let permit = match self.key_backup_gate.try_acquire(&room_id) {
+            // Per-(caller, room) cooldown + global concurrency. The
+            // caller key is the MAS subject so one user's pull doesn't
+            // suppress another user's recovery for a shared encrypted
+            // room. Surface cooldown rejection to the explicit tool
+            // caller (the auto-pull helper does silent-skip below).
+            let identity = identity_from_ctx(&ctx).ok_or_else(missing_identity_err)?;
+            let caller_sub = identity.mas_subject;
+            let permit = match self.key_backup_gate.try_acquire(&caller_sub, &room_id) {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     return Err(ErrorData::invalid_params(
@@ -3074,6 +3155,20 @@ impl MatrixMcpService {
             let room = client.get_room(&room_id).ok_or_else(|| {
                 ErrorData::invalid_params(format!("not joined to {room_id}"), None)
             })?;
+            // m.room.member specifically is high-cardinality in
+            // public/federated rooms (tens of thousands of events).
+            // Reject the all-keys query early — the caller should use
+            // `room_members` for bounded listing, or pass a concrete
+            // MXID as `state_key` for a one-shot membership lookup.
+            if params.state_key.is_none() && params.event_type == "m.room.member" {
+                return Err(ErrorData::invalid_params(
+                    "get_room_state for `m.room.member` without state_key is rejected \
+                     (public rooms can have tens of thousands of members); use \
+                     `room_members` for a bounded listing, or pass the target MXID \
+                     as state_key for a single-member lookup",
+                    None,
+                ));
+            }
             let event_type: StateEventType = params.event_type.as_str().into();
             // SDK's get_state_events_for_keys takes an iterator of
             // state_key strs; get_state_events with no key returns
@@ -3094,8 +3189,11 @@ impl MatrixMcpService {
                         ErrorData::internal_error(format!("get_state_events: {e}"), None)
                     })?
                 };
+            let total = raws.len();
+            let truncated = total > MAX_STATE_EVENTS;
             let events: Vec<StateEventInfo> = raws
                 .into_iter()
+                .take(MAX_STATE_EVENTS)
                 .map(|raw| {
                     // `RawAnySyncOrStrippedState` is a Sync/Stripped enum
                     // around `Raw<…>`. Both variants serialize back to the
@@ -3110,6 +3208,7 @@ impl MatrixMcpService {
                 room_id: room_id.to_string(),
                 event_type: params.event_type,
                 events,
+                truncated,
             });
             Ok::<_, ErrorData>((res, count))
         }
@@ -5397,6 +5496,22 @@ impl MatrixMcpService {
         let span = make_tool_span("set_account_data", &mxid_for_audit, None);
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            // Reserved event types: the generic writer cannot enforce
+            // the shape invariants the dedicated tools rely on, and
+            // certain Matrix-managed types (secret-storage keys,
+            // cross-signing containers) must not be writable as
+            // arbitrary JSON. Reject before reaching the homeserver.
+            if account_data_event_type_is_reserved(&params.event_type) {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "event_type `{}` is reserved; use the dedicated tool \
+                         (set_audit_room / ignore_user / etc.) or pick a custom \
+                         `org.<your-namespace>.<key>` event type",
+                        params.event_type
+                    ),
+                    None,
+                ));
+            }
             let client = self.client_for(&ctx).await?;
             let event_type: GlobalAccountDataEventType = params.event_type.as_str().into();
             // Some MCP clients (notably claude.ai) JSON-encode the
@@ -5430,6 +5545,19 @@ impl MatrixMcpService {
             // serialize the canonical value to bytes, then wrap.
             let raw_bytes = serde_json::value::to_raw_value(&canonical_content)
                 .map_err(|e| ErrorData::invalid_params(format!("serialize content: {e}"), None))?;
+            // Reject oversized content blobs before they reach the
+            // homeserver. The check is on the serialized bytes (not the
+            // input Value), so deeply-nested or repeated keys can't
+            // smuggle past via the Value representation.
+            if raw_bytes.get().len() > MAX_ACCOUNT_DATA_CONTENT_BYTES {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "serialized content is {} bytes; maximum is {MAX_ACCOUNT_DATA_CONTENT_BYTES} bytes",
+                        raw_bytes.get().len()
+                    ),
+                    None,
+                ));
+            }
             let raw: matrix_sdk::ruma::serde::Raw<
                 matrix_sdk::ruma::events::AnyGlobalAccountDataEventContent,
             > = matrix_sdk::ruma::serde::Raw::from_json(raw_bytes);
@@ -6502,6 +6630,7 @@ pub fn token_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<AccessToken> {
 /// to the caller still surfaces the undecryptable status.
 fn spawn_key_backup_pull_if_needed(
     gate: &crate::key_backup_gate::KeyBackupGate,
+    caller_sub: &str,
     client: &matrix_sdk::Client,
     room_id: &matrix_sdk::ruma::RoomId,
     events: &[ReadEvent],
@@ -6513,11 +6642,12 @@ fn spawn_key_backup_pull_if_needed(
     if undecryptable == 0 {
         return;
     }
-    // Per-room cooldown + global concurrency. Auto-pull is best-effort
-    // recovery for self-healing reads, so we silently skip when either
-    // bound is hit — the caller will see undecryptable status and can
-    // invoke `request_room_keys` explicitly to surface the rejection.
-    let permit = match gate.try_acquire(room_id) {
+    // Per-(caller, room) cooldown + global concurrency. Auto-pull is
+    // best-effort recovery for self-healing reads, so we silently
+    // skip when either bound is hit — the caller will see
+    // undecryptable status and can invoke `request_room_keys`
+    // explicitly to surface the rejection.
+    let permit = match gate.try_acquire(caller_sub, room_id) {
         Ok(Some(p)) => p,
         Ok(None) => {
             tracing::debug!(
@@ -6743,6 +6873,46 @@ mod tests {
         assert!(validate_redaction_reason(Some(&at_limit)).is_ok());
         let oversized = "a".repeat(MAX_REDACTION_REASON_BYTES + 1);
         assert!(validate_redaction_reason(Some(&oversized)).is_err());
+    }
+
+    #[test]
+    fn account_data_reserved_types_blocked() {
+        // Dedicated-tool-managed
+        assert!(account_data_event_type_is_reserved("m.audit_room"));
+        assert!(account_data_event_type_is_reserved("m.ignored_user_list"));
+        assert!(account_data_event_type_is_reserved("m.push_rules"));
+        assert!(account_data_event_type_is_reserved("m.direct"));
+        // Matrix security-sensitive
+        assert!(account_data_event_type_is_reserved(
+            "m.secret_storage.default_key"
+        ));
+        assert!(account_data_event_type_is_reserved(
+            "m.secret_storage.key.AbCdEf123456"
+        ));
+        assert!(account_data_event_type_is_reserved(
+            "m.cross_signing.master"
+        ));
+        assert!(account_data_event_type_is_reserved(
+            "m.cross_signing.self_signing"
+        ));
+        assert!(account_data_event_type_is_reserved(
+            "m.cross_signing.user_signing"
+        ));
+        assert!(account_data_event_type_is_reserved("m.megolm_backup.v1"));
+        // Custom namespaces remain writable
+        assert!(!account_data_event_type_is_reserved("org.julian.foo"));
+        assert!(!account_data_event_type_is_reserved("io.matrix_mcp.smoke"));
+        // Other m.* types not in the list are NOT blocked (we don't
+        // want to over-block: the user might be using a non-managed
+        // standard type the SDK doesn't touch).
+        assert!(!account_data_event_type_is_reserved("m.fully_read"));
+        // Case-sensitive: a typo with capitals doesn't bypass the check
+        // because Matrix event types are spec-defined as lowercase.
+        assert!(!account_data_event_type_is_reserved("M.audit_room"));
+        // Prefix check is exact: a longer string that starts with the
+        // reserved name but isn't a key-store entry passes through.
+        // (m.secret_storage.key.* is the only intentional prefix match.)
+        assert!(!account_data_event_type_is_reserved("m.audit_roomy"));
     }
 
     #[test]

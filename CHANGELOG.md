@@ -6,6 +6,36 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Security (secscan Group C: rescan follow-ups)
+- `set_account_data` rejects reserved global account-data event types
+  (`m.audit_room`, `m.ignored_user_list`, `m.push_rules`, `m.direct`,
+  `m.secret_storage.default_key`, `m.secret_storage.key.*`,
+  `m.cross_signing.{master,self_signing,user_signing}`,
+  `m.megolm_backup.v1`). The generic writer previously let a caller
+  overwrite `m.audit_room` with malformed content to silently disable
+  audit notices, or corrupt Matrix-managed E2EE recovery state.
+  Custom `org.<...>` namespaces remain writable. Closes #8c54c9f0.
+- `set_account_data` also caps serialized content at 32 KiB
+  (`MAX_ACCOUNT_DATA_CONTENT_BYTES`).
+- `get_room_state` caps returned events at `MAX_STATE_EVENTS = 500`
+  with a new `truncated: bool` field, and refuses
+  `event_type=m.room.member` when `state_key` is omitted (public
+  rooms can have tens of thousands of member events; use
+  `room_members` for bounded listing or pass a concrete MXID as
+  `state_key`). Closes #ea339918.
+- `KeyBackupGate` cooldown is now keyed by `(caller, room_id)` rather
+  than `room_id` alone. The previous process-global key meant one
+  user's pull for a shared encrypted room blocked another user's
+  recovery for the same room for 5 minutes — a cross-user E2EE
+  availability issue introduced by Group B's gate. The global
+  semaphore (resource cap) remains process-wide on purpose.
+  Closes #baa1ab07.
+- `MatrixClientCache::for_user` checks the cached client's
+  `sync_task.is_finished()` and evicts + rebuilds when the background
+  sync watchdog has exited (which the Group B watchdog fix introduced
+  for permanent auth failures). Without this, room/state freshness
+  silently degraded after token revocation. Closes #cef36421.
+
 ### Security (secscan Group B: rate-limit / SSRF / availability)
 - Per-identity initialize rate-limit: a new middleware on `/mcp` charges
   one bucket-token per fresh-session POST keyed by bearer-hash AND MAS

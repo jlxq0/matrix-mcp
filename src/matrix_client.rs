@@ -186,19 +186,52 @@ impl MatrixClientCache {
     ) -> Result<Arc<Client>> {
         let incoming_hash = token_hash(access_token);
 
-        // Fast path: cell exists AND is fully initialized. Holds the
-        // read lock only for the HashMap lookup, then drops it before
-        // running refresh_token_if_needed.
+        // Fast path: cell exists AND is fully initialized AND its
+        // background sync task is still running. Holds the read lock
+        // only for the HashMap lookup, then drops it before running
+        // refresh_token_if_needed.
+        //
+        // The sync_task check matters because `sync_watchdog` exits
+        // cleanly on permanent auth-failure signatures
+        // (M_UNKNOWN_TOKEN, Token is not active). Without this check
+        // the next /mcp request with a freshly-refreshed bearer would
+        // restore_session the new token onto the same cached client
+        // — but the background sync task is gone, so SDK room/state
+        // freshness silently degrades. By treating a finished
+        // sync_task as "stale", we force eviction + rebuild here.
         {
             let guard = self.inner.read().await;
             if let Some(cell) = guard.get(&identity.mxid)
                 && let Some(cached) = cell.get()
+                && !cached.sync_task.is_finished()
             {
                 let cached = cached.clone();
                 drop(guard);
                 self.refresh_token_if_needed(&cached, identity, access_token, incoming_hash)
                     .await?;
                 return Ok(cached.client.clone());
+            }
+        }
+
+        // Stale eviction: if the existing cell holds a cached client
+        // with a finished sync_task, remove the entry so the slow
+        // path below creates a fresh OnceCell + rebuilds. Holding a
+        // write lock just long enough to drop the entry — the build
+        // itself runs off-lock inside the cell. matrix-sdk's
+        // `restore_session` panics with `AlreadyInitializedError` if
+        // we tried to reuse the Client; rebuilding from scratch is
+        // the only sound recovery.
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(cell) = guard.get(&identity.mxid)
+                && cell.get().is_some_and(|c| c.sync_task.is_finished())
+            {
+                debug!(
+                    mxid = %identity.mxid,
+                    "evicting cached matrix-sdk client with finished sync_task; \
+                     will rebuild"
+                );
+                guard.remove(&identity.mxid);
             }
         }
 
