@@ -5303,6 +5303,28 @@ impl MatrixMcpService {
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
             })?;
+            // join_room_by_id works on ANY room id — it would happily
+            // join a non-invited public room. The tool is advertised as
+            // "accept a pending invite", so require Invited state to
+            // match that contract and prevent the tool from being used
+            // as a generic join (use `join_room` for that).
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("no pending invite for {room_id} in the SDK cache"),
+                    None,
+                )
+            })?;
+            if room.state() != matrix_sdk::RoomState::Invited {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "room {room_id} is not in the Invited state \
+                         (current state: {:?}); use `join_room` to join an \
+                         already-public or knock room",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
             client
                 .join_room_by_id(&room_id)
                 .await
