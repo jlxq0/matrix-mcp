@@ -713,14 +713,14 @@ mod tests {
             "expected 16 hex-char token_hash, got: {}",
             body["token_hash"]
         );
-        // last_used was populated by the auth middleware on this same
-        // request. With the default trusted_proxy_hops=1, the recorded
-        // IP is the **rightmost** XFF entry (the one our trusted proxy
-        // appended) — NOT the leftmost (which an attacker could spoof).
-        assert_eq!(body["last_used"]["ip"], "10.0.0.1");
+        // The /token/introspect call itself MUST NOT update last_used —
+        // otherwise the act of checking the audit signal would
+        // immediately overwrite it and hide any prior (potentially
+        // attacker-driven) use the owner is trying to detect. With no
+        // prior tool calls recorded, last_used is null on first read.
         assert!(
-            body["last_used"]["at_unix"].as_i64().is_some(),
-            "at_unix should be an integer; body: {body}"
+            body["last_used"].is_null(),
+            "last_used should be null on first /token/introspect (no prior real use); got: {body}"
         );
     }
 
