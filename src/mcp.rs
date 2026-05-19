@@ -4286,6 +4286,10 @@ impl MatrixMcpService {
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
         let span = make_tool_span("send_bulk", &mxid_for_audit, None);
         let mut result = async {
+            // Pre-flight: one bucket-token charged just to enter the
+            // tool. Per-room charges happen below in the loop, so a
+            // single call can't fan out cheaper than `N` discrete
+            // send_text_message calls.
             self.rate_limit_check(&ctx, Category::Write)?;
             validate_text_message_body(&params.body)?;
             if params.room_ids.is_empty() {
@@ -4306,6 +4310,18 @@ impl MatrixMcpService {
             let client = self.client_for(&ctx).await?;
             let mut outcomes: Vec<SendBulkOutcome> = Vec::with_capacity(params.room_ids.len());
             for rid_str in &params.room_ids {
+                // Charge one write-token per actual room send. When the
+                // bucket runs dry mid-loop, remaining rooms are recorded
+                // as rate-limited outcomes and the call returns; no
+                // partial state is hidden from the caller.
+                if self.rate_limit_check(&ctx, Category::Write).is_err() {
+                    outcomes.push(SendBulkOutcome {
+                        room_id: rid_str.clone(),
+                        event_id: None,
+                        error: Some("rate_limited".to_owned()),
+                    });
+                    continue;
+                }
                 let outcome = match self.send_text_to_room(&client, rid_str, &params.body).await {
                     Ok(event_id) => SendBulkOutcome {
                         room_id: rid_str.clone(),
@@ -4397,6 +4413,15 @@ impl MatrixMcpService {
                         error: Some(format!(
                             "skipped: {member_count} joined members exceeds max_room_members {max_members}"
                         )),
+                    });
+                    continue;
+                }
+                // Charge one write-token per actual room send.
+                if self.rate_limit_check(&ctx, Category::Write).is_err() {
+                    outcomes.push(SendBulkOutcome {
+                        room_id: rid_str,
+                        event_id: None,
+                        error: Some("rate_limited".to_owned()),
                     });
                     continue;
                 }
