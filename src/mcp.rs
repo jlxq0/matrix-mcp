@@ -5115,6 +5115,23 @@ impl MatrixMcpService {
             let room = client.get_room(&room_id).ok_or_else(|| {
                 ErrorData::invalid_params(format!("no such room {room_id}"), None)
             })?;
+            // The SDK's `room.leave()` is the same call used by the
+            // explicit `leave_room` tool: it works on Joined rooms too.
+            // The tool is advertised as non-destructive (a reject is
+            // expected to be a no-op on Joined rooms), so guard against
+            // a misdirected call by checking the room state first. If
+            // the room is no longer in the Invited state, surface that
+            // explicitly rather than silently leaving a joined room.
+            if room.state() != matrix_sdk::RoomState::Invited {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "room {room_id} is not in the Invited state \
+                         (current state: {:?}); use `leave_room` to leave a joined room",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
             room.leave()
                 .await
                 .map_err(|e| ErrorData::internal_error(format!("room.leave: {e}"), None))?;
