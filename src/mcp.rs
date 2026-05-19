@@ -208,6 +208,16 @@ const MAX_TEXT_MESSAGE_BODY_BYTES: usize = 64 * 1024;
 /// custom-emoji shortcodes without leaving the field unbounded.
 const MAX_REACTION_KEY_BYTES: usize = 1024;
 
+/// Hard cap on the number of MXIDs `get_user_receipts` will look up in
+/// one call. One SDK round-trip per user, so an unbounded list is a
+/// trivially authenticated DoS through a single read-rate token.
+const MAX_RECEIPT_USERS: usize = 100;
+
+/// Hard cap on the number of receipts `get_event_receipts` returns for
+/// one event. Busy public rooms can have thousands of readers; cap so
+/// one call doesn't have to serialize and ship that whole list.
+const MAX_EVENT_RECEIPT_READERS: usize = 1000;
+
 /// Hard cap on the byte length of a `redact_message` reason. Matches the
 /// same envelope-size bound applied to text-message bodies.
 const MAX_REDACTION_REASON_BYTES: usize = MAX_TEXT_MESSAGE_BODY_BYTES;
@@ -957,7 +967,15 @@ pub struct GetEventReceiptsResult {
     /// included — only the caller could ever see those for
     /// themselves, and Synapse only exposes public ones to
     /// general-purpose `/read_markers` queries.
+    ///
+    /// Capped at [`MAX_EVENT_RECEIPT_READERS`]. When the room has
+    /// more readers than the cap, the array is truncated and
+    /// `truncated` is set; the cap is high enough that hitting it
+    /// in normal use is unusual.
     pub readers: Vec<EventReceiptInfo>,
+    /// True iff the upstream reader list was longer than
+    /// [`MAX_EVENT_RECEIPT_READERS`] and `readers` was truncated.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2663,6 +2681,15 @@ impl MatrixMcpService {
                     .map(|i| vec![i.mxid.clone()])
                     .unwrap_or_default()
             });
+            if raw_user_ids.len() > MAX_RECEIPT_USERS {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "user_ids has {} entries; maximum is {MAX_RECEIPT_USERS}",
+                        raw_user_ids.len()
+                    ),
+                    None,
+                ));
+            }
             let mut receipts: Vec<UserReceiptInfo> = Vec::with_capacity(raw_user_ids.len());
             for raw in raw_user_ids {
                 let user_id = match UserId::parse(&raw) {
@@ -2767,8 +2794,11 @@ impl MatrixMcpService {
                 .map_err(|e| {
                     ErrorData::internal_error(format!("load_event_receipts: {e}"), None)
                 })?;
+            let total = pairs.len();
+            let truncated = total > MAX_EVENT_RECEIPT_READERS;
             let readers: Vec<EventReceiptInfo> = pairs
                 .into_iter()
+                .take(MAX_EVENT_RECEIPT_READERS)
                 .map(|(user_id, receipt)| EventReceiptInfo {
                     user_id: user_id.to_string(),
                     ts_unix_ms: receipt.ts.map(|ts| u64::from(ts.get())),
@@ -2779,6 +2809,7 @@ impl MatrixMcpService {
                 room_id: room_id.to_string(),
                 event_id: event_id.to_string(),
                 readers,
+                truncated,
             });
             Ok::<_, ErrorData>((res, count))
         }
@@ -6548,6 +6579,14 @@ mod tests {
         assert!(validate_redaction_reason(Some(&at_limit)).is_ok());
         let oversized = "a".repeat(MAX_REDACTION_REASON_BYTES + 1);
         assert!(validate_redaction_reason(Some(&oversized)).is_err());
+    }
+
+    #[test]
+    fn receipt_caps_are_sensible() {
+        // Calibration check, not behavioural — just guards against
+        // somebody accidentally setting the caps unbounded.
+        assert!(MAX_RECEIPT_USERS > 0 && MAX_RECEIPT_USERS <= 1000);
+        assert!(MAX_EVENT_RECEIPT_READERS >= 100);
     }
 
     #[test]
