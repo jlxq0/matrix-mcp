@@ -33,8 +33,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::http::StatusCode;
-use axum::middleware;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Method, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -42,12 +44,13 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-use crate::auth::{AuthState, bearer_auth};
+use crate::auth::{AccessToken, AuthState, bearer_auth};
 use crate::config::Config;
 #[cfg(test)]
 use crate::config::IntrospectionCredentials;
 use crate::mas::MasIntrospectionClient;
 use crate::matrix_client::MatrixClientCache;
+use crate::rate_limit::{InitializeLimiter, MAX_INITIALIZES_PER_IDENTITY};
 use crate::mcp::MatrixMcpService;
 use crate::oauth_metadata::protected_resource_metadata;
 use crate::rate_limit::Limiter;
@@ -152,9 +155,11 @@ fn build_router(
     if let Some(h) = resource_host {
         allowed_hosts.push(h);
     }
-    // Mitigation A + B (audit finding #13): use a CappedSessionManager that
-    // applies a 60 s idle TTL (down from rmcp's 300 s default) and hard-caps
-    // the global session count at session::MAX_SESSIONS (256).
+    // Session pool defences (audit finding #13 + secscan #83350ed0):
+    // - CappedSessionManager applies a 30-minute idle TTL and hard-caps the
+    //   global session count at session::MAX_SESSIONS (256).
+    // - InitializeLimiter (below) rate-limits *fresh* MCP session creation
+    //   per identity so one bearer token can't cheaply fill the global pool.
     let mcp_service = StreamableHttpService::new(
         move || {
             let mas = mas.clone();
@@ -172,14 +177,31 @@ fn build_router(
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
 
+    // Per-identity initialize-rate-limit. Pairs the refill period with the
+    // session idle TTL so an attacker who has filled their slots can only
+    // open new ones at the rate their old ones idle out.
+    let initialize_limiter = Arc::new(InitializeLimiter::new(
+        session::SESSION_KEEP_ALIVE,
+        MAX_INITIALIZES_PER_IDENTITY,
+    ));
+
     // `/token/introspect` shares the bearer-auth middleware with `/mcp`
     // and reads `state.last_used`, so it lives in this sub-router. The
     // explicit `.with_state(auth_state.clone())` is what makes
     // `State<AuthState>` extractable in the handler; `from_fn_with_state`
     // alone wires state into the middleware only.
+    //
+    // Middleware order matters: bearer_auth attaches AccessToken +
+    // AuthenticatedIdentity to the request extensions; the initialize
+    // limiter reads those, so it must run AFTER bearer_auth. Axum's
+    // .layer() applies bottom-up, so the limiter goes first here.
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp_service)
         .route("/token/introspect", get(token_introspect::handler))
+        .layer(middleware::from_fn_with_state(
+            initialize_limiter,
+            initialize_rate_limit,
+        ))
         .layer(middleware::from_fn_with_state(
             auth_state.clone(),
             bearer_auth,
@@ -211,6 +233,57 @@ fn build_router(
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
+}
+
+/// Middleware that rejects fresh MCP session creation when the caller's
+/// per-identity initialize bucket is exhausted. Runs only on POSTs to
+/// /mcp without an `mcp-session-id` header — i.e., the initialize call
+/// rmcp uses to mint a fresh session. Tool calls (which carry the
+/// session id) flow through untouched, since they're already gated by
+/// the tool-level [`crate::rate_limit::Limiter`].
+async fn initialize_rate_limit(
+    State(limiter): State<Arc<InitializeLimiter>>,
+    request: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    if !is_fresh_mcp_session_request(&request) {
+        return next.run(request).await;
+    }
+    // bearer_auth ran upstream and attached these. If they're missing
+    // it's a routing misconfiguration, not an attacker — fail closed.
+    let Some(token) = request.extensions().get::<AccessToken>() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authenticated request missing token extension\n",
+        )
+            .into_response();
+    };
+    let Some(identity) = request
+        .extensions()
+        .get::<crate::mas::AuthenticatedIdentity>()
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authenticated request missing identity extension\n",
+        )
+            .into_response();
+    };
+    let bearer_hash = crate::audit::token_hash(&token.0);
+    if limiter
+        .check(&bearer_hash, Some(identity.mas_subject.as_str()))
+        .is_err()
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many MCP initialize requests; try again later\n",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn is_fresh_mcp_session_request(request: &Request<Body>) -> bool {
+    request.method() == Method::POST && request.headers().get("mcp-session-id").is_none()
 }
 
 /// Best-effort `https://host:port/path` → `host[:port]` extraction.
@@ -359,12 +432,10 @@ mod tests {
     /// stateless mode each request stands alone. The default
     /// `StreamableHttpServerConfig` is stateful, so we issue `initialize` once
     /// to capture the session id, then issue `tools/call`.
-    async fn initialize_then_call_whoami(
-        app: &Router,
-    ) -> Result<(StatusCode, Value), anyhow::Error> {
+    fn initialize_request(token: &str, id: u32) -> Result<Request<Body>, anyhow::Error> {
         let init_body = json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": id,
             "method": "initialize",
             "params": {
                 "protocolVersion": "2025-06-18",
@@ -372,20 +443,21 @@ mod tests {
                 "clientInfo": {"name": "matrix-mcp-test", "version": "0.0.1"}
             }
         });
-        let init_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("Host", "localhost")
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "application/json, text/event-stream")
-                    .header(header::AUTHORIZATION, "Bearer test-token")
-                    .body(Body::from(serde_json::to_vec(&init_body)?))
-                    .unwrap(),
-            )
-            .await?;
+        Ok(Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(serde_json::to_vec(&init_body)?))
+            .unwrap())
+    }
+
+    async fn initialize_then_call_whoami(
+        app: &Router,
+    ) -> Result<(StatusCode, Value), anyhow::Error> {
+        let init_response = app.clone().oneshot(initialize_request("test-token", 1)?).await?;
 
         let session_id = init_response
             .headers()
@@ -510,6 +582,34 @@ mod tests {
     // can realistically replay. The MCP routing layer is still
     // covered by `whoami` above; the SDK-backed tools get exercised
     // in production smoke testing.
+
+    #[tokio::test]
+    async fn repeated_initializes_are_rate_limited_per_identity() {
+        let mas_mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mas_mock)
+            .await;
+
+        let app = router(test_config(&mas_mock.uri(), "https://res.example"));
+        // Burn the entire per-identity initialize burst.
+        for id in 1..=MAX_INITIALIZES_PER_IDENTITY {
+            let response = app
+                .clone()
+                .oneshot(initialize_request("test-token", id).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "init {id} should succeed");
+        }
+        // The next fresh-session initialize from the same identity is
+        // denied with 429 BEFORE rmcp ever sees it.
+        let response = app
+            .oneshot(initialize_request("test-token", MAX_INITIALIZES_PER_IDENTITY + 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 
     #[tokio::test]
     async fn mcp_with_inactive_token_returns_401() {

@@ -42,10 +42,18 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
+
+/// Maximum number of fresh MCP sessions a single bearer token or MAS
+/// subject may open in a short burst. Legitimate Claude usage normally
+/// needs one or two live sessions; this leaves headroom for reconnects
+/// while preventing one authenticated identity from filling the global
+/// session pool (`session::MAX_SESSIONS`).
+pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 8;
 
 /// Limiter type alias — `governor`'s direct (non-keyed) variant; we
 /// build one per identity and hand it out keyed by bearer-hash or sub.
@@ -119,14 +127,23 @@ fn get_or_insert(
     key: &str,
     quota: NonZeroU32,
 ) -> Arc<Bucket> {
+    // `governor::Quota::per_minute(n)` translates to one token every
+    // (60/n) seconds with a burst of `n`.
+    get_or_insert_with_quota(map, key, Quota::per_minute(quota))
+}
+
+fn get_or_insert_with_quota(
+    map: &RwLock<HashMap<String, Arc<Bucket>>>,
+    key: &str,
+    quota: Quota,
+) -> Arc<Bucket> {
     if let Ok(guard) = map.read()
         && let Some(b) = guard.get(key)
     {
         return Arc::clone(b);
     }
     // Slow path: re-check under write lock to avoid double-insert under
-    // contention. `governor::Quota::per_minute(n)` translates to one
-    // token every (60/n) seconds with a burst of `n`.
+    // contention.
     let mut guard = match map.write() {
         Ok(g) => g,
         // RwLock poisoning is unrecoverable here. A poisoned lock means a
@@ -139,8 +156,61 @@ fn get_or_insert(
     Arc::clone(
         guard
             .entry(key.to_owned())
-            .or_insert_with(|| Arc::new(RateLimiter::direct(Quota::per_minute(quota)))),
+            .or_insert_with(|| Arc::new(RateLimiter::direct(quota))),
     )
+}
+
+/// Rate limiter dedicated to fresh MCP session creation (the
+/// `initialize` request without an `mcp-session-id` header). Tool-call
+/// rate limits do not protect this path because rmcp allocates the
+/// session before any tool handler runs, so the per-bucket charge
+/// inside [`Limiter::check`] never fires for the initialize request.
+///
+/// Keyed by bearer-hash AND MAS subject the same way [`Limiter`] is:
+/// a stolen token can't fan out more sessions than the bucket allows,
+/// and the same `sub` can't accumulate sessions across rotated tokens
+/// either.
+#[derive(Debug)]
+pub struct InitializeLimiter {
+    quota: Quota,
+    bearer: RwLock<HashMap<String, Arc<Bucket>>>,
+    sub: RwLock<HashMap<String, Arc<Bucket>>>,
+}
+
+impl InitializeLimiter {
+    /// New limiter that allows up to `burst` initialize calls back-to-back
+    /// and then refills one token every `replenish_1_per`. Pairing the
+    /// refill period with `session::SESSION_KEEP_ALIVE` means once an
+    /// attacker has filled their slots they can only open a new one as
+    /// fast as their existing ones idle out — exactly the timescale of
+    /// the global session-pool cap.
+    #[must_use]
+    pub fn new(replenish_1_per: Duration, burst: u32) -> Self {
+        let burst = NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN);
+        let quota = Quota::with_period(replenish_1_per)
+            .unwrap_or_else(|| Quota::per_minute(NonZeroU32::MIN))
+            .allow_burst(burst);
+        Self {
+            quota,
+            bearer: RwLock::new(HashMap::new()),
+            sub: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Check both per-bearer-hash and per-sub initialize buckets.
+    pub fn check(&self, bearer_hash: &str, sub: Option<&str>) -> Result<(), RateLimited> {
+        let bearer_bucket = get_or_insert_with_quota(&self.bearer, bearer_hash, self.quota);
+        if bearer_bucket.check().is_err() {
+            return Err(RateLimited);
+        }
+        if let Some(s) = sub {
+            let sub_bucket = get_or_insert_with_quota(&self.sub, s, self.quota);
+            if sub_bucket.check().is_err() {
+                return Err(RateLimited);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +263,30 @@ mod tests {
         l.check("h1", None, Category::Read).unwrap();
         assert!(l.check("h1", None, Category::Read).is_err());
         l.check("h2", None, Category::Read).unwrap();
+    }
+
+    #[test]
+    fn initialize_limiter_denies_after_burst_on_bearer() {
+        let l = InitializeLimiter::new(Duration::from_secs(60), 2);
+        l.check("h", Some("s")).unwrap();
+        l.check("h", Some("s")).unwrap();
+        assert!(l.check("h", Some("s")).is_err());
+    }
+
+    #[test]
+    fn initialize_limiter_denies_across_bearers_for_same_sub() {
+        let l = InitializeLimiter::new(Duration::from_secs(60), 1);
+        l.check("h1", Some("s")).unwrap();
+        // Different bearer, same sub → sub bucket exhausted.
+        assert!(l.check("h2", Some("s")).is_err());
+    }
+
+    #[test]
+    fn initialize_limiter_no_sub_uses_bearer_only() {
+        let l = InitializeLimiter::new(Duration::from_secs(60), 1);
+        l.check("h", None).unwrap();
+        assert!(l.check("h", None).is_err());
+        // Different bearer → fresh bucket.
+        l.check("h2", None).unwrap();
     }
 }
