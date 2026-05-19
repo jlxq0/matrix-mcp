@@ -236,6 +236,14 @@ const MAX_REDACTION_REASON_BYTES: usize = MAX_TEXT_MESSAGE_BODY_BYTES;
 /// matrix-mcp clamps lower to bound per-request allocations.
 const MAX_ACCOUNT_DATA_CONTENT_BYTES: usize = 32 * 1024;
 
+/// Hard cap on the number of state events `get_room_state` returns when
+/// `state_key` is omitted. Public/federated rooms can have tens of
+/// thousands of state events of certain types (member, ACL rule sets);
+/// the cap bounds per-call memory + serialization without rejecting
+/// outright. Callers needing more should narrow with a `state_key` or
+/// use a typed tool like `room_members`.
+const MAX_STATE_EVENTS: usize = 500;
+
 /// Global account-data event types that matrix-mcp refuses to write
 /// through the generic `set_account_data` tool. Two categories:
 ///
@@ -1085,12 +1093,16 @@ pub struct GetRoomStateParams {
     pub room_id: String,
     /// Matrix state event type to fetch (e.g. `m.room.name`,
     /// `m.room.topic`, `m.room.member`, `m.room.power_levels`,
-    /// `m.room.pinned_events`). Required so the response is bounded
-    /// — `m.room.member` in a large room can be hundreds of events.
+    /// `m.room.pinned_events`). Required so the response is bounded.
+    /// `m.room.member` specifically is rejected when `state_key` is
+    /// omitted — public/federated rooms can have tens of thousands of
+    /// member events; use `room_members` for bounded listing or pass a
+    /// concrete MXID as `state_key`.
     pub event_type: String,
     /// When set, return only the state event whose `state_key`
     /// equals this. Useful for `m.room.member` lookups by mxid.
-    /// When `null` (default), return all events of `event_type`.
+    /// When `null` (default), return all events of `event_type`,
+    /// truncated at [`MAX_STATE_EVENTS`].
     #[serde(default)]
     pub state_key: Option<String>,
 }
@@ -1109,7 +1121,17 @@ pub struct StateEventInfo {
 pub struct GetRoomStateResult {
     pub room_id: String,
     pub event_type: String,
+    /// State events of the requested type. Capped at
+    /// [`MAX_STATE_EVENTS`]; when the upstream list is longer,
+    /// `truncated` is set and the array contains the first N entries
+    /// in iteration order (matrix-sdk does not expose a stable sort
+    /// for state queries, so the truncation point is best-effort).
     pub events: Vec<StateEventInfo>,
+    /// True iff the upstream state list was longer than
+    /// [`MAX_STATE_EVENTS`] and `events` was truncated. When `true`,
+    /// the caller should narrow the query with a concrete
+    /// `state_key` (or use a typed tool like `room_members`).
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3112,6 +3134,20 @@ impl MatrixMcpService {
             let room = client.get_room(&room_id).ok_or_else(|| {
                 ErrorData::invalid_params(format!("not joined to {room_id}"), None)
             })?;
+            // m.room.member specifically is high-cardinality in
+            // public/federated rooms (tens of thousands of events).
+            // Reject the all-keys query early — the caller should use
+            // `room_members` for bounded listing, or pass a concrete
+            // MXID as `state_key` for a one-shot membership lookup.
+            if params.state_key.is_none() && params.event_type == "m.room.member" {
+                return Err(ErrorData::invalid_params(
+                    "get_room_state for `m.room.member` without state_key is rejected \
+                     (public rooms can have tens of thousands of members); use \
+                     `room_members` for a bounded listing, or pass the target MXID \
+                     as state_key for a single-member lookup",
+                    None,
+                ));
+            }
             let event_type: StateEventType = params.event_type.as_str().into();
             // SDK's get_state_events_for_keys takes an iterator of
             // state_key strs; get_state_events with no key returns
@@ -3132,8 +3168,11 @@ impl MatrixMcpService {
                         ErrorData::internal_error(format!("get_state_events: {e}"), None)
                     })?
                 };
+            let total = raws.len();
+            let truncated = total > MAX_STATE_EVENTS;
             let events: Vec<StateEventInfo> = raws
                 .into_iter()
+                .take(MAX_STATE_EVENTS)
                 .map(|raw| {
                     // `RawAnySyncOrStrippedState` is a Sync/Stripped enum
                     // around `Raw<…>`. Both variants serialize back to the
@@ -3148,6 +3187,7 @@ impl MatrixMcpService {
                 room_id: room_id.to_string(),
                 event_type: params.event_type,
                 events,
+                truncated,
             });
             Ok::<_, ErrorData>((res, count))
         }
