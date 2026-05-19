@@ -69,12 +69,26 @@ pub struct KeyBackupGate {
 }
 
 struct Inner {
-    /// Maximum concurrent in-flight pulls across all rooms.
+    /// Maximum concurrent in-flight pulls across all rooms / users.
+    /// The cap is process-global rather than per-user because the
+    /// resource it protects (matrix-sdk crypto-store contention,
+    /// Synapse `/room_keys` request budget) is shared.
     semaphore: Arc<Semaphore>,
-    /// Last successful pull time per room. Bounded by number of
-    /// joined encrypted rooms (small) — no eviction needed.
-    last_pull: RwLock<HashMap<OwnedRoomId, Instant>>,
+    /// Last successful pull time per (caller, room). The key
+    /// includes the caller's stable identifier (typically the MAS
+    /// subject, sometimes the MXID for `/setup/recover`) so that
+    /// one user's successful pull does not silently suppress
+    /// another user's recovery for the same shared encrypted room.
+    /// Bounded by number of distinct (user, room) pairs — small
+    /// for normal usage; no eviction needed.
+    last_pull: RwLock<HashMap<CooldownKey, Instant>>,
 }
+
+/// Cooldown-map key. The caller is identified by an opaque string
+/// (MAS subject in normal MCP requests, MXID in `/setup/recover`).
+/// Either is stable per-user; using the opaque string lets the call
+/// site pick whichever identifier it already has.
+type CooldownKey = (String, OwnedRoomId);
 
 /// Permit returned by [`KeyBackupGate::try_acquire`]. Holding it
 /// reserves one of the [`MAX_CONCURRENT`] slots; dropping it (after
@@ -82,16 +96,17 @@ struct Inner {
 pub struct PullPermit {
     _semaphore_permit: tokio::sync::OwnedSemaphorePermit,
     gate: KeyBackupGate,
+    caller: String,
     room_id: OwnedRoomId,
 }
 
 impl PullPermit {
-    /// Mark the pull as completed successfully so the per-room
+    /// Mark the pull as completed successfully so the per-(caller, room)
     /// cooldown applies to subsequent calls. On failure, don't call
     /// this — the caller may legitimately want to retry sooner.
     pub fn record_success(&self) {
         if let Ok(mut map) = self.gate.inner.last_pull.write() {
-            map.insert(self.room_id.clone(), Instant::now());
+            map.insert((self.caller.clone(), self.room_id.clone()), Instant::now());
         }
     }
 }
@@ -109,12 +124,22 @@ impl KeyBackupGate {
 
     /// Non-blocking permit attempt. Returns:
     /// * `Ok(Some(permit))` — proceed with the pull.
-    /// * `Ok(None)` — silent skip (cooldown still active). Use this
-    ///   branch in detached helpers like `spawn_key_backup_pull_if_needed`.
-    /// * `Err(reason)` — concurrency cap reached. Surface to the
-    ///   caller in explicit tool invocations.
-    pub fn try_acquire(&self, room_id: &RoomId) -> Result<Option<PullPermit>, GateBusy> {
-        if self.in_cooldown(room_id) {
+    /// * `Ok(None)` — silent skip (cooldown still active for this
+    ///   `(caller, room)`). Use this branch in detached helpers like
+    ///   `spawn_key_backup_pull_if_needed`.
+    /// * `Err(reason)` — global concurrency cap reached. Surface to
+    ///   the caller in explicit tool invocations.
+    ///
+    /// `caller` is the caller's stable identifier (MAS subject in
+    /// normal MCP requests, MXID in `/setup/recover`). The cooldown
+    /// is scoped to `(caller, room)` so user A's pull doesn't block
+    /// user B's recovery for a shared encrypted room.
+    pub fn try_acquire(
+        &self,
+        caller: &str,
+        room_id: &RoomId,
+    ) -> Result<Option<PullPermit>, GateBusy> {
+        if self.in_cooldown(caller, room_id) {
             return Ok(None);
         }
         self.inner
@@ -125,18 +150,20 @@ impl KeyBackupGate {
                 Ok(Some(PullPermit {
                     _semaphore_permit: p,
                     gate: self.clone(),
+                    caller: caller.to_owned(),
                     room_id: room_id.to_owned(),
                 }))
             })
     }
 
-    /// True when a successful pull for `room_id` happened less than
-    /// [`COOLDOWN`] ago.
-    fn in_cooldown(&self, room_id: &RoomId) -> bool {
+    /// True when a successful pull for `(caller, room_id)` happened
+    /// less than [`COOLDOWN`] ago.
+    fn in_cooldown(&self, caller: &str, room_id: &RoomId) -> bool {
         let Ok(map) = self.inner.last_pull.read() else {
             return false;
         };
-        map.get(room_id).is_some_and(|t| t.elapsed() < COOLDOWN)
+        map.get(&(caller.to_owned(), room_id.to_owned()))
+            .is_some_and(|t| t.elapsed() < COOLDOWN)
     }
 }
 
@@ -185,10 +212,13 @@ mod tests {
         s.parse().unwrap()
     }
 
+    const ALICE: &str = "01JABCDEFGHJKMNPQRSTVWXY01"; // MAS subject ULID shape
+    const BOB: &str = "01JABCDEFGHJKMNPQRSTVWXY02";
+
     #[test]
     fn first_acquire_succeeds() {
         let g = KeyBackupGate::new();
-        let p = g.try_acquire(&rid("!a:example.test")).unwrap();
+        let p = g.try_acquire(ALICE, &rid("!a:example.test")).unwrap();
         assert!(p.is_some());
     }
 
@@ -196,11 +226,31 @@ mod tests {
     fn cooldown_short_circuits_until_recorded_success_ages_out() {
         let g = KeyBackupGate::new();
         let r = rid("!a:example.test");
-        let p = g.try_acquire(&r).unwrap().unwrap();
+        let p = g.try_acquire(ALICE, &r).unwrap().unwrap();
         p.record_success();
         drop(p);
-        // Second attempt immediately after success → cooldown skip.
-        assert!(g.try_acquire(&r).unwrap().is_none());
+        // Second attempt by the same caller for the same room →
+        // cooldown skip.
+        assert!(g.try_acquire(ALICE, &r).unwrap().is_none());
+    }
+
+    #[test]
+    fn cooldown_is_per_caller_not_global() {
+        // Regression: a successful pull by user A for room R must
+        // NOT block user B from pulling the same room. The previous
+        // implementation keyed cooldown by room only, which silently
+        // suppressed cross-user E2EE recovery for shared rooms.
+        let g = KeyBackupGate::new();
+        let r = rid("!shared:example.test");
+        let a = g.try_acquire(ALICE, &r).unwrap().unwrap();
+        a.record_success();
+        drop(a);
+        // Bob, different caller, same room → must get a permit.
+        let b = g.try_acquire(BOB, &r).unwrap();
+        assert!(
+            b.is_some(),
+            "user B was blocked by user A's cooldown for shared room"
+        );
     }
 
     #[test]
@@ -211,24 +261,25 @@ mod tests {
             .collect();
         let permits: Vec<_> = rooms
             .iter()
-            .map(|r| g.try_acquire(r).unwrap().unwrap())
+            .map(|r| g.try_acquire(ALICE, r).unwrap().unwrap())
             .collect();
-        // One more slot → GateBusy.
+        // One more slot → GateBusy (process-global, deliberately —
+        // protects the shared crypto-store / Synapse budget).
         let extra = rid("!extra:example.test");
-        assert!(matches!(g.try_acquire(&extra), Err(GateBusy)));
+        assert!(matches!(g.try_acquire(ALICE, &extra), Err(GateBusy)));
         // Drop one permit → next attempt for a fresh room succeeds.
         drop(permits.into_iter().next().unwrap());
-        assert!(g.try_acquire(&extra).unwrap().is_some());
+        assert!(g.try_acquire(ALICE, &extra).unwrap().is_some());
     }
 
     #[test]
     fn permit_without_record_success_does_not_set_cooldown() {
         let g = KeyBackupGate::new();
         let r = rid("!a:example.test");
-        let p = g.try_acquire(&r).unwrap().unwrap();
+        let p = g.try_acquire(ALICE, &r).unwrap().unwrap();
         // Don't call record_success — simulates a failed pull.
         drop(p);
         // Cooldown should NOT be active; caller can retry immediately.
-        assert!(g.try_acquire(&r).unwrap().is_some());
+        assert!(g.try_acquire(ALICE, &r).unwrap().is_some());
     }
 }

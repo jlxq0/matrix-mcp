@@ -1677,7 +1677,16 @@ impl MatrixMcpService {
             // server-side key-backup pull in the background. Best-effort:
             // sessions in backup self-heal on the next read; sessions
             // that were never backed up stay opaque.
-            spawn_key_backup_pull_if_needed(&self.key_backup_gate, &client, &room_id, &events);
+            let caller_sub = identity_from_ctx(&ctx)
+                .map(|i| i.mas_subject)
+                .unwrap_or_default();
+            spawn_key_backup_pull_if_needed(
+                &self.key_backup_gate,
+                &caller_sub,
+                &client,
+                &room_id,
+                &events,
+            );
             let count = events.len();
             let res = structured_result(&ReadRecentMessagesResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -1768,7 +1777,16 @@ impl MatrixMcpService {
             })?;
 
             let events = read_events_from_chunk(relations.chunk);
-            spawn_key_backup_pull_if_needed(&self.key_backup_gate, &client, &room_id, &events);
+            let caller_sub = identity_from_ctx(&ctx)
+                .map(|i| i.mas_subject)
+                .unwrap_or_default();
+            spawn_key_backup_pull_if_needed(
+                &self.key_backup_gate,
+                &caller_sub,
+                &client,
+                &room_id,
+                &events,
+            );
             let count = events.len();
             let res = structured_result(&ReadThreadResult { events });
             Ok::<_, ErrorData>((res, count))
@@ -2712,11 +2730,14 @@ impl MatrixMcpService {
                     None,
                 ));
             }
-            // Per-room cooldown + global concurrency. Surface a clear
-            // rate-limited / cooldown rejection to the explicit tool
-            // caller instead of silently skipping (the auto-pull
-            // helper does silent-skip).
-            let permit = match self.key_backup_gate.try_acquire(&room_id) {
+            // Per-(caller, room) cooldown + global concurrency. The
+            // caller key is the MAS subject so one user's pull doesn't
+            // suppress another user's recovery for a shared encrypted
+            // room. Surface cooldown rejection to the explicit tool
+            // caller (the auto-pull helper does silent-skip below).
+            let identity = identity_from_ctx(&ctx).ok_or_else(missing_identity_err)?;
+            let caller_sub = identity.mas_subject;
+            let permit = match self.key_backup_gate.try_acquire(&caller_sub, &room_id) {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     return Err(ErrorData::invalid_params(
@@ -6609,6 +6630,7 @@ pub fn token_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<AccessToken> {
 /// to the caller still surfaces the undecryptable status.
 fn spawn_key_backup_pull_if_needed(
     gate: &crate::key_backup_gate::KeyBackupGate,
+    caller_sub: &str,
     client: &matrix_sdk::Client,
     room_id: &matrix_sdk::ruma::RoomId,
     events: &[ReadEvent],
@@ -6620,11 +6642,12 @@ fn spawn_key_backup_pull_if_needed(
     if undecryptable == 0 {
         return;
     }
-    // Per-room cooldown + global concurrency. Auto-pull is best-effort
-    // recovery for self-healing reads, so we silently skip when either
-    // bound is hit — the caller will see undecryptable status and can
-    // invoke `request_room_keys` explicitly to surface the rejection.
-    let permit = match gate.try_acquire(room_id) {
+    // Per-(caller, room) cooldown + global concurrency. Auto-pull is
+    // best-effort recovery for self-healing reads, so we silently
+    // skip when either bound is hit — the caller will see
+    // undecryptable status and can invoke `request_room_keys`
+    // explicitly to surface the rejection.
+    let permit = match gate.try_acquire(caller_sub, room_id) {
         Ok(Some(p)) => p,
         Ok(None) => {
             tracing::debug!(

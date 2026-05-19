@@ -604,7 +604,10 @@ pub async fn recover(
                         // can't double-pull the same room and our
                         // global concurrency cap also applies to the
                         // MCP `request_room_keys` tool.
-                        let permit = match key_backup_gate.try_acquire(&room_id) {
+                        // Caller key is the MXID (we don't have the
+                        // MAS subject here; MXID is stable per-user
+                        // for the lifetime of the cooldown window).
+                        let permit = match key_backup_gate.try_acquire(&mxid_for_log, &room_id) {
                             Ok(Some(p)) => p,
                             Ok(None) => {
                                 skipped_cooldown += 1;
