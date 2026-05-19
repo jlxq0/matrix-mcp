@@ -406,6 +406,23 @@ async fn sync_watchdog(weak: std::sync::Weak<Client>, mxid: String) {
             }
             Err(e) => {
                 attempt = attempt.saturating_add(1);
+                // Permanent auth failures don't recover with backoff —
+                // the bearer token is gone (claude.ai reconnect, MAS
+                // session revoked, user signed out). Stop the watchdog
+                // instead of pounding Synapse with M_UNKNOWN_TOKEN
+                // forever; the next /mcp call will rebuild a fresh
+                // client with the new token.
+                let err_msg = e.to_string();
+                if is_permanent_auth_failure(&err_msg) {
+                    info!(
+                        mxid = %mxid,
+                        attempt = attempt,
+                        error = %e,
+                        "matrix-sdk sync hit permanent auth failure; \
+                         exiting watchdog (cache will rebuild on next /mcp request)",
+                    );
+                    return;
+                }
                 warn!(
                     mxid = %mxid,
                     attempt = attempt,
@@ -434,6 +451,15 @@ async fn sync_watchdog(weak: std::sync::Weak<Client>, mxid: String) {
             }
         }
     }
+}
+
+/// True if the matrix-sdk sync error message indicates the bearer token
+/// has been permanently rejected by the homeserver. Matches the same
+/// signatures used by `is_auth_expiry_signature` in `mcp.rs`. Substring
+/// match is fine — these strings only appear in legitimate 401
+/// envelopes.
+fn is_permanent_auth_failure(msg: &str) -> bool {
+    msg.contains("M_UNKNOWN_TOKEN") || msg.contains("Token is not active")
 }
 
 /// SHA-256 the mxid, hex-encode, take the first 32 chars. Stable and
@@ -484,6 +510,25 @@ fn token_hash(access_token: &str) -> [u8; 32] {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permanent_auth_failure_signatures() {
+        assert!(is_permanent_auth_failure(
+            "error sending request: M_UNKNOWN_TOKEN: Token is not active"
+        ));
+        assert!(is_permanent_auth_failure(
+            "[401 / M_UNKNOWN_TOKEN] Invalid access token passed."
+        ));
+        assert!(is_permanent_auth_failure(
+            "the homeserver responded: Token is not active"
+        ));
+        // Network / transient errors must NOT match — those should retry.
+        assert!(!is_permanent_auth_failure("connection refused"));
+        assert!(!is_permanent_auth_failure("504 Gateway Timeout"));
+        assert!(!is_permanent_auth_failure(
+            "operation timed out after 30 seconds"
+        ));
+    }
 
     #[test]
     fn mxid_dir_name_is_stable() {
