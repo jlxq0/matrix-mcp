@@ -1,5 +1,7 @@
 # matrix-mcp
 
+[![CI](https://forge.oddie.app/julian/matrix-mcp/actions/workflows/ci.yml/badge.svg)](https://forge.oddie.app/julian/matrix-mcp/actions?workflow=ci.yml)
+
 A remote MCP server that lets [claude.ai](https://claude.ai) (or any other
 MCP client) read, search, and write in your [Matrix](https://matrix.org)
 account – including in **end-to-end-encrypted rooms** – using your existing
@@ -67,7 +69,7 @@ docker run --rm -p 3000:3000 \
   -e MATRIX_MCP_INTROSPECTION_CLIENT_SECRET=... \
   -e MATRIX_MCP_STORE_DIR=/var/lib/matrix-mcp \
   -e MATRIX_MCP_STORE_PEPPER="$(openssl rand -hex 32)" \
-  ghcr.io/jlxq0/matrix-mcp:v0.3.18
+  ghcr.io/jlxq0/matrix-mcp:v0.3.20
 ```
 
 Then point a public hostname at it over HTTPS (claude.ai requires
@@ -125,7 +127,7 @@ otherwise. Conventional Commits for messages.
 | [`docs/onboarding.md`](docs/onboarding.md) | Connecting from claude.ai end-to-end |
 | [`docs/installation.md`](docs/installation.md) | Deploy on a VPS or Kubernetes |
 | [`docs/architecture.md`](docs/architecture.md) | Component diagrams, OAuth dance, sync loop, storage layout |
-| [`docs/api-reference.md`](docs/api-reference.md) | All 19 tools, arguments, return shapes |
+| [`docs/api-reference.md`](docs/api-reference.md) | Arguments + return shapes for the most-used tools (full set returned by `tools/list`) |
 | [`docs/operations.md`](docs/operations.md) | Running in production, debug recipes, pepper rotation |
 | [`docs/security.md`](docs/security.md) | Implementation-level security notes |
 | [`docs/multi-user.md`](docs/multi-user.md) | Multi-user isolation guarantees |
