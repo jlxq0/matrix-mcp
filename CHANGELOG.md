@@ -6,6 +6,39 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Security (secscan Group A: validation/clamp fixes)
+- `audit_room::emit_notice` drops the `target_room` field from the
+  user-visible audit-room notice body when the raw `room_id` string
+  fails Matrix-id validation (whitespace/control-char free + Ruma
+  `RoomId::parse`). Previously a crafted `room_id` containing newlines
+  and a forged `outcome=ok` fragment could poison the audit trail.
+  Closes secscan #071b456a.
+- `invites_reject` requires `RoomState::Invited`. Previously
+  `room.leave()` was called unconditionally, so the tool — advertised
+  as non-destructive — could silently leave a Joined room. Returns
+  `invalid_params` with a pointer to `leave_room` otherwise.
+  Closes secscan #8aac2b50.
+- `read_thread` requires `RoomState::Joined` (matching `room_info`).
+  Previously any room in the SDK cache (invited/left/knocked/banned)
+  would yield thread replies. Closes secscan #f43552ff.
+- `send_reaction` rejects keys longer than 1 KiB; `redact_message`
+  rejects reasons longer than 64 KiB. Brings these write tools in
+  line with the existing `send_text_message` body cap.
+  Closes secscan #162d4cf5.
+- `get_user_receipts` caps `user_ids` at 100 entries; `get_event_receipts`
+  truncates the returned readers list at 1000 and surfaces a
+  `truncated: bool` field. Closes secscan #603a9b23.
+- `message_edit` refuses to send an `m.replace` whose target was
+  authored by a different user. Spec-compliant clients ignore forged
+  edits, but buggy clients / bridges / downstream consumers may not.
+  Closes secscan #d412f0c4.
+
+### Changed
+- Install snippets (README + examples/docker-compose.yml) pin the
+  image tag to `v0.3.14` rather than the mutable `:latest`. The
+  Kubernetes guide in `docs/installation.md` was already pinned.
+  Closes secscan #dca0974a.
+
 ### Fixed
 - `set_account_data` no longer rejects content from MCP clients that
   JSON-encode the `content` argument as a string. claude.ai sends

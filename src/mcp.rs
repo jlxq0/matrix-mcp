@@ -203,6 +203,25 @@ const MAX_MESSAGE_LIMIT: u32 = 50;
 /// uploads.
 const MAX_TEXT_MESSAGE_BODY_BYTES: usize = 64 * 1024;
 
+/// Hard cap on the byte length of a `send_reaction` key. Real reactions
+/// are short (typically a single emoji); this is generous headroom for
+/// custom-emoji shortcodes without leaving the field unbounded.
+const MAX_REACTION_KEY_BYTES: usize = 1024;
+
+/// Hard cap on the number of MXIDs `get_user_receipts` will look up in
+/// one call. One SDK round-trip per user, so an unbounded list is a
+/// trivially authenticated `DoS` through a single read-rate token.
+const MAX_RECEIPT_USERS: usize = 100;
+
+/// Hard cap on the number of receipts `get_event_receipts` returns for
+/// one event. Busy public rooms can have thousands of readers; cap so
+/// one call doesn't have to serialize and ship that whole list.
+const MAX_EVENT_RECEIPT_READERS: usize = 1000;
+
+/// Hard cap on the byte length of a `redact_message` reason. Matches the
+/// same envelope-size bound applied to text-message bodies.
+const MAX_REDACTION_REASON_BYTES: usize = MAX_TEXT_MESSAGE_BODY_BYTES;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadRecentMessagesParams {
     /// Matrix room id, e.g. `!abc:example.com`.
@@ -232,6 +251,35 @@ fn validate_text_message_body(body: &str) -> Result<(), ErrorData> {
     if len > MAX_TEXT_MESSAGE_BODY_BYTES {
         return Err(ErrorData::invalid_params(
             format!("message body is {len} bytes; maximum is {MAX_TEXT_MESSAGE_BODY_BYTES} bytes"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Reject reaction keys longer than [`MAX_REACTION_KEY_BYTES`].
+fn validate_reaction_key(key: &str) -> Result<(), ErrorData> {
+    let len = key.len();
+    if len > MAX_REACTION_KEY_BYTES {
+        return Err(ErrorData::invalid_params(
+            format!("reaction key is {len} bytes; maximum is {MAX_REACTION_KEY_BYTES} bytes"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Reject redaction reasons longer than [`MAX_REDACTION_REASON_BYTES`].
+fn validate_redaction_reason(reason: Option<&str>) -> Result<(), ErrorData> {
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    let len = reason.len();
+    if len > MAX_REDACTION_REASON_BYTES {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "redaction reason is {len} bytes; maximum is {MAX_REDACTION_REASON_BYTES} bytes"
+            ),
             None,
         ));
     }
@@ -919,7 +967,15 @@ pub struct GetEventReceiptsResult {
     /// included — only the caller could ever see those for
     /// themselves, and Synapse only exposes public ones to
     /// general-purpose `/read_markers` queries.
+    ///
+    /// Capped at [`MAX_EVENT_RECEIPT_READERS`]. When the room has
+    /// more readers than the cap, the array is truncated and
+    /// `truncated` is set; the cap is high enough that hitting it
+    /// in normal use is unusual.
     pub readers: Vec<EventReceiptInfo>,
+    /// True iff the upstream reader list was longer than
+    /// [`MAX_EVENT_RECEIPT_READERS`] and `readers` was truncated.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1609,6 +1665,19 @@ impl MatrixMcpService {
             let room = client.get_room(&room_id).ok_or_else(|| {
                 ErrorData::invalid_params(format!("not joined to {room_id}"), None)
             })?;
+            // get_room() returns any room known to the SDK cache (invited,
+            // left, knocked, banned) — not only joined rooms. Require
+            // Joined to match the tool description and the behaviour of
+            // sibling read tools (room_info, etc.).
+            if room.state() != matrix_sdk::RoomState::Joined {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "not joined to {room_id} (current state: {:?})",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
             let root_event_id: OwnedEventId = params.root_event_id.parse().map_err(|e| {
                 ErrorData::invalid_params(
                     format!("invalid root_event_id {}: {e}", params.root_event_id),
@@ -1792,6 +1861,28 @@ impl MatrixMcpService {
                         None,
                     )
                 })?;
+            // Matrix homeservers authorize an m.replace as an ordinary
+            // m.room.message send; the spec-required check that
+            // `m.relates_to.event_id`'s sender matches the editor is a
+            // client-side responsibility. Standards-compliant clients
+            // (Element et al.) ignore replacements whose sender differs
+            // from the original event's sender — but buggy clients,
+            // bridges, bots, and downstream message consumers do not.
+            // Refuse to send the edit if the caller is not the original
+            // sender, so matrix-mcp never produces a forged-edit event
+            // that those consumers might honour.
+            let caller_user_id = client
+                .user_id()
+                .ok_or_else(|| ErrorData::internal_error("matrix client has no user_id", None))?;
+            if original.sender != caller_user_id {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "cannot edit event {event_id}: original sender is {} but caller is {}",
+                        original.sender, caller_user_id
+                    ),
+                    None,
+                ));
+            }
             let new_content = RoomMessageEventContent::text_markdown(&params.new_body)
                 .make_replacement(&original);
             let response = room
@@ -2612,6 +2703,15 @@ impl MatrixMcpService {
                     .map(|i| vec![i.mxid.clone()])
                     .unwrap_or_default()
             });
+            if raw_user_ids.len() > MAX_RECEIPT_USERS {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "user_ids has {} entries; maximum is {MAX_RECEIPT_USERS}",
+                        raw_user_ids.len()
+                    ),
+                    None,
+                ));
+            }
             let mut receipts: Vec<UserReceiptInfo> = Vec::with_capacity(raw_user_ids.len());
             for raw in raw_user_ids {
                 let user_id = match UserId::parse(&raw) {
@@ -2716,8 +2816,11 @@ impl MatrixMcpService {
                 .map_err(|e| {
                     ErrorData::internal_error(format!("load_event_receipts: {e}"), None)
                 })?;
+            let total = pairs.len();
+            let truncated = total > MAX_EVENT_RECEIPT_READERS;
             let readers: Vec<EventReceiptInfo> = pairs
                 .into_iter()
+                .take(MAX_EVENT_RECEIPT_READERS)
                 .map(|(user_id, receipt)| EventReceiptInfo {
                     user_id: user_id.to_string(),
                     ts_unix_ms: receipt.ts.map(|ts| u64::from(ts.get())),
@@ -2728,6 +2831,7 @@ impl MatrixMcpService {
                 room_id: room_id.to_string(),
                 event_id: event_id.to_string(),
                 readers,
+                truncated,
             });
             Ok::<_, ErrorData>((res, count))
         }
@@ -3357,6 +3461,7 @@ impl MatrixMcpService {
         let span = make_tool_span("send_reaction", &mxid_for_audit, Some(&room_id_for_audit));
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            validate_reaction_key(&params.key)?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
@@ -3431,6 +3536,7 @@ impl MatrixMcpService {
         let span = make_tool_span("redact_message", &mxid_for_audit, Some(&room_id_for_audit));
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            validate_redaction_reason(params.reason.as_deref())?;
             let client = self.client_for(&ctx).await?;
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
@@ -5115,6 +5221,23 @@ impl MatrixMcpService {
             let room = client.get_room(&room_id).ok_or_else(|| {
                 ErrorData::invalid_params(format!("no such room {room_id}"), None)
             })?;
+            // The SDK's `room.leave()` is the same call used by the
+            // explicit `leave_room` tool: it works on Joined rooms too.
+            // The tool is advertised as non-destructive (a reject is
+            // expected to be a no-op on Joined rooms), so guard against
+            // a misdirected call by checking the room state first. If
+            // the room is no longer in the Invited state, surface that
+            // explicitly rather than silently leaving a joined room.
+            if room.state() != matrix_sdk::RoomState::Invited {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "room {room_id} is not in the Invited state \
+                         (current state: {:?}); use `leave_room` to leave a joined room",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
             room.leave()
                 .await
                 .map_err(|e| ErrorData::internal_error(format!("room.leave: {e}"), None))?;
@@ -6461,6 +6584,23 @@ mod tests {
 
         let oversized = "a".repeat(MAX_TEXT_MESSAGE_BODY_BYTES + 1);
         assert!(validate_text_message_body(&oversized).is_err());
+    }
+
+    #[test]
+    fn oversized_reaction_key_is_rejected() {
+        let at_limit = "a".repeat(MAX_REACTION_KEY_BYTES);
+        assert!(validate_reaction_key(&at_limit).is_ok());
+        let oversized = "a".repeat(MAX_REACTION_KEY_BYTES + 1);
+        assert!(validate_reaction_key(&oversized).is_err());
+    }
+
+    #[test]
+    fn oversized_redaction_reason_is_rejected() {
+        assert!(validate_redaction_reason(None).is_ok());
+        let at_limit = "a".repeat(MAX_REDACTION_REASON_BYTES);
+        assert!(validate_redaction_reason(Some(&at_limit)).is_ok());
+        let oversized = "a".repeat(MAX_REDACTION_REASON_BYTES + 1);
+        assert!(validate_redaction_reason(Some(&oversized)).is_err());
     }
 
     #[test]

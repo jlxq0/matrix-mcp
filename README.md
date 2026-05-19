@@ -56,7 +56,7 @@ docker run --rm -p 3000:3000 \
   -e MATRIX_MCP_INTROSPECTION_CLIENT_SECRET=... \
   -e MATRIX_MCP_STORE_DIR=/var/lib/matrix-mcp \
   -e MATRIX_MCP_STORE_PEPPER="$(openssl rand -hex 32)" \
-  ghcr.io/jlxq0/matrix-mcp:latest
+  ghcr.io/jlxq0/matrix-mcp:v0.3.14
 ```
 
 Then point a public hostname at it over HTTPS (claude.ai requires
