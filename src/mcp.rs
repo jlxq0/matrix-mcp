@@ -1049,6 +1049,150 @@ pub struct ListIgnoredUsersResult {
     pub user_ids: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Account data + presence + media upload + space hierarchy (PR-D)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetAccountDataParams {
+    /// Global account-data event type to read, e.g.
+    /// `m.direct`, `m.push_rules`, `m.ignored_user_list`,
+    /// `m.identity_server`, or any custom type a client has set.
+    pub event_type: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GetAccountDataResult {
+    pub event_type: String,
+    /// Raw account-data content as JSON, or `null` if no account
+    /// data event of this type exists for the user. Schema varies
+    /// per `event_type`.
+    pub content: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetAccountDataParams {
+    pub event_type: String,
+    /// New account-data content as JSON. Replaces the previous
+    /// content for this `event_type` atomically. Pass `{}` to clear
+    /// (most types interpret missing fields as defaults).
+    pub content: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SetAccountDataResult {
+    pub event_type: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UploadMediaFromUrlParams {
+    /// HTTPS URL to fetch and upload. Same fetch policy as
+    /// `send_image_from_url` et al: HTTPS-only, 3-redirect limit,
+    /// 15 s timeout, size-capped by `MATRIX_MCP_UPLOAD_MAX_BYTES`.
+    pub url: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct UploadMediaFromUrlResult {
+    /// `mxc://` URI of the uploaded media. Pass this to other
+    /// tools that accept media references (e.g. set as an avatar,
+    /// reference in a custom event body).
+    pub mxc_uri: String,
+    /// MIME type the server saw. Useful for downstream tools that
+    /// need to round-trip the content type.
+    pub mime_type: String,
+    /// Size of the uploaded blob in bytes.
+    pub bytes: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetPresenceParams {
+    /// MXID to look up. Defaults to the caller's own MXID.
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct PresenceInfo {
+    pub user_id: String,
+    /// One of `online`, `offline`, `unavailable`. Spec-defined set
+    /// per RFC-style enum; surfaced as a lowercase string.
+    pub presence: String,
+    /// Free-form status message the user set with their presence.
+    /// `null` when unset.
+    pub status_msg: Option<String>,
+    /// Whether the user is "currently active" (interpretation
+    /// varies per homeserver). `null` when not reported.
+    pub currently_active: Option<bool>,
+    /// Milliseconds since the user's last activity. `null` when
+    /// not reported.
+    pub last_active_ago_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetPresenceParams {
+    /// New presence state: `online`, `offline`, or `unavailable`.
+    pub presence: String,
+    /// Optional free-form status message displayed alongside the
+    /// presence state in compliant clients.
+    #[serde(default)]
+    pub status_msg: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SetPresenceResult {
+    pub presence: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetSpaceHierarchyParams {
+    /// Matrix room id of the **space** (a room of type `m.space`)
+    /// whose child rooms you want to list.
+    pub room_id: String,
+    /// Maximum rooms to return per response. Default 50, capped at
+    /// [`MAX_SPACE_HIERARCHY_LIMIT`] (200).
+    #[serde(default = "default_space_hierarchy_limit")]
+    pub limit: u32,
+    /// How deep to descend into nested spaces. Default 3.
+    #[serde(default = "default_space_hierarchy_max_depth")]
+    pub max_depth: u32,
+    /// When `true`, the homeserver returns only rooms annotated
+    /// `suggested: true` in their `m.space.child` events.
+    #[serde(default)]
+    pub suggested_only: bool,
+}
+
+const fn default_space_hierarchy_limit() -> u32 {
+    50
+}
+const fn default_space_hierarchy_max_depth() -> u32 {
+    3
+}
+const MAX_SPACE_HIERARCHY_LIMIT: u32 = 200;
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SpaceHierarchyRoom {
+    pub room_id: String,
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub canonical_alias: Option<String>,
+    pub avatar_url: Option<String>,
+    pub num_joined_members: Option<u64>,
+    /// Room type (`m.space` for nested spaces, `null` for normal
+    /// rooms).
+    pub room_type: Option<String>,
+    /// World-readable / joinable join rule, if surfaced.
+    pub join_rule: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GetSpaceHierarchyResult {
+    pub root_room_id: String,
+    pub rooms: Vec<SpaceHierarchyRoom>,
+    /// Pagination token. `null` when the response is final.
+    pub next_batch_token: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestRoomKeysParams {
     /// Matrix room id (`!abc:server`) to request missing megolm
@@ -5006,6 +5150,385 @@ impl MatrixMcpService {
     /// Every subsequent write tool call will send a short `m.notice` event into
     /// this room summarising the tool name, target room, and outcome.
     ///
+    /// Read a global account-data event for the caller. Returns
+    /// raw content JSON for whatever event type the caller asks
+    /// about. Use to introspect arbitrary account data without
+    /// having a dedicated tool per type.
+    #[tool(
+        description = "Read a global account-data event by type. Returns raw content \
+                       JSON or null if no event of that type is set.",
+        annotations(title = "Get account data", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn get_account_data(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<GetAccountDataParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::events::GlobalAccountDataEventType;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("get_account_data", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let event_type: GlobalAccountDataEventType = params.event_type.as_str().into();
+            let content = client
+                .account()
+                .account_data_raw(event_type)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("account_data_raw: {e}"), None))?
+                .map(|raw| serde_json::to_value(&raw).unwrap_or(serde_json::Value::Null));
+            structured_result(&GetAccountDataResult {
+                event_type: params.event_type,
+                content,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "get_account_data",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Write a global account-data event for the caller. Replaces
+    /// the previous content for this event type atomically.
+    ///
+    /// Don't use this for events with dedicated tools
+    /// (`m.audit_room` → `set_audit_room`,
+    /// `m.ignored_user_list` → `ignore_user`/`unignore_user`) —
+    /// the dedicated tools enforce shape correctness. Use this
+    /// only for custom or non-standard account-data types.
+    #[tool(
+        description = "Write a global account-data event by type with arbitrary JSON \
+                       content. Replaces the previous content atomically. Prefer \
+                       dedicated tools (set_audit_room, ignore_user) where they exist.",
+        annotations(
+            title = "Set account data",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn set_account_data(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetAccountDataParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::events::GlobalAccountDataEventType;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("set_account_data", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let event_type: GlobalAccountDataEventType = params.event_type.as_str().into();
+            // set_account_data_raw expects Raw<AnyGlobalAccountDataEventContent>;
+            // serialize the user-supplied JSON value to bytes, then wrap.
+            let raw_bytes = serde_json::value::to_raw_value(&params.content)
+                .map_err(|e| ErrorData::invalid_params(format!("serialize content: {e}"), None))?;
+            let raw: matrix_sdk::ruma::serde::Raw<
+                matrix_sdk::ruma::events::AnyGlobalAccountDataEventContent,
+            > = matrix_sdk::ruma::serde::Raw::from_json(raw_bytes);
+            client
+                .account()
+                .set_account_data_raw(event_type, raw)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("set_account_data_raw: {e}"), None)
+                })?;
+            structured_result(&SetAccountDataResult {
+                event_type: params.event_type,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_write_notice(&result, &self.clients, &ctx, "set_account_data", None).await;
+        emit_tool_audit(
+            "set_account_data",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Fetch media from an HTTPS URL and upload to the homeserver's
+    /// media repo, returning the resulting `mxc://` URI **without
+    /// sending the media to a room**.
+    ///
+    /// Use to stage media before passing the URI to another tool
+    /// (e.g. `me_set_avatar`, or a custom event payload). For the
+    /// "fetch + upload + send as a room message" workflow, use
+    /// `send_image_from_url` / `send_file` etc. directly.
+    #[tool(
+        description = "Fetch media from an HTTPS URL and upload to the homeserver, \
+                       returning the mxc:// URI without sending. HTTPS-only, \
+                       size-capped, redirect-limited.",
+        annotations(
+            title = "Upload media from URL",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn upload_media_from_url(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<UploadMediaFromUrlParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("upload_media_from_url", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let uploaded = self
+                .upload_from_url(&params.url, &client, None, mime::APPLICATION_OCTET_STREAM)
+                .await?;
+            structured_result(&UploadMediaFromUrlResult {
+                mxc_uri: uploaded.mxc_uri.to_string(),
+                mime_type: uploaded.mime_type.essence_str().to_owned(),
+                bytes: uploaded.bytes_len,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_write_notice(&result, &self.clients, &ctx, "upload_media_from_url", None).await;
+        emit_tool_audit(
+            "upload_media_from_url",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Get a user's presence state. Defaults to the caller's own.
+    /// Note: many homeservers (Synapse included) disable presence
+    /// federation / reporting by default. Result may be `offline`
+    /// even for actively-connected users.
+    #[tool(
+        description = "Get a user's presence state (online/offline/unavailable) plus \
+                       optional status message. Defaults to caller. Synapse often \
+                       disables presence — expect `offline` from federated users.",
+        annotations(title = "Get presence", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn get_presence(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<GetPresenceParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::api::client::presence::get_presence;
+        let started = Instant::now();
+        let identity = identity_from_ctx(&ctx);
+        let mxid_for_audit = identity
+            .as_ref()
+            .map_or_else(String::new, |i| i.mxid.clone());
+        let span = make_tool_span("get_presence", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let raw_user_id = params
+                .user_id
+                .clone()
+                .or_else(|| identity.as_ref().map(|i| i.mxid.clone()))
+                .ok_or_else(|| {
+                    ErrorData::invalid_params("user_id required when caller has no mxid", None)
+                })?;
+            let user_id = UserId::parse(&raw_user_id).map_err(|e| {
+                ErrorData::invalid_params(format!("invalid user_id {raw_user_id}: {e}"), None)
+            })?;
+            let response = client
+                .send(get_presence::v3::Request::new(user_id.clone()))
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("get_presence: {e}"), None))?;
+            structured_result(&PresenceInfo {
+                user_id: user_id.to_string(),
+                presence: response.presence.to_string(),
+                status_msg: response.status_msg,
+                currently_active: response.currently_active,
+                last_active_ago_ms: response
+                    .last_active_ago
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "get_presence",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Set the caller's own presence state. Sends a `PUT
+    /// /presence/{caller}/status` to the homeserver. Synapse may
+    /// quietly ignore depending on its presence config.
+    #[tool(
+        description = "Set the caller's presence state (online/offline/unavailable) \
+                       plus optional status message. Synapse may ignore depending on \
+                       its presence config.",
+        annotations(
+            title = "Set presence",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn set_presence(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SetPresenceParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::api::client::presence::set_presence;
+        use matrix_sdk::ruma::presence::PresenceState;
+        let started = Instant::now();
+        let identity = identity_from_ctx(&ctx);
+        let mxid_for_audit = identity
+            .as_ref()
+            .map_or_else(String::new, |i| i.mxid.clone());
+        let span = make_tool_span("set_presence", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let id = identity.as_ref().ok_or_else(|| {
+                ErrorData::internal_error("auth middleware did not populate identity", None)
+            })?;
+            let user_id = UserId::parse(&id.mxid)
+                .map_err(|e| ErrorData::internal_error(format!("parse own mxid: {e}"), None))?;
+            let presence: PresenceState = params.presence.as_str().into();
+            let mut req = set_presence::v3::Request::new(user_id, presence.clone());
+            req.status_msg = params.status_msg;
+            client
+                .send(req)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("set_presence: {e}"), None))?;
+            structured_result(&SetPresenceResult {
+                presence: presence.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_write_notice(&result, &self.clients, &ctx, "set_presence", None).await;
+        emit_tool_audit(
+            "set_presence",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// List the rooms inside a Matrix **space** (a room of type
+    /// `m.space`). Uses the spec `/rooms/{room_id}/hierarchy`
+    /// endpoint, paginated. Returns one page per call; if
+    /// `next_batch_token` is non-null there are more rooms to
+    /// fetch — pagination is not yet exposed at the MCP layer.
+    #[tool(
+        description = "List the rooms inside a Matrix space (room with room_type=m.space). \
+                       Returns one paginated page of child rooms; configure max_depth \
+                       and limit, or filter to suggested_only.",
+        annotations(title = "Get space hierarchy", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn get_space_hierarchy(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<GetSpaceHierarchyParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::api::client::space::get_hierarchy;
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(
+            "get_space_hierarchy",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+        );
+        let (mut result, count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let mut req = get_hierarchy::v1::Request::new(room_id.clone());
+            let limit = params.limit.min(MAX_SPACE_HIERARCHY_LIMIT);
+            req.limit = Some(limit.into());
+            req.max_depth = Some(params.max_depth.into());
+            req.suggested_only = params.suggested_only;
+            let response = client
+                .send(req)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("get_hierarchy: {e}"), None))?;
+            let rooms: Vec<SpaceHierarchyRoom> = response
+                .rooms
+                .into_iter()
+                .map(|r| SpaceHierarchyRoom {
+                    room_id: r.summary.room_id.to_string(),
+                    name: r.summary.name,
+                    topic: r.summary.topic,
+                    canonical_alias: r.summary.canonical_alias.map(|a| a.to_string()),
+                    avatar_url: r.summary.avatar_url.map(|u| u.to_string()),
+                    num_joined_members: Some(u64::from(r.summary.num_joined_members)),
+                    room_type: r.summary.room_type.map(|t| t.to_string()),
+                    join_rule: Some(format!("{:?}", r.summary.join_rule)),
+                })
+                .collect();
+            let count = rooms.len();
+            let res = structured_result(&GetSpaceHierarchyResult {
+                root_room_id: room_id.to_string(),
+                rooms,
+                next_batch_token: response.next_batch,
+            });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .instrument(span.clone())
+        .await
+        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "get_space_hierarchy",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(count),
+            &span,
+            &result,
+        );
+        result
+    }
+
     /// The room id is stored in your Matrix global account data under
     /// the custom key `m.audit_room` so it persists across sessions.
     ///

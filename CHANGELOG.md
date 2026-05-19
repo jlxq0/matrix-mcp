@@ -6,6 +6,27 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added (PR-D: account data + presence + media + spaces)
+- `get_account_data(event_type)` / `set_account_data(event_type, content)`
+  tools. Generic read/write for arbitrary global account-data event
+  types. Prefer dedicated tools (`set_audit_room`, `ignore_user`)
+  where they exist; use these for custom or non-standard types.
+  Tool count 52 → 54.
+- `upload_media_from_url(url)` tool. Fetches HTTPS media, uploads to
+  the homeserver media repo, returns the `mxc://` URI **without
+  sending to a room**. Stages media for downstream consumers
+  (avatars, custom payloads). Same fetch policy as
+  `send_image_from_url`. Tool count 54 → 55.
+- `get_presence(user_id?)` / `set_presence(presence, status_msg?)`
+  tools. Wraps the spec's `/presence/{userId}/status` endpoints.
+  Synapse often disables presence reporting — expect `offline`
+  from federated users. Tool count 55 → 57.
+- `get_space_hierarchy(room_id, limit?, max_depth?, suggested_only?)`
+  tool. MSC1772-aware `/hierarchy` wrapper: lists rooms inside a
+  Matrix space. Returns one paginated page; `next_batch_token`
+  is surfaced but pagination input isn't exposed yet. Tool count
+  57 → 58.
+
 ### Added (PR-C: state events + ignored users)
 - `get_room_state(room_id, event_type, state_key?)` tool. Fetch
   state events of a given type (`m.room.name`, `m.room.topic`,
