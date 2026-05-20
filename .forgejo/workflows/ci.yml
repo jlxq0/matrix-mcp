@@ -67,7 +67,7 @@ jobs:
           set -euo pipefail
           TARBALL="/tmp/buildkit.tar.gz"
           curl -sSL -o "$TARBALL" \
-            "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}-linux-amd64.tar.gz"
+            "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-amd64.tar.gz"
           echo "${BUILDKIT_SHA256}  ${TARBALL}" | sha256sum -c -
           sudo tar -xz -C /usr/local --strip-components=0 -f "$TARBALL"
           rm -f "$TARBALL"
