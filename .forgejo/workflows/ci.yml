@@ -19,12 +19,12 @@ jobs:
   cargo:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           components: rustfmt, clippy
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: |
             ~/.cargo/registry
@@ -43,7 +43,7 @@ jobs:
         run: |
           [ -x ~/.cargo/bin/cargo-audit ] || cargo install --locked cargo-audit
           cargo audit
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1  # v2
         with: { command: check bans licenses sources }
 
   # buildctl talks to Pada's buildkitd over TCP. Registry-backed layer cache
@@ -55,18 +55,30 @@ jobs:
     env:
       BUILDKIT_HOST: tcp://10.0.1.57:1234
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }
       - name: Install buildctl
+        env:
+          BUILDKIT_VERSION: v0.30.0
+          # sha256 of buildkit-v0.30.0.linux-amd64.tar.gz from
+          # github.com/moby/buildkit/releases/tag/v0.30.0
+          BUILDKIT_SHA256: 2da148c50540409988c837e62b72176e4a9ad7855548a2dd6ea1cd0c0d2d360d
         run: |
-          curl -sSL https://github.com/moby/buildkit/releases/download/v0.30.0/buildkit-v0.30.0.linux-amd64.tar.gz \
-            | sudo tar -xz -C /usr/local --strip-components=0
+          set -euo pipefail
+          TARBALL="/tmp/buildkit.tar.gz"
+          curl -sSL -o "$TARBALL" \
+            "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}-linux-amd64.tar.gz"
+          echo "${BUILDKIT_SHA256}  ${TARBALL}" | sha256sum -c -
+          sudo tar -xz -C /usr/local --strip-components=0 -f "$TARBALL"
+          rm -f "$TARBALL"
           buildctl --version
-      # forge.oddie.app login is needed on every run (for buildcache push/pull).
-      # secrets.GITHUB_TOKEN doesn't have write:package scope on Forgejo's
-      # container registry — we use FORGE_PUSH_TOKEN (a PAT with that scope).
+      # Forgejo login only on trusted refs (main + tags). PR builds do
+      # a cold build with no buildcache import — slower, but no
+      # package-write PAT lands in the runner's docker config for a
+      # PR-triggered job to potentially exfiltrate.
       # GHCR login only when we're about to push real tags.
       - name: Login to Forgejo registry
+        if: github.event_name != 'pull_request'
         run: |
           mkdir -p ~/.docker
           F_AUTH=$(printf "%s:%s" "julian" "${{ secrets.FORGE_PUSH_TOKEN }}" | base64 -w0)
@@ -78,11 +90,25 @@ jobs:
           jq --arg a "$G_AUTH" '.auths["ghcr.io"] = {auth: $a}' ~/.docker/config.json > /tmp/d && mv /tmp/d ~/.docker/config.json
       - name: Build (and push on tag)
         run: |
+          set -euo pipefail
           CACHE_REF="forge.oddie.app/julian/matrix-mcp:buildcache"
+          # Cache import/export only on trusted refs (main + release
+          # tags). PRs build cold — they can't poison the cache that
+          # the next tag build pulls, and they don't need the Forgejo
+          # PAT to be present in the runner's docker config.
+          IMPORT_CACHE_ARG=()
+          EXPORT_CACHE_ARG=()
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             V="${GITHUB_REF#refs/tags/}"
             TAGS="forge.oddie.app/julian/matrix-mcp:${V},forge.oddie.app/julian/matrix-mcp:latest,ghcr.io/jlxq0/matrix-mcp:${V},ghcr.io/jlxq0/matrix-mcp:latest"
             PUSH=true
+            IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
+            EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            TAGS="forge.oddie.app/julian/matrix-mcp:ci-${GITHUB_SHA::8}"
+            PUSH=false
+            IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
+            EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
           else
             TAGS="forge.oddie.app/julian/matrix-mcp:ci-${GITHUB_SHA::8}"
             PUSH=false
@@ -91,6 +117,6 @@ jobs:
             --frontend dockerfile.v0 \
             --local context=. \
             --local dockerfile=. \
-            --import-cache "type=registry,ref=${CACHE_REF}" \
-            --export-cache "type=registry,ref=${CACHE_REF},mode=max" \
+            "${IMPORT_CACHE_ARG[@]}" \
+            "${EXPORT_CACHE_ARG[@]}" \
             --output "type=image,\"name=${TAGS}\",push=${PUSH}"
