@@ -117,6 +117,24 @@ pub static ACTIVE_CLIENTS: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("register active_clients once")
 });
 
+/// Auto-heal counter for the `MatrixClientCache`'s split-brain device-keys
+/// recovery. Incremented once per successful self-heal: see
+/// [`MatrixClientCache::for_user`] for the trigger condition. Labels:
+///
+/// - `reason="device_keys_missing"` — local SDK reported `device_keys_published`
+///   but Synapse's `/keys/query` did not return our `device_id`. The per-MXID
+///   crypto store is wiped and the client rebuilt; the next sync re-uploads
+///   the device keys.
+pub static SELF_HEAL_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "matrix_mcp_client_cache_self_heal_total",
+        "MatrixClientCache auto-heal events. Labels: reason.",
+        &["reason"],
+        prometheus::default_registry()
+    )
+    .expect("register client_cache_self_heal_total once")
+});
+
 /// Initialize all metrics. Idempotent — `LazyLock` ensures
 /// registration only happens once. Call this once at startup so the
 /// scraped `/metrics` text always lists the families even before
@@ -128,6 +146,7 @@ pub fn init() {
     LazyLock::force(&INTROSPECT_LATENCY_SECONDS);
     LazyLock::force(&SETUP_EVENTS_TOTAL);
     LazyLock::force(&ACTIVE_CLIENTS);
+    LazyLock::force(&SELF_HEAL_COUNTER);
 }
 
 /// Record a finished tool call.

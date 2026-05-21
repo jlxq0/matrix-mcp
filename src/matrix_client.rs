@@ -47,9 +47,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use hkdf::Hkdf;
 use matrix_sdk::authentication::SessionTokens;
 use matrix_sdk::authentication::matrix::MatrixSession;
@@ -79,6 +80,13 @@ struct CachedClient {
     /// `tokio::sync::Mutex` because we update under await (the
     /// `restore_session` swap is async).
     access_token_hash: tokio::sync::Mutex<[u8; 32]>,
+    /// Latched to `true` the first time `for_user` confirms that
+    /// Synapse's `/keys/query` response for this MXID includes our
+    /// `device_id`. Auto-heal in `for_user` consults this flag once per
+    /// cached client and skips the check thereafter — verification is
+    /// idempotent but `get_user_devices` round-trips the `OlmMachine` so
+    /// we don't want to run it on the hot path of every tool call.
+    keys_verified: AtomicBool,
 }
 
 impl Drop for CachedClient {
@@ -179,10 +187,44 @@ impl MatrixClientCache {
     /// the `SQLite` store (deriving the passphrase via HKDF), runs the SDK's session
     /// restoration, and spawns the background sync task. Subsequent
     /// calls return immediately.
+    ///
+    /// ## Split-brain device-keys auto-heal
+    ///
+    /// Once per cached client lifetime, this method also verifies that
+    /// Synapse's `/keys/query` for this MXID lists our `device_id`. If
+    /// matrix-rust-sdk's local `device_keys_published` flag is latched
+    /// to `true` but Synapse doesn't actually have our keys — which is
+    /// possible when an earlier `/keys/upload` was rejected (e.g. an
+    /// unbound `/setup` token) while the SDK still set the local flag
+    /// — every subsequent /keys/upload is skipped and the device stays
+    /// invisible to the homeserver. The SDK exposes no public API to
+    /// clear that flag, so the only recovery is to wipe the per-MXID
+    /// crypto store and let the SDK rebuild from scratch. We do that
+    /// transparently here, recursing exactly once to verify the
+    /// rebuild actually published keys (and erroring out instead of
+    /// looping if it didn't).
     pub async fn for_user(
         &self,
         identity: &AuthenticatedIdentity,
         access_token: &str,
+    ) -> Result<Arc<Client>> {
+        self.for_user_inner(identity, access_token, false).await
+    }
+
+    /// Inner implementation of `for_user`. Splits out the retry flag so
+    /// the auto-heal path can recurse exactly once.
+    ///
+    /// `retry=true` means we're being called from the self-heal branch
+    /// below, after wiping the per-MXID store. On the retry pass we
+    /// re-verify; if Synapse *still* doesn't have our keys after a
+    /// fresh build we surface an error rather than recurse again. That
+    /// keeps the worst case bounded at two SDK builds + two
+    /// `/keys/query` calls per /mcp request — never an infinite loop.
+    async fn for_user_inner(
+        &self,
+        identity: &AuthenticatedIdentity,
+        access_token: &str,
+        retry: bool,
     ) -> Result<Arc<Client>> {
         let incoming_hash = token_hash(access_token);
 
@@ -199,7 +241,7 @@ impl MatrixClientCache {
         // — but the background sync task is gone, so SDK room/state
         // freshness silently degrades. By treating a finished
         // sync_task as "stale", we force eviction + rebuild here.
-        {
+        let cached = {
             let guard = self.inner.read().await;
             if let Some(cell) = guard.get(&identity.mxid)
                 && let Some(cached) = cell.get()
@@ -209,8 +251,16 @@ impl MatrixClientCache {
                 drop(guard);
                 self.refresh_token_if_needed(&cached, identity, access_token, incoming_hash)
                     .await?;
-                return Ok(cached.client.clone());
+                Some(cached)
+            } else {
+                None
             }
+        };
+
+        if let Some(cached) = cached {
+            return self
+                .verify_or_heal(cached, identity, access_token, retry)
+                .await;
         }
 
         // Stale eviction: if the existing cell holds a cached client
@@ -260,7 +310,106 @@ impl MatrixClientCache {
             .clone();
         self.refresh_token_if_needed(&cached, identity, access_token, incoming_hash)
             .await?;
-        Ok(cached.client.clone())
+
+        self.verify_or_heal(cached, identity, access_token, retry)
+            .await
+    }
+
+    /// Post-build / post-fetch verification step shared by both the
+    /// fast path and the slow path of `for_user_inner`. Runs the
+    /// `/keys/query` round-trip exactly once per cached client; on a
+    /// negative result, wipes the per-MXID store and recurses.
+    async fn verify_or_heal(
+        &self,
+        cached: Arc<CachedClient>,
+        identity: &AuthenticatedIdentity,
+        access_token: &str,
+        retry: bool,
+    ) -> Result<Arc<Client>> {
+        if cached.keys_verified.load(Ordering::Acquire) {
+            return Ok(cached.client.clone());
+        }
+        match verify_device_keys_published(&cached.client, &identity.mxid).await {
+            Ok(true) => {
+                cached.keys_verified.store(true, Ordering::Release);
+                Ok(cached.client.clone())
+            }
+            Ok(false) => {
+                if retry {
+                    // Second pass after wipe+rebuild and Synapse still
+                    // doesn't have our keys. Surface the failure rather
+                    // than recurse — something more fundamental is
+                    // wrong (auth bound to the wrong device, MAS clock
+                    // skew, /keys/upload returning 200 but Synapse
+                    // dropping the device, etc.) and looping would
+                    // pound the homeserver.
+                    return Err(anyhow!(
+                        "self-heal failed: device keys still not published after rebuild for {}",
+                        identity.mxid
+                    ));
+                }
+                warn!(
+                    mxid = %identity.mxid,
+                    device_id = ?cached.client.device_id(),
+                    "split-brain crypto state detected (local SDK has device_keys, \
+                     Synapse does not); self-healing by wiping per-MXID store",
+                );
+                crate::metrics::SELF_HEAL_COUNTER
+                    .with_label_values(&["device_keys_missing"])
+                    .inc();
+                // Drop the Arc *before* evict so the cached client's
+                // background sync task gets aborted when the cache
+                // entry is removed. (Drop impl on CachedClient calls
+                // sync_task.abort().)
+                drop(cached);
+                self.evict(&identity.mxid).await;
+                self.wipe_user_store(&identity.mxid).await?;
+                // Recurse exactly once. Box::pin because an `async fn`
+                // can't recurse directly — the returned future would
+                // have infinite size.
+                Box::pin(self.for_user_inner(identity, access_token, true)).await
+            }
+            Err(e) => {
+                // Network blip / olm machine not ready / Synapse 5xx.
+                // Don't fail closed: leaving keys_verified=false means
+                // the next /mcp call retries the check, and meanwhile
+                // the tool call proceeds normally. Decryption either
+                // works (most rooms) or doesn't (which is what the
+                // user would see anyway without this auto-heal).
+                warn!(
+                    mxid = %identity.mxid,
+                    error = ?e,
+                    "device_keys verification failed; leaving keys_verified=false",
+                );
+                Ok(cached.client.clone())
+            }
+        }
+    }
+
+    /// Delete the per-MXID matrix-sdk store directory under
+    /// `self.store.root`. Scoped to exactly one user's subdirectory —
+    /// never the store root itself, and never another user's data. A
+    /// missing directory is not an error (treated as a no-op).
+    ///
+    /// Used by the device-keys self-heal path in [`Self::for_user`].
+    /// After this returns, the next `for_user` call for `mxid` will
+    /// rebuild a fresh `SQLite` crypto + state store and re-run
+    /// `restore_session`, which re-uploads device keys via the SDK's
+    /// normal sync flow.
+    async fn wipe_user_store(&self, mxid: &str) -> Result<()> {
+        let dir = self.store.root.join(mxid_dir_name(mxid));
+        info!(
+            mxid = %mxid,
+            store_path = %dir.display(),
+            "wiping per-MXID matrix-sdk store for self-heal",
+        );
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("remove per-MXID store dir {}", dir.display()))
+            }
+        }
     }
 
     /// Swap the access token on a cached client in-place if the
@@ -401,6 +550,7 @@ impl MatrixClientCache {
             client: client_arc,
             sync_task,
             access_token_hash: tokio::sync::Mutex::new(token_hash(access_token)),
+            keys_verified: AtomicBool::new(false),
         })
     }
 
@@ -515,6 +665,35 @@ async fn sync_watchdog(weak: std::sync::Weak<Client>, mxid: String) {
 /// envelopes.
 fn is_permanent_auth_failure(msg: &str) -> bool {
     msg.contains("M_UNKNOWN_TOKEN") || msg.contains("Token is not active")
+}
+
+/// Ask matrix-rust-sdk for the user's device set and check whether
+/// `client.device_id()` is present.
+///
+/// `Client::encryption().get_user_devices` routes through the
+/// `OlmMachine`, which consults its local crypto store but also issues
+/// `/keys/query` to the homeserver for any user with a pending key-query
+/// (and our own user is always in that set after a successful sync).
+/// We treat:
+///
+/// - `Ok(true)` — device id present in response → keys are published
+/// - `Ok(false)` — device id absent → split-brain, caller should self-heal
+/// - `Err(_)` — network or olm-machine error → propagate; caller decides
+///   whether to fail closed (we don't; we log and leave `keys_verified`
+///   false so the next call retries)
+async fn verify_device_keys_published(client: &Client, mxid: &str) -> Result<bool> {
+    let user_id = UserId::parse(mxid).with_context(|| format!("parse mxid: {mxid}"))?;
+    let Some(device_id) = client.device_id() else {
+        return Err(anyhow!(
+            "client has no device_id; cannot verify device_keys for {mxid}"
+        ));
+    };
+    let devices = client
+        .encryption()
+        .get_user_devices(&user_id)
+        .await
+        .with_context(|| format!("get_user_devices({mxid})"))?;
+    Ok(devices.get(device_id).is_some())
 }
 
 /// SHA-256 the mxid, hex-encode, take the first 32 chars. Stable and
@@ -695,6 +874,82 @@ mod tests {
     // -----------------------------------------------------------------------
     // Sync watchdog — lifecycle: dropped Weak exits cleanly
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Self-heal — wipe_user_store
+    // -----------------------------------------------------------------------
+
+    fn cache_with_store_root(root: PathBuf) -> MatrixClientCache {
+        MatrixClientCache::new(
+            "https://example.org",
+            StoreConfig {
+                root,
+                pepper: "deadbeef".repeat(8),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn wipe_user_store_removes_only_the_target_mxid_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = cache_with_store_root(tmp.path().to_path_buf());
+
+        let alice = "@alice:example.com";
+        let bob = "@bob:example.com";
+        let alice_dir = tmp.path().join(mxid_dir_name(alice));
+        let bob_dir = tmp.path().join(mxid_dir_name(bob));
+        tokio::fs::create_dir_all(&alice_dir).await.unwrap();
+        tokio::fs::create_dir_all(&bob_dir).await.unwrap();
+        tokio::fs::write(alice_dir.join("matrix-sdk-crypto.sqlite3"), b"alice-data")
+            .await
+            .unwrap();
+        tokio::fs::write(bob_dir.join("matrix-sdk-crypto.sqlite3"), b"bob-data")
+            .await
+            .unwrap();
+
+        cache.wipe_user_store(alice).await.unwrap();
+
+        assert!(
+            !alice_dir.exists(),
+            "alice's store dir should be gone after wipe"
+        );
+        assert!(
+            bob_dir.exists(),
+            "bob's store dir must not be touched by alice's wipe"
+        );
+        // The store root itself must NEVER be wiped.
+        assert!(tmp.path().exists(), "store root must survive a wipe");
+    }
+
+    #[tokio::test]
+    async fn wipe_user_store_tolerates_missing_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = cache_with_store_root(tmp.path().to_path_buf());
+
+        // No directory created — wipe must succeed (NotFound is a no-op).
+        cache
+            .wipe_user_store("@neverexisted:example.com")
+            .await
+            .expect("wipe of missing dir must be a no-op, not an error");
+    }
+
+    #[test]
+    fn self_heal_counter_increments_under_reason_label() {
+        // Sanity: the metric we'll inc from the heal path is registered
+        // and addressable. Reset to a known floor, inc, assert.
+        crate::metrics::SELF_HEAL_COUNTER
+            .with_label_values(&["device_keys_missing"])
+            .reset();
+        crate::metrics::SELF_HEAL_COUNTER
+            .with_label_values(&["device_keys_missing"])
+            .inc();
+        assert_eq!(
+            crate::metrics::SELF_HEAL_COUNTER
+                .with_label_values(&["device_keys_missing"])
+                .get(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn watchdog_exits_when_weak_is_dead() {
