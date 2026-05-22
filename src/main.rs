@@ -133,6 +133,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         )?,
     );
     let download_max_bytes = cfg.download_max_bytes;
+    let tts = cfg.tts.clone().map(Arc::new);
     Ok(build_router(
         cfg,
         auth_state,
@@ -142,6 +143,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         limiter,
         download_max_bytes,
         key_backup_gate,
+        tts,
     ))
 }
 
@@ -155,6 +157,7 @@ fn build_router(
     limiter: Arc<Limiter>,
     download_max_bytes: u64,
     key_backup_gate: key_backup_gate::KeyBackupGate,
+    tts: Option<Arc<crate::config::TtsConfig>>,
 ) -> Router {
     // rmcp's StreamableHttpService is a tower::Service that handles all the
     // MCP transport details (initialize, tools/list, tools/call, SSE
@@ -181,6 +184,7 @@ fn build_router(
             let clients = clients.clone();
             let limiter = Arc::clone(&limiter);
             let key_backup_gate = key_backup_gate.clone();
+            let tts = tts.clone();
             Ok(MatrixMcpService::new(
                 clients,
                 mas,
@@ -188,6 +192,7 @@ fn build_router(
                 download_max_bytes,
                 upload_max_bytes,
                 key_backup_gate,
+                tts,
             ))
         },
         Arc::new(session::CappedSessionManager::new()),
@@ -434,6 +439,7 @@ mod tests {
             limiter,
             5 * 1024 * 1024, // default 5 MiB cap in tests
             key_backup_gate,
+            None,
         )
     }
 

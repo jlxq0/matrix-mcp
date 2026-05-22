@@ -85,6 +85,13 @@ pub const ENV_UPLOAD_MAX_BYTES: &str = "MATRIX_MCP_UPLOAD_MAX_BYTES";
 /// out of `X-Forwarded-For`. Default 1 (assumes Traefik in front in
 /// production).
 const ENV_TRUSTED_PROXY_HOPS: &str = "MATRIX_MCP_TRUSTED_PROXY_HOPS";
+/// Base URL of an OpenAI-compatible TTS endpoint (Chatterbox /
+/// `POST /v1/audio/speech`). Optional — if unset, the
+/// `send_tts_voice_message` tool returns `invalid_params`.
+const ENV_TTS_BASE_URL: &str = "MATRIX_MCP_TTS_BASE_URL";
+/// Bearer token sent to the TTS endpoint above. Must be set if (and
+/// only if) `MATRIX_MCP_TTS_BASE_URL` is set.
+const ENV_TTS_BEARER_TOKEN: &str = "MATRIX_MCP_TTS_BEARER_TOKEN";
 
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
@@ -146,6 +153,28 @@ pub struct Config {
     /// Advertised in the protected-resource metadata as the
     /// device-binding OAuth scope claude.ai requests.
     pub device_id: String,
+    /// Optional TTS endpoint config. When `Some`, `send_tts_voice_message`
+    /// posts text to `{base_url}/audio/speech` and forwards the
+    /// returned audio as a Matrix voice message. When `None`, the
+    /// tool returns `invalid_params`.
+    pub tts: Option<TtsConfig>,
+}
+
+#[derive(Clone)]
+pub struct TtsConfig {
+    /// e.g. `https://tts.oddie.media/v1`. Trailing slash stripped.
+    pub base_url: String,
+    /// Bearer token. Logged as `<redacted>`.
+    pub bearer_token: String,
+}
+
+impl std::fmt::Debug for TtsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TtsConfig")
+            .field("base_url", &self.base_url)
+            .field("bearer_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -232,6 +261,7 @@ impl Config {
             // it obvious in any accidental dump that resolution hasn't
             // run yet.
             device_id: "UNRESOLVED".to_owned(),
+            tts: None,
         })
     }
 
@@ -248,6 +278,15 @@ impl Config {
     #[must_use]
     pub fn with_store(mut self, store: StoreConfig) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Builder-style: attach TTS endpoint config. Unset on boot if
+    /// the operator hasn't set both `MATRIX_MCP_TTS_BASE_URL` and
+    /// `MATRIX_MCP_TTS_BEARER_TOKEN`.
+    #[must_use]
+    pub fn with_tts(mut self, tts: TtsConfig) -> Self {
+        self.tts = Some(tts);
         self
     }
 
@@ -306,6 +345,9 @@ impl Config {
         cfg.upload_max_bytes = parse_upload_max_bytes()?;
         cfg.trusted_proxy_hops = parse_trusted_proxy_hops()?;
         cfg.device_id = device_id;
+        if let Some(tts) = parse_tts_config()? {
+            cfg = cfg.with_tts(tts);
+        }
         Ok(cfg
             .with_introspection(IntrospectionCredentials {
                 client_id,
@@ -315,6 +357,35 @@ impl Config {
                 root: store_root,
                 pepper,
             }))
+    }
+}
+
+/// `(MATRIX_MCP_TTS_BASE_URL, MATRIX_MCP_TTS_BEARER_TOKEN)` must
+/// either both be set or both be unset. Mixing is rejected so a
+/// half-configured deploy doesn't silently disable TTS or, worse,
+/// post anonymous requests to a public endpoint.
+fn parse_tts_config() -> Result<Option<TtsConfig>> {
+    let url = std::env::var(ENV_TTS_BASE_URL).ok();
+    let token = std::env::var(ENV_TTS_BEARER_TOKEN).ok();
+    match (url, token) {
+        (None, None) => Ok(None),
+        (Some(url), Some(token)) => {
+            let base_url = strip_trailing_slash(url);
+            validate_url(&base_url, ENV_TTS_BASE_URL)?;
+            if token.is_empty() {
+                anyhow::bail!("{ENV_TTS_BEARER_TOKEN} must not be empty");
+            }
+            Ok(Some(TtsConfig {
+                base_url,
+                bearer_token: token,
+            }))
+        }
+        (Some(_), None) => {
+            anyhow::bail!("{ENV_TTS_BASE_URL} is set but {ENV_TTS_BEARER_TOKEN} is not")
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("{ENV_TTS_BEARER_TOKEN} is set but {ENV_TTS_BASE_URL} is not")
+        }
     }
 }
 

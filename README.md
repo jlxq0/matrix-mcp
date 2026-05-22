@@ -27,7 +27,8 @@ and warn before writes.
   `get_user_receipts`, `get_event_receipts`, `get_presence`,
   `list_ignored_users`, `invites_list`
 - **Writes**: `send_text_message`, `send_image_from_url`, `send_file`,
-  `send_audio`, `send_video`, `send_reaction`, `send_bulk`,
+  `send_audio`, `send_voice_message`, `send_tts_voice_message`,
+  `send_video`, `send_reaction`, `send_bulk`,
   `send_broadcast`, `mark_read`, `message_edit`, `message_forward`,
   `redact_message`, `upload_media_from_url`, `set_account_data`,
   `set_presence`, `set_room_name`, `set_room_topic`,

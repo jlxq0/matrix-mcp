@@ -80,6 +80,10 @@ pub struct MatrixMcpService {
     /// can trigger a Matrix room-key backup pull. Used by the explicit
     /// `request_room_keys` tool and the auto-pull helper.
     key_backup_gate: crate::key_backup_gate::KeyBackupGate,
+    /// Optional TTS endpoint config; backs `send_tts_voice_message`.
+    /// `None` means the operator hasn't configured a TTS endpoint and
+    /// the tool returns `invalid_params` when invoked.
+    tts: Option<Arc<crate::config::TtsConfig>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -97,6 +101,7 @@ impl MatrixMcpService {
         download_max_bytes: u64,
         upload_max_bytes: usize,
         key_backup_gate: crate::key_backup_gate::KeyBackupGate,
+        tts: Option<Arc<crate::config::TtsConfig>>,
     ) -> Self {
         Self {
             clients,
@@ -105,6 +110,7 @@ impl MatrixMcpService {
             download_max_bytes,
             upload_max_bytes,
             key_backup_gate,
+            tts,
             tool_router: Self::tool_router(),
         }
     }
@@ -339,6 +345,206 @@ fn validate_reaction_key(key: &str) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// Reject voice-message metadata that would violate MSC3245's
+/// constraints or cause UI weirdness in Element.
+fn validate_voice_params(
+    duration_ms: Option<u64>,
+    waveform: Option<&[u16]>,
+    duration_max_ms: u64,
+    waveform_max_len: usize,
+    waveform_max_value: u16,
+) -> Result<(), ErrorData> {
+    if let Some(d) = duration_ms
+        && d > duration_max_ms
+    {
+        return Err(ErrorData::invalid_params(
+            format!("duration_ms {d} exceeds cap of {duration_max_ms} ms"),
+            None,
+        ));
+    }
+    let Some(wf) = waveform else {
+        return Ok(());
+    };
+    if wf.is_empty() {
+        return Err(ErrorData::invalid_params(
+            "waveform must contain at least one sample (or be omitted)",
+            None,
+        ));
+    }
+    if wf.len() > waveform_max_len {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "waveform length {} exceeds cap of {waveform_max_len}",
+                wf.len()
+            ),
+            None,
+        ));
+    }
+    if let Some(&bad) = wf.iter().find(|&&v| v > waveform_max_value) {
+        return Err(ErrorData::invalid_params(
+            format!("waveform sample {bad} exceeds MSC3245 max of {waveform_max_value}"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Parse the RIFF/WAVE header of `bytes` and return the audio
+/// duration. Returns `None` if `bytes` is not a recognisable WAV
+/// file (we only need duration here; sample format / endianness
+/// details are skipped). Reads the `fmt ` chunk for `sample_rate`
+/// and `block_align`, and the `data` chunk for the sample-payload
+/// size; duration = (`data_bytes` / `block_align`) / `sample_rate`.
+fn parse_wav_duration(bytes: &[u8]) -> Option<Duration> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut sample_rate: u32 = 0;
+    let mut block_align: u16 = 0;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let body_start = pos + 8;
+        let body_end = body_start.checked_add(size)?;
+        if body_end > bytes.len() {
+            return None;
+        }
+        match id {
+            b"fmt " => {
+                if size < 16 {
+                    return None;
+                }
+                sample_rate = u32::from_le_bytes([
+                    bytes[body_start + 4],
+                    bytes[body_start + 5],
+                    bytes[body_start + 6],
+                    bytes[body_start + 7],
+                ]);
+                block_align = u16::from_le_bytes([bytes[body_start + 12], bytes[body_start + 13]]);
+            }
+            b"data" => {
+                if sample_rate == 0 || block_align == 0 {
+                    return None;
+                }
+                let frames = (size as u64) / u64::from(block_align);
+                let micros = frames.checked_mul(1_000_000)? / u64::from(sample_rate);
+                return Some(Duration::from_micros(micros));
+            }
+            _ => {}
+        }
+        // RIFF subchunks are padded to even-byte boundaries.
+        pos = body_end + (size & 1);
+    }
+    None
+}
+
+/// Validate the user-controllable parameters of `send_tts_voice_message`
+/// before we make any outbound calls.
+fn validate_tts_params(
+    params: &SendTtsVoiceMessageParams,
+    input_max_chars: usize,
+) -> Result<(), ErrorData> {
+    if params.input.trim().is_empty() {
+        return Err(ErrorData::invalid_params(
+            "input must not be empty after trimming whitespace",
+            None,
+        ));
+    }
+    if params.input.chars().count() > input_max_chars {
+        return Err(ErrorData::invalid_params(
+            format!("input must be at most {input_max_chars} chars"),
+            None,
+        ));
+    }
+    for (label, value) in [
+        ("exaggeration", params.exaggeration),
+        ("cfg_weight", params.cfg_weight),
+    ] {
+        if let Some(v) = value
+            && !(0.0..=1.0).contains(&v)
+        {
+            return Err(ErrorData::invalid_params(
+                format!("{label} must be in 0..=1 (got {v})"),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// POST `params` to `{tts.base_url}/audio/speech` and return the
+/// audio bytes. Caps the response at `max_bytes` and the request at
+/// `timeout`. Never logs the bearer token or response body.
+async fn synthesize_tts(
+    tts: &crate::config::TtsConfig,
+    params: &SendTtsVoiceMessageParams,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ErrorData> {
+    let url = format!("{}/audio/speech", tts.base_url);
+    url_safety::validate_https_url(&url)
+        .await
+        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+
+    let voice = params.voice.as_deref().unwrap_or("julian");
+    let mut body = serde_json::json!({
+        "input": params.input,
+        "voice": voice,
+    });
+    if let Some(v) = params.exaggeration {
+        body["exaggeration"] = serde_json::json!(v);
+    }
+    if let Some(v) = params.cfg_weight {
+        body["cfg_weight"] = serde_json::json!(v);
+    }
+    if let Some(ref lang) = params.language_id {
+        body["language_id"] = serde_json::json!(lang);
+    }
+
+    let http = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| ErrorData::internal_error(format!("build tts http client: {e}"), None))?;
+    let response = http
+        .post(&url)
+        .bearer_auth(&tts.bearer_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("tts request: {e}"), None))?;
+    let status = response.status();
+    if !status.is_success() {
+        // Deliberately don't include the response body — TTS error
+        // pages can echo request fields and we'd rather not surface
+        // them in MCP audit logs.
+        return Err(ErrorData::internal_error(
+            format!("tts endpoint returned {status}"),
+            None,
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("read tts body: {e}"), None))?;
+    if bytes.len() > max_bytes {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "tts response {} bytes exceeds upload cap {max_bytes}",
+                bytes.len()
+            ),
+            None,
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
 /// Reject redaction reasons longer than [`MAX_REDACTION_REASON_BYTES`].
 fn validate_redaction_reason(reason: Option<&str>) -> Result<(), ErrorData> {
     let Some(reason) = reason else {
@@ -520,6 +726,63 @@ pub struct SendMediaFromUrlParams {
 pub struct SendMediaResult {
     pub event_id: String,
     pub mxc_uri: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendTtsVoiceMessageParams {
+    /// Matrix room id, e.g. `!abc:example.com`.
+    pub room_id: String,
+    /// Text to synthesize. Sent verbatim to the configured TTS
+    /// endpoint as the `input` field. Hard-capped at 4096 chars to
+    /// keep clip length bounded.
+    pub input: String,
+    /// Voice preset to request. Defaults to `julian` (Julian's
+    /// cloned voice on the homelab Chatterbox).
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Chatterbox `exaggeration` parameter, 0..=1. Higher =
+    /// more expressive delivery.
+    #[serde(default)]
+    pub exaggeration: Option<f32>,
+    /// Chatterbox `cfg_weight` parameter, 0..=1. Lower = stays
+    /// closer to the reference voice. Use `0` if the input is in
+    /// a language different from the voice's native language.
+    #[serde(default)]
+    pub cfg_weight: Option<f32>,
+    /// Optional language code (e.g. `de`); only meaningful for
+    /// multilingual TTS backends.
+    #[serde(default)]
+    pub language_id: Option<String>,
+    /// Optional override for the Matrix `body` fallback text. If
+    /// omitted, the body defaults to the `input` text (truncated
+    /// to 512 chars) so non-audio clients still show a transcript.
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendVoiceMessageParams {
+    /// Matrix room id, e.g. `!abc:example.com`.
+    pub room_id: String,
+    /// HTTPS URL of the audio clip. Re-uploaded to the homeserver
+    /// media repo before sending. Content-Type must start with
+    /// `audio/`; OGG/Opus renders best in Element.
+    pub media_url: String,
+    /// Duration of the audio in milliseconds. Optional but
+    /// recommended — clients display it without having to decode
+    /// the file. Capped at 1 hour.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// Pre-computed amplitude samples, one per render bucket. Each
+    /// sample is 0..=1024 (saturating). 30–100 entries is typical
+    /// for Element; capped at 200. Omit if you don't have one —
+    /// clients will then render a flat bar but still treat the
+    /// event as a voice message.
+    #[serde(default)]
+    pub waveform: Option<Vec<u16>>,
+    /// Optional fallback body text. Defaults to "Voice message".
+    #[serde(default)]
+    pub caption: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -4385,6 +4648,53 @@ impl MatrixMcpService {
         .await
     }
 
+    /// Send a voice message: an `m.audio` event decorated with the
+    /// MSC3245 voice flag and the MSC1767 audio block (duration +
+    /// waveform). Element renders this as a voice-memo bubble with a
+    /// play button and waveform instead of a generic audio
+    /// attachment. If `waveform` is omitted, clients still treat it
+    /// as a voice message but show a flat bar.
+    #[tool(
+        description = "Send a voice message from an HTTPS URL (m.audio + MSC3245 voice flag).",
+        annotations(
+            title = "Send voice message",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn send_voice_message(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SendVoiceMessageParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.send_voice_message_inner(ctx, params).await
+    }
+
+    /// Synthesize speech via the configured TTS endpoint (e.g.
+    /// Chatterbox) and post the result into a Matrix room as a
+    /// voice message (m.audio + MSC3245 voice flag). Returns
+    /// `invalid_params` if no TTS endpoint is configured on this
+    /// matrix-mcp instance.
+    #[tool(
+        description = "Synthesize speech and post it as a Matrix voice message (TTS → m.audio + MSC3245).",
+        annotations(
+            title = "Send TTS voice message",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn send_tts_voice_message(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<SendTtsVoiceMessageParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.send_tts_voice_message_inner(ctx, params).await
+    }
+
     /// Send the same text body to a specific list of rooms. Hard cap
     /// of 20 rooms per call to keep blast radius modest. Per-room
     /// outcomes are returned individually — a failure in one room
@@ -6513,6 +6823,238 @@ impl MatrixMcpService {
         .await;
         result
     }
+
+    /// Body for `send_voice_message`. Mirrors `send_media_from_url`'s
+    /// audit / notice / rate-limit envelope but builds the m.audio
+    /// content with the MSC3245 voice flag and MSC1767 audio block
+    /// so Element renders it as a voice-memo bubble.
+    async fn send_voice_message_inner(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        params: SendVoiceMessageParams,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::UInt;
+        use matrix_sdk::ruma::events::room::message::{
+            AudioInfo, AudioMessageEventContent, UnstableAmplitude,
+            UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock,
+        };
+
+        const TOOL_NAME: &str = "send_voice_message";
+        const WAVEFORM_MAX_LEN: usize = 200;
+        const WAVEFORM_MAX_VALUE: u16 = 1024;
+        // One-hour cap; longer values are almost certainly caller
+        // bugs and confuse Element's progress UI.
+        const DURATION_MAX_MS: u64 = 60 * 60 * 1000;
+
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(TOOL_NAME, &mxid_for_audit, Some(&room_id_for_audit));
+
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            validate_voice_params(
+                params.duration_ms,
+                params.waveform.as_deref(),
+                DURATION_MAX_MS,
+                WAVEFORM_MAX_LEN,
+                WAVEFORM_MAX_VALUE,
+            )?;
+
+            let client = self.client_for(&ctx).await?;
+            let uploaded = self
+                .upload_from_url(
+                    &params.media_url,
+                    &client,
+                    Some("audio/"),
+                    MediaKind::Audio.default_mime(),
+                )
+                .await?;
+
+            let mime_str = uploaded.mime_type.essence_str().to_owned();
+            let size = UInt::try_from(uploaded.bytes_len).ok();
+            let duration = params.duration_ms.map(Duration::from_millis);
+
+            let body = params
+                .caption
+                .clone()
+                .unwrap_or_else(|| "Voice message".to_owned());
+            let mut info = AudioInfo::new();
+            info.mimetype = Some(mime_str);
+            info.size = size;
+            info.duration = duration;
+
+            let mut content = AudioMessageEventContent::plain(body, uploaded.mxc_uri.clone());
+            content.info = Some(Box::new(info));
+            // MSC3245: empty block flips Element's UI to voice-memo
+            // mode. The MSC1767 audio block below carries duration +
+            // waveform; presence of both is what 1767-aware clients
+            // key off.
+            content.voice = Some(UnstableVoiceContentBlock::new());
+            let waveform = params
+                .waveform
+                .unwrap_or_default()
+                .into_iter()
+                .map(UnstableAmplitude::new)
+                .collect();
+            content.audio = Some(UnstableAudioDetailsContentBlock::new(
+                duration.unwrap_or_default(),
+                waveform,
+            ));
+
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let send_resp = room
+                .send(RoomMessageEventContent::new(MessageType::Audio(content)))
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.send: {e}"), None))?;
+            structured_result(&SendMediaResult {
+                event_id: send_resp.response.event_id.to_string(),
+                mxc_uri: uploaded.mxc_uri.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            TOOL_NAME,
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            TOOL_NAME,
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
+
+    /// Body for `send_tts_voice_message`. Synthesises speech via the
+    /// configured TTS endpoint, parses the returned WAV for
+    /// duration, uploads to the homeserver media repo, and sends an
+    /// `m.audio` event with the MSC3245 voice flag.
+    async fn send_tts_voice_message_inner(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        params: SendTtsVoiceMessageParams,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        use matrix_sdk::ruma::UInt;
+        use matrix_sdk::ruma::events::room::message::{
+            AudioInfo, AudioMessageEventContent, UnstableAudioDetailsContentBlock,
+            UnstableVoiceContentBlock,
+        };
+
+        const TOOL_NAME: &str = "send_tts_voice_message";
+        const INPUT_MAX_CHARS: usize = 4096;
+        const BODY_FALLBACK_MAX_CHARS: usize = 512;
+        const TTS_TIMEOUT_SECS: u64 = 120;
+        const MIME_WAV: &str = "audio/wav";
+
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span(TOOL_NAME, &mxid_for_audit, Some(&room_id_for_audit));
+
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let tts = self.tts.as_ref().ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "TTS endpoint is not configured on this matrix-mcp instance \
+                     (set MATRIX_MCP_TTS_BASE_URL and MATRIX_MCP_TTS_BEARER_TOKEN).",
+                    None,
+                )
+            })?;
+            validate_tts_params(&params, INPUT_MAX_CHARS)?;
+
+            let wav_bytes = synthesize_tts(
+                tts,
+                &params,
+                Duration::from_secs(TTS_TIMEOUT_SECS),
+                self.upload_max_bytes,
+            )
+            .await?;
+
+            let duration = parse_wav_duration(&wav_bytes);
+            let wav_len = wav_bytes.len();
+            let client = self.client_for(&ctx).await?;
+            let mime_type: mime::Mime = MIME_WAV.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+            let upload_resp = client
+                .media()
+                .upload(&mime_type, wav_bytes, None)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("media upload: {e}"), None))?;
+            let mxc_uri = upload_resp.content_uri;
+
+            let body = params.caption.clone().unwrap_or_else(|| {
+                let trimmed = params.input.trim();
+                let mut t: String = trimmed.chars().take(BODY_FALLBACK_MAX_CHARS).collect();
+                if trimmed.chars().count() > BODY_FALLBACK_MAX_CHARS {
+                    t.push('…');
+                }
+                t
+            });
+            let mut info = AudioInfo::new();
+            info.mimetype = Some(MIME_WAV.to_owned());
+            info.size = UInt::try_from(wav_len).ok();
+            info.duration = duration;
+            let mut content = AudioMessageEventContent::plain(body, mxc_uri.clone());
+            content.info = Some(Box::new(info));
+            content.voice = Some(UnstableVoiceContentBlock::new());
+            content.audio = Some(UnstableAudioDetailsContentBlock::new(
+                duration.unwrap_or_default(),
+                Vec::new(),
+            ));
+
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            let send_resp = room
+                .send(RoomMessageEventContent::new(MessageType::Audio(content)))
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("room.send: {e}"), None))?;
+            structured_result(&SendMediaResult {
+                event_id: send_resp.response.event_id.to_string(),
+                mxc_uri: mxc_uri.to_string(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            TOOL_NAME,
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            None,
+            &span,
+            &result,
+        );
+        emit_write_notice(
+            &result,
+            &self.clients,
+            &ctx,
+            TOOL_NAME,
+            Some(room_id_for_audit.as_str()),
+        )
+        .await;
+        result
+    }
 }
 
 /// Convert a batch of [`matrix_sdk::deserialized_responses::TimelineEvent`]s
@@ -6905,6 +7447,46 @@ mod tests {
         assert!(validate_reaction_key(&at_limit).is_ok());
         let oversized = "a".repeat(MAX_REACTION_KEY_BYTES + 1);
         assert!(validate_reaction_key(&oversized).is_err());
+    }
+
+    #[test]
+    fn wav_duration_parses_minimal_header() {
+        // 24 kHz mono 16-bit PCM, 12000 samples = 500 ms.
+        let sample_rate: u32 = 24_000;
+        let bits: u16 = 16;
+        let channels: u16 = 1;
+        let block_align: u16 = channels * bits / 8;
+        let data_bytes: u32 = 24_000; // 12000 frames * 2 bytes
+        let riff_size: u32 = 36 + data_bytes;
+
+        let mut wav: Vec<u8> = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // audio_format = PCM
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        wav.resize(wav.len() + data_bytes as usize, 0);
+
+        let got = parse_wav_duration(&wav).expect("valid WAV must parse");
+        assert_eq!(got, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn wav_duration_rejects_garbage() {
+        assert!(parse_wav_duration(&[]).is_none());
+        assert!(parse_wav_duration(b"not a wav file at all").is_none());
+        // Header prefix present but truncated before any chunk.
+        let mut short = b"RIFF\x00\x00\x00\x00WAVE".to_vec();
+        short.resize(44, 0);
+        assert!(parse_wav_duration(&short).is_none());
     }
 
     #[test]

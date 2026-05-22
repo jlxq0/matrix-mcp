@@ -6,6 +6,26 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added
+- `send_voice_message` MCP tool: posts `m.audio` with the MSC3245
+  voice flag + MSC1767 audio block (duration + waveform) so Element
+  renders the event as a voice-memo bubble instead of a generic audio
+  attachment. Accepts an optional caller-supplied waveform (0..=1024
+  samples, cap 200 entries); without one, clients still treat the
+  event as a voice message but show a flat bar. Audio is not decoded
+  server-side. Enables `ruma`'s `unstable-msc3245-v1-compat` feature.
+- `send_tts_voice_message` MCP tool: POSTs caller text to a
+  configured OpenAI-compatible TTS endpoint
+  (`{base}/audio/speech`, e.g. Chatterbox), parses the returned
+  WAV for duration, uploads to the homeserver media repo, and
+  sends the result as a voice message (same MSC3245 + MSC1767
+  envelope as `send_voice_message`). New env vars
+  `MATRIX_MCP_TTS_BASE_URL` and `MATRIX_MCP_TTS_BEARER_TOKEN` —
+  both must be set together, or both unset (the tool then
+  returns `invalid_params`). Input capped at 4096 chars; response
+  capped at the existing `MATRIX_MCP_UPLOAD_MAX_BYTES`. Token
+  is never logged.
+
 ### Security (secscan Group D: rescan follow-ups)
 - `CappedSessionManager::create_session` now takes a `tokio::sync::Mutex`
   gate before reading the session count and inserting. Previously the

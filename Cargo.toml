@@ -95,7 +95,15 @@ matrix-sdk = { version = "0.17", default-features = false, features = [
 # `RoomMessageEventContent` for sending m.text bodies). Pinned to the
 # same Matrix-spec generation as matrix-sdk 0.17. 0.15 is the API line
 # matrix-sdk 0.17 re-exports under `matrix_sdk::ruma::*`.
-ruma = { version = "0.15", features = ["client-api-c", "html"] }
+ruma = { version = "0.15", features = [
+    "client-api-c",
+    "html",
+    # Adds typed `voice` and `audio` (MSC1767) fields on
+    # `AudioMessageEventContent`, used by `send_voice_message` so
+    # Element renders an outgoing m.audio as a voice memo (waveform
+    # bubble) instead of a generic audio attachment.
+    "unstable-msc3245-v1-compat",
+] }
 # HKDF for deriving the per-user store-cipher key from the shared pepper.
 # `salt = mxid`, `ikm = pepper`, `info = "matrix-mcp-store-cipher v1"`.
 hkdf = "0.12"
