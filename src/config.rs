@@ -360,31 +360,45 @@ impl Config {
     }
 }
 
-/// `(MATRIX_MCP_TTS_BASE_URL, MATRIX_MCP_TTS_BEARER_TOKEN)` must
-/// either both be set or both be unset. Mixing is rejected so a
-/// half-configured deploy doesn't silently disable TTS or, worse,
-/// post anonymous requests to a public endpoint.
+/// `(MATRIX_MCP_TTS_BASE_URL, MATRIX_MCP_TTS_BEARER_TOKEN)` should
+/// either both be set or both be unset. A partial configuration is
+/// almost certainly an ESO race during a rollout (one env var
+/// landed before the other) — we log a warning and treat TTS as
+/// disabled instead of crashlooping the pod, so the rest of the
+/// server stays available while the secret catches up.
 fn parse_tts_config() -> Result<Option<TtsConfig>> {
     let url = std::env::var(ENV_TTS_BASE_URL).ok();
     let token = std::env::var(ENV_TTS_BEARER_TOKEN).ok();
     match (url, token) {
         (None, None) => Ok(None),
-        (Some(url), Some(token)) => {
+        (Some(url), Some(token)) if !token.is_empty() => {
             let base_url = strip_trailing_slash(url);
             validate_url(&base_url, ENV_TTS_BASE_URL)?;
-            if token.is_empty() {
-                anyhow::bail!("{ENV_TTS_BEARER_TOKEN} must not be empty");
-            }
             Ok(Some(TtsConfig {
                 base_url,
                 bearer_token: token,
             }))
         }
+        (Some(_), Some(_)) => {
+            tracing::warn!(
+                "{ENV_TTS_BEARER_TOKEN} is set but empty — disabling TTS \
+                 (send_tts_voice_message will return invalid_params)"
+            );
+            Ok(None)
+        }
         (Some(_), None) => {
-            anyhow::bail!("{ENV_TTS_BASE_URL} is set but {ENV_TTS_BEARER_TOKEN} is not")
+            tracing::warn!(
+                "{ENV_TTS_BASE_URL} is set but {ENV_TTS_BEARER_TOKEN} is not — \
+                 disabling TTS (send_tts_voice_message will return invalid_params)"
+            );
+            Ok(None)
         }
         (None, Some(_)) => {
-            anyhow::bail!("{ENV_TTS_BEARER_TOKEN} is set but {ENV_TTS_BASE_URL} is not")
+            tracing::warn!(
+                "{ENV_TTS_BEARER_TOKEN} is set but {ENV_TTS_BASE_URL} is not — \
+                 disabling TTS (send_tts_voice_message will return invalid_params)"
+            );
+            Ok(None)
         }
     }
 }
