@@ -389,19 +389,26 @@ fn validate_voice_params(
     Ok(())
 }
 
-/// Parse the RIFF/WAVE header of `bytes` and return the audio
-/// duration. Returns `None` if `bytes` is not a recognisable WAV
-/// file (we only need duration here; sample format / endianness
-/// details are skipped). Reads the `fmt ` chunk for `sample_rate`
-/// and `block_align`, and the `data` chunk for the sample-payload
-/// size; duration = (`data_bytes` / `block_align`) / `sample_rate`.
-fn parse_wav_duration(bytes: &[u8]) -> Option<Duration> {
+/// PCM samples extracted from a WAV file. We only accept the
+/// narrow shape that Chatterbox emits and Element ingests cleanly
+/// (mono, 16-bit, one of Opus's supported sample rates).
+struct WavSamples {
+    sample_rate: u32,
+    samples: Vec<i16>,
+}
+
+/// Parse a mono 16-bit PCM WAV. Returns `None` for anything we
+/// can't feed straight into libopus (multi-channel, non-PCM,
+/// non-16-bit, malformed RIFF).
+fn parse_wav_mono_16bit(bytes: &[u8]) -> Option<WavSamples> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return None;
     }
     let mut pos = 12usize;
     let mut sample_rate: u32 = 0;
-    let mut block_align: u16 = 0;
+    let mut channels: u16 = 0;
+    let mut bits_per_sample: u16 = 0;
+    let mut audio_format: u16 = 0;
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
         let size = u32::from_le_bytes([
@@ -410,8 +417,8 @@ fn parse_wav_duration(bytes: &[u8]) -> Option<Duration> {
             bytes[pos + 6],
             bytes[pos + 7],
         ]) as usize;
-        let body_start = pos + 8;
-        let body_end = body_start.checked_add(size)?;
+        let body = pos + 8;
+        let body_end = body.checked_add(size)?;
         if body_end > bytes.len() {
             return None;
         }
@@ -420,21 +427,32 @@ fn parse_wav_duration(bytes: &[u8]) -> Option<Duration> {
                 if size < 16 {
                     return None;
                 }
+                audio_format = u16::from_le_bytes([bytes[body], bytes[body + 1]]);
+                channels = u16::from_le_bytes([bytes[body + 2], bytes[body + 3]]);
                 sample_rate = u32::from_le_bytes([
-                    bytes[body_start + 4],
-                    bytes[body_start + 5],
-                    bytes[body_start + 6],
-                    bytes[body_start + 7],
+                    bytes[body + 4],
+                    bytes[body + 5],
+                    bytes[body + 6],
+                    bytes[body + 7],
                 ]);
-                block_align = u16::from_le_bytes([bytes[body_start + 12], bytes[body_start + 13]]);
+                bits_per_sample = u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]);
             }
             b"data" => {
-                if sample_rate == 0 || block_align == 0 {
+                if audio_format != 1 || channels != 1 || bits_per_sample != 16 {
                     return None;
                 }
-                let frames = (size as u64) / u64::from(block_align);
-                let micros = frames.checked_mul(1_000_000)? / u64::from(sample_rate);
-                return Some(Duration::from_micros(micros));
+                if sample_rate == 0 {
+                    return None;
+                }
+                let even = size & !1;
+                let samples = bytes[body..body + even]
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                return Some(WavSamples {
+                    sample_rate,
+                    samples,
+                });
             }
             _ => {}
         }
@@ -442,6 +460,169 @@ fn parse_wav_duration(bytes: &[u8]) -> Option<Duration> {
         pos = body_end + (size & 1);
     }
     None
+}
+
+/// Peak-amplitude waveform: `bucket_count` evenly-spaced buckets
+/// across `samples`, each value = max |sample| in that bucket
+/// normalised to 0..=1024 per MSC1767. Element draws the
+/// voice-message bars from these.
+fn compute_waveform(samples: &[i16], bucket_count: usize) -> Vec<u16> {
+    if samples.is_empty() || bucket_count == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(bucket_count);
+    for i in 0..bucket_count {
+        let lo = i * samples.len() / bucket_count;
+        let hi = ((i + 1) * samples.len() / bucket_count).clamp(lo + 1, samples.len());
+        let peak = samples[lo..hi]
+            .iter()
+            .map(|s| u32::from(s.unsigned_abs()))
+            .max()
+            .unwrap_or(0);
+        // Map 0..=32768 → 0..=1024 (peak fits in u16 by construction
+        // since the operand is bounded by 1024 before the cast).
+        let scaled = u16::try_from((peak * 1024 / 32_768).min(1024)).unwrap_or(1024);
+        out.push(scaled);
+    }
+    out
+}
+
+/// Build the `OpusHead` packet (RFC 7845 §5.1). 19 bytes for
+/// `channel_mapping_family = 0` (mono/stereo).
+fn build_opus_head(sample_rate: u32, pre_skip: u16) -> Vec<u8> {
+    let mut head = Vec::with_capacity(19);
+    head.extend_from_slice(b"OpusHead");
+    head.push(1); // version
+    head.push(1); // channel_count (mono)
+    head.extend_from_slice(&pre_skip.to_le_bytes());
+    head.extend_from_slice(&sample_rate.to_le_bytes()); // input_sample_rate
+    head.extend_from_slice(&0i16.to_le_bytes()); // output_gain (Q8 dB)
+    head.push(0); // channel_mapping_family
+    head
+}
+
+/// Build the `OpusTags` packet (RFC 7845 §5.2). Vendor string is
+/// `matrix-mcp`; zero user comments.
+fn build_opus_tags() -> Vec<u8> {
+    const VENDOR: &[u8] = b"matrix-mcp";
+    // The vendor name is a compile-time constant well under u32::MAX,
+    // so the cast is exact; clippy's `as` lint requires a justification.
+    #[allow(clippy::cast_possible_truncation)]
+    let vendor_len = VENDOR.len() as u32;
+    let mut tags = Vec::with_capacity(8 + 4 + VENDOR.len() + 4);
+    tags.extend_from_slice(b"OpusTags");
+    tags.extend_from_slice(&vendor_len.to_le_bytes());
+    tags.extend_from_slice(VENDOR);
+    tags.extend_from_slice(&0u32.to_le_bytes()); // user_comment_list_length
+    tags
+}
+
+/// Transcode a mono 16-bit PCM WAV into an Ogg/Opus stream
+/// (`audio/ogg`). Returns `(ogg_bytes, duration, waveform)` —
+/// the waveform is 40 peak samples in 0..=1024.
+///
+/// This is what makes Element render the Matrix event as a
+/// voice-memo bubble with a real waveform: `audio/wav` displays
+/// as a generic attachment in most clients regardless of the
+/// MSC3245 voice flag.
+fn transcode_wav_to_ogg_opus(wav: &[u8]) -> Result<(Vec<u8>, Duration, Vec<u16>), ErrorData> {
+    const OGG_SERIAL: u32 = 0x4d_4d_43_50; // "MMCP"; arbitrary per-stream id
+    const OPUS_OUT_BUF: usize = 4000; // safe upper bound for one Opus packet
+    // OggOpus granule positions are always at 48 kHz per RFC 7845,
+    // regardless of input sample rate. A 20 ms frame = 960 @ 48 kHz.
+    const GRANULES_PER_FRAME: u64 = 960;
+    const WAVEFORM_BUCKETS: usize = 40;
+
+    let pcm = parse_wav_mono_16bit(wav).ok_or_else(|| {
+        ErrorData::internal_error(
+            "TTS response must be mono 16-bit PCM WAV (Chatterbox default)",
+            None,
+        )
+    })?;
+    if !matches!(pcm.sample_rate, 8000 | 12000 | 16000 | 24000 | 48000) {
+        return Err(ErrorData::internal_error(
+            format!(
+                "TTS sample rate {} Hz is not one Opus supports natively",
+                pcm.sample_rate
+            ),
+            None,
+        ));
+    }
+    if pcm.samples.is_empty() {
+        return Err(ErrorData::internal_error(
+            "TTS response had no audio samples",
+            None,
+        ));
+    }
+    let duration =
+        Duration::from_micros((pcm.samples.len() as u64) * 1_000_000 / u64::from(pcm.sample_rate));
+    let waveform = compute_waveform(&pcm.samples, WAVEFORM_BUCKETS);
+
+    let mut encoder = opus::Encoder::new(
+        pcm.sample_rate,
+        opus::Channels::Mono,
+        opus::Application::Voip,
+    )
+    .map_err(|e| ErrorData::internal_error(format!("opus encoder init: {e}"), None))?;
+    encoder
+        .set_bitrate(opus::Bitrate::Bits(24_000))
+        .map_err(|e| ErrorData::internal_error(format!("opus set_bitrate: {e}"), None))?;
+    // pre_skip in OpusHead is at 48 kHz regardless of input rate.
+    let lookahead = encoder
+        .get_lookahead()
+        .map_err(|e| ErrorData::internal_error(format!("opus get_lookahead: {e}"), None))?;
+    let lookahead_u32 = u32::try_from(lookahead.max(0)).unwrap_or(0);
+    let pre_skip: u16 =
+        u16::try_from(u64::from(lookahead_u32) * 48_000 / u64::from(pcm.sample_rate))
+            .unwrap_or(312);
+
+    let frame_samples = (pcm.sample_rate / 50) as usize;
+    let mut ogg_buf: Vec<u8> = Vec::with_capacity(wav.len() / 4);
+    {
+        let mut writer = ogg::PacketWriter::new(&mut ogg_buf);
+        writer
+            .write_packet(
+                build_opus_head(pcm.sample_rate, pre_skip),
+                OGG_SERIAL,
+                ogg::PacketWriteEndInfo::EndPage,
+                0,
+            )
+            .map_err(|e| ErrorData::internal_error(format!("ogg head page: {e}"), None))?;
+        writer
+            .write_packet(
+                build_opus_tags(),
+                OGG_SERIAL,
+                ogg::PacketWriteEndInfo::EndPage,
+                0,
+            )
+            .map_err(|e| ErrorData::internal_error(format!("ogg tags page: {e}"), None))?;
+
+        let mut opus_out = vec![0u8; OPUS_OUT_BUF];
+        let mut granule: u64 = u64::from(pre_skip);
+        let mut iter = pcm.samples.chunks(frame_samples).peekable();
+        while let Some(chunk) = iter.next() {
+            // Pad the trailing frame with silence so the encoder
+            // always gets a full 20 ms input; the extra <20 ms tail
+            // is imperceptible at the bitrates we use.
+            let mut frame = chunk.to_vec();
+            if frame.len() < frame_samples {
+                frame.resize(frame_samples, 0);
+            }
+            let n = encoder
+                .encode(&frame, &mut opus_out)
+                .map_err(|e| ErrorData::internal_error(format!("opus encode: {e}"), None))?;
+            granule += GRANULES_PER_FRAME;
+            let end_info = if iter.peek().is_none() {
+                ogg::PacketWriteEndInfo::EndStream
+            } else {
+                ogg::PacketWriteEndInfo::NormalPacket
+            };
+            writer
+                .write_packet(opus_out[..n].to_vec(), OGG_SERIAL, end_info, granule)
+                .map_err(|e| ErrorData::internal_error(format!("ogg audio page: {e}"), None))?;
+        }
+    }
+    Ok((ogg_buf, duration, waveform))
 }
 
 /// Validate the user-controllable parameters of `send_tts_voice_message`
@@ -6952,15 +7133,15 @@ impl MatrixMcpService {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         use matrix_sdk::ruma::UInt;
         use matrix_sdk::ruma::events::room::message::{
-            AudioInfo, AudioMessageEventContent, UnstableAudioDetailsContentBlock,
-            UnstableVoiceContentBlock,
+            AudioInfo, AudioMessageEventContent, UnstableAmplitude,
+            UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock,
         };
 
         const TOOL_NAME: &str = "send_tts_voice_message";
         const INPUT_MAX_CHARS: usize = 4096;
         const BODY_FALLBACK_MAX_CHARS: usize = 512;
         const TTS_TIMEOUT_SECS: u64 = 120;
-        const MIME_WAV: &str = "audio/wav";
+        const MIME_OPUS: &str = "audio/ogg";
 
         let started = Instant::now();
         let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
@@ -6986,13 +7167,17 @@ impl MatrixMcpService {
             )
             .await?;
 
-            let duration = parse_wav_duration(&wav_bytes);
-            let wav_len = wav_bytes.len();
+            // Transcode Chatterbox's WAV into Ogg/Opus so Element
+            // renders this as a voice-memo bubble. WAV-mimetype voice
+            // messages show as generic attachments in most clients
+            // regardless of the MSC3245 voice flag.
+            let (ogg_bytes, duration, waveform_samples) = transcode_wav_to_ogg_opus(&wav_bytes)?;
+            let ogg_len = ogg_bytes.len();
             let client = self.client_for(&ctx).await?;
-            let mime_type: mime::Mime = MIME_WAV.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+            let mime_type: mime::Mime = MIME_OPUS.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
             let upload_resp = client
                 .media()
-                .upload(&mime_type, wav_bytes, None)
+                .upload(&mime_type, ogg_bytes, None)
                 .await
                 .map_err(|e| ErrorData::internal_error(format!("media upload: {e}"), None))?;
             let mxc_uri = upload_resp.content_uri;
@@ -7006,16 +7191,17 @@ impl MatrixMcpService {
                 t
             });
             let mut info = AudioInfo::new();
-            info.mimetype = Some(MIME_WAV.to_owned());
-            info.size = UInt::try_from(wav_len).ok();
-            info.duration = duration;
+            info.mimetype = Some(MIME_OPUS.to_owned());
+            info.size = UInt::try_from(ogg_len).ok();
+            info.duration = Some(duration);
             let mut content = AudioMessageEventContent::plain(body, mxc_uri.clone());
             content.info = Some(Box::new(info));
             content.voice = Some(UnstableVoiceContentBlock::new());
-            content.audio = Some(UnstableAudioDetailsContentBlock::new(
-                duration.unwrap_or_default(),
-                Vec::new(),
-            ));
+            let waveform = waveform_samples
+                .into_iter()
+                .map(UnstableAmplitude::new)
+                .collect();
+            content.audio = Some(UnstableAudioDetailsContentBlock::new(duration, waveform));
 
             let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
                 ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
@@ -7449,14 +7635,16 @@ mod tests {
         assert!(validate_reaction_key(&oversized).is_err());
     }
 
-    #[test]
-    fn wav_duration_parses_minimal_header() {
-        // 24 kHz mono 16-bit PCM, 12000 samples = 500 ms.
+    /// Synthesise a 24 kHz mono 16-bit PCM WAV containing
+    /// `duration_ms` of a `freq_hz` sine wave at half-scale.
+    /// Used by the transcoder tests below.
+    fn synth_sine_wav(duration_ms: u32, freq_hz: f32) -> Vec<u8> {
         let sample_rate: u32 = 24_000;
-        let bits: u16 = 16;
         let channels: u16 = 1;
+        let bits: u16 = 16;
         let block_align: u16 = channels * bits / 8;
-        let data_bytes: u32 = 24_000; // 12000 frames * 2 bytes
+        let frames: u32 = sample_rate * duration_ms / 1000;
+        let data_bytes: u32 = frames * u32::from(block_align);
         let riff_size: u32 = 36 + data_bytes;
 
         let mut wav: Vec<u8> = Vec::new();
@@ -7464,29 +7652,67 @@ mod tests {
         wav.extend_from_slice(&riff_size.to_le_bytes());
         wav.extend_from_slice(b"WAVE");
         wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+        wav.extend_from_slice(&16u32.to_le_bytes());
         wav.extend_from_slice(&1u16.to_le_bytes()); // audio_format = PCM
         wav.extend_from_slice(&channels.to_le_bytes());
         wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
         wav.extend_from_slice(&block_align.to_le_bytes());
         wav.extend_from_slice(&bits.to_le_bytes());
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&data_bytes.to_le_bytes());
-        wav.resize(wav.len() + data_bytes as usize, 0);
-
-        let got = parse_wav_duration(&wav).expect("valid WAV must parse");
-        assert_eq!(got, Duration::from_millis(500));
+        let amplitude: f32 = 16_000.0;
+        for n in 0..frames {
+            #[allow(clippy::cast_precision_loss)]
+            let t = n as f32 / sample_rate as f32;
+            #[allow(clippy::cast_possible_truncation)]
+            let s = (amplitude * (2.0 * std::f32::consts::PI * freq_hz * t).sin()) as i16;
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        wav
     }
 
     #[test]
-    fn wav_duration_rejects_garbage() {
-        assert!(parse_wav_duration(&[]).is_none());
-        assert!(parse_wav_duration(b"not a wav file at all").is_none());
-        // Header prefix present but truncated before any chunk.
-        let mut short = b"RIFF\x00\x00\x00\x00WAVE".to_vec();
-        short.resize(44, 0);
-        assert!(parse_wav_duration(&short).is_none());
+    fn transcoder_produces_ogg_stream() {
+        let wav = synth_sine_wav(500, 440.0);
+        let (ogg, duration, waveform) =
+            transcode_wav_to_ogg_opus(&wav).expect("transcode of sine WAV");
+
+        // Every Ogg page starts with the four-byte magic "OggS".
+        assert_eq!(&ogg[0..4], b"OggS", "stream must start with Ogg magic");
+        // At least three pages: OpusHead, OpusTags, audio.
+        let page_count = ogg.windows(4).filter(|w| *w == b"OggS").count();
+        assert!(
+            page_count >= 3,
+            "expected at least 3 Ogg pages, got {page_count}"
+        );
+
+        assert_eq!(duration, Duration::from_millis(500));
+        assert_eq!(waveform.len(), 40, "default bucket count is 40");
+        // A 440 Hz sine at half-scale should max out somewhere
+        // around 500/1024; exact value depends on bucket alignment.
+        let peak = *waveform.iter().max().unwrap_or(&0);
+        assert!(
+            (200..=1024).contains(&peak),
+            "sine peak {peak} should reach ~half-scale"
+        );
+    }
+
+    #[test]
+    fn transcoder_rejects_non_pcm_input() {
+        // Non-PCM audio_format (e.g. 3 = IEEE float) must be refused
+        // because libopus expects 16-bit integer samples.
+        let mut wav = synth_sine_wav(20, 440.0);
+        // audio_format lives at offset 20 (RIFF header + "fmt " + size).
+        wav[20] = 3;
+        wav[21] = 0;
+        assert!(transcode_wav_to_ogg_opus(&wav).is_err());
+    }
+
+    #[test]
+    fn transcoder_rejects_garbage() {
+        assert!(transcode_wav_to_ogg_opus(&[]).is_err());
+        assert!(transcode_wav_to_ogg_opus(b"not a wav file at all").is_err());
     }
 
     #[test]

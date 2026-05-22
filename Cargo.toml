@@ -114,6 +114,15 @@ hex = "0.4"
 # a transitive dep (reqwest + matrix-sdk pull it in), so this just makes
 # the dependency explicit and keeps the import path stable.
 mime = "0.3"
+# libopus bindings for transcoding Chatterbox's WAV output into the
+# Ogg/Opus that Element renders as a voice-memo bubble. `opus` pulls
+# `opusic-sys`, which builds libopus statically from C source at
+# build time (cc-rs), so the distroless runtime image needs no extra
+# system libraries.
+opus = "0.3"
+# Ogg container packetizer for wrapping the raw Opus frames into the
+# RFC 7845 OggOpus stream layout (OpusHead + OpusTags + audio pages).
+ogg = "0.9"
 
 [dev-dependencies]
 # Mock HTTP server for MAS introspection tests. Used by `cargo test` only;

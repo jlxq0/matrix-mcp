@@ -12,6 +12,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  # `audiopus_sys` defaults to dynamic linking on Linux/glibc, which
+  # would make our distroless runtime image require libopus.so. Force
+  # static so the same library shipped in the binary is what runs.
+  OPUS_STATIC: "1"
 
 jobs:
   # All cargo checks in one job. On a fast runner the cache hit + shared
@@ -33,6 +37,12 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
+      # `opus` (via audiopus_sys) builds libopus from C source at
+      # crate-build time using CMake. Even `cargo clippy` runs the
+      # build script, so cmake must be present on the runner for any
+      # cargo step to succeed.
+      - name: Install C build deps for libopus
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy

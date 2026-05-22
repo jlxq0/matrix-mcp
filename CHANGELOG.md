@@ -6,6 +6,18 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Changed
+- `send_tts_voice_message` now transcodes Chatterbox's WAV output
+  to Ogg/Opus (`audio/ogg`) before uploading to the homeserver.
+  WAV-mimetype voice messages rendered as generic file attachments
+  in Element regardless of the MSC3245 voice flag; Ogg/Opus is what
+  Element actually treats as a voice memo (bubble + play button +
+  waveform bars). The MSC1767 audio block now carries a real
+  40-bucket peak waveform computed from the PCM samples (previously
+  empty), so Element draws the bars instead of a flat line.
+  Implemented in pure Rust via `opus` (libopus C bindings, built
+  static) + `ogg` — no system libraries needed at runtime.
+
 ### Added
 - `send_voice_message` MCP tool: posts `m.audio` with the MSC3245
   voice flag + MSC1767 audio block (duration + waveform) so Element

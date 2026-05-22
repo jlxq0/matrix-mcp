@@ -13,6 +13,19 @@ FROM rust:${RUST_VERSION}-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8
 
 WORKDIR /build
 
+# `opus` (via audiopus_sys) builds libopus from C source via CMake.
+# The rust:1.93-bookworm image has gcc but not cmake; install it here
+# so the build script can produce libopus.a for static linking. We
+# don't need cmake at runtime — only during `cargo build`.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Force static linking of libopus so the distroless runtime image
+# (which has no libopus.so) doesn't crash at startup. audiopus_sys's
+# default on Linux/glibc is dynamic linking; OPUS_STATIC=1 flips it.
+ENV OPUS_STATIC=1
+
 # Cache dependencies separately from source: copy manifest first, build a
 # stub, then copy real source. This means `cargo build` only re-runs the
 # slow dependency compile if Cargo.toml / Cargo.lock change.
