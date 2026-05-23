@@ -659,6 +659,34 @@ fn validate_tts_params(
     Ok(())
 }
 
+/// Insert `...` after sentence-ending punctuation so Chatterbox
+/// breathes between sentences instead of rushing through them. No-op
+/// if the input already contains `...` (caller has hand-tuned pauses
+/// and we don't want to double them up). Only triggers on punctuation
+/// followed by whitespace + a letter/digit — so things like decimals
+/// (`3.14`) or URLs (`example.com`) aren't affected.
+fn inject_pauses(input: &str) -> String {
+    if input.contains("...") {
+        return input.to_owned();
+    }
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        out.push(c);
+        if (c == '.' || c == '?' || c == '!')
+            && i + 2 < bytes.len()
+            && (bytes[i + 1] as char).is_whitespace()
+            && (bytes[i + 2] as char).is_alphanumeric()
+        {
+            out.push_str(" ...");
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Distinguishes transient (retryable) and permanent (caller-visible)
 /// errors during TTS synthesis. Transient = mid-stream cuts and 5xx
 /// from the TTS endpoint, both typical signatures of Chatterbox cold
@@ -688,20 +716,27 @@ async fn synthesize_tts(
         .await
         .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
 
+    // Defaults below are tuned for the `julian` voice (Julian's cloned
+    // voice on the homelab Chatterbox). They produce English with the
+    // German accent that makes it recognisable as Julian; without
+    // `language_id=de` the model irons out the accent and recipients
+    // report "that doesn't sound like you". They also paste-pad input
+    // with `...` between sentences so the output breathes instead of
+    // rushing — chatterbox respects punctuation as pause cues.
+    //
+    // Explicit caller values always override these defaults.
     let voice = params.voice.as_deref().unwrap_or("julian");
-    let mut body = serde_json::json!({
-        "input": params.input,
+    let input = inject_pauses(&params.input);
+    let exaggeration = params.exaggeration.unwrap_or(0.6);
+    let cfg_weight = params.cfg_weight.unwrap_or(0.5);
+    let language_id = params.language_id.as_deref().unwrap_or("de");
+    let body = serde_json::json!({
+        "input": input,
         "voice": voice,
+        "exaggeration": exaggeration,
+        "cfg_weight": cfg_weight,
+        "language_id": language_id,
     });
-    if let Some(v) = params.exaggeration {
-        body["exaggeration"] = serde_json::json!(v);
-    }
-    if let Some(v) = params.cfg_weight {
-        body["cfg_weight"] = serde_json::json!(v);
-    }
-    if let Some(ref lang) = params.language_id {
-        body["language_id"] = serde_json::json!(lang);
-    }
 
     // http1_only: Cloudflare's HTTP/2 implementation cuts streams that
     // trickle bytes slower than its idle threshold (~60 s), and
@@ -988,25 +1023,31 @@ pub struct SendMediaResult {
 pub struct SendTtsVoiceMessageParams {
     /// Matrix room id, e.g. `!abc:example.com`.
     pub room_id: String,
-    /// Text to synthesize. Sent verbatim to the configured TTS
-    /// endpoint as the `input` field. Hard-capped at 4096 chars to
-    /// keep clip length bounded.
+    /// Text to synthesize. `...` is auto-inserted after sentence
+    /// punctuation so the output breathes — if you want explicit
+    /// control over pauses, include `...` yourself anywhere in the
+    /// input and the auto-insertion is skipped. Hard-capped at
+    /// 4096 chars to keep clip length bounded.
     pub input: String,
     /// Voice preset to request. Defaults to `julian` (Julian's
     /// cloned voice on the homelab Chatterbox).
     #[serde(default)]
     pub voice: Option<String>,
     /// Chatterbox `exaggeration` parameter, 0..=1. Higher =
-    /// more expressive delivery.
+    /// more expressive delivery. Defaults to 0.6 (tuned for `julian`).
     #[serde(default)]
     pub exaggeration: Option<f32>,
     /// Chatterbox `cfg_weight` parameter, 0..=1. Lower = stays
-    /// closer to the reference voice. Use `0` if the input is in
-    /// a language different from the voice's native language.
+    /// closer to the reference voice. Defaults to 0.5. Use `0` if
+    /// the input is in a language different from the voice's native
+    /// language.
     #[serde(default)]
     pub cfg_weight: Option<f32>,
-    /// Optional language code (e.g. `de`); only meaningful for
-    /// multilingual TTS backends.
+    /// Language code (e.g. `de`, `en`). For the `julian` voice this
+    /// defaults to `de` — feeding English text through the German
+    /// phonemiser gives Julian's natural English-with-German-accent
+    /// sound. Pass `en` explicitly for un-accented English, or `de`
+    /// with German input text for full German output.
     #[serde(default)]
     pub language_id: Option<String>,
     /// Optional override for the Matrix `body` fallback text. If
@@ -7684,6 +7725,36 @@ mod tests {
     fn default_message_limit_is_sensible() {
         let n = default_message_limit();
         assert!((10..=MAX_MESSAGE_LIMIT).contains(&n), "limit was {n}");
+    }
+
+    #[test]
+    fn inject_pauses_adds_ellipses_between_sentences() {
+        assert_eq!(
+            inject_pauses("Hello world. How are you? I am fine!"),
+            "Hello world. ... How are you? ... I am fine!"
+        );
+    }
+
+    #[test]
+    fn inject_pauses_skips_if_user_already_used_ellipses() {
+        let input = "Hello... world. How are you?";
+        assert_eq!(inject_pauses(input), input);
+    }
+
+    #[test]
+    fn inject_pauses_leaves_decimals_alone() {
+        assert_eq!(inject_pauses("Pi is 3.14 roughly."), "Pi is 3.14 roughly.");
+    }
+
+    #[test]
+    fn inject_pauses_leaves_end_of_input_alone() {
+        assert_eq!(inject_pauses("Just one sentence."), "Just one sentence.");
+        assert_eq!(inject_pauses("Question?"), "Question?");
+    }
+
+    #[test]
+    fn inject_pauses_handles_empty() {
+        assert_eq!(inject_pauses(""), "");
     }
 
     #[test]
