@@ -7,6 +7,13 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 ## [Unreleased]
 
 ### Changed
+- `send_tts_voice_message` is more resilient to TTS endpoint flakiness:
+  the reqwest client is now pinned to HTTP/1.1 (so a slow Chatterbox
+  cold start doesn't get killed by Cloudflare's HTTP/2 stream-idle
+  timeout at ~60 s and surface as `error decoding response body`),
+  and the call retries once on transient failures (mid-stream cut,
+  5xx including Cloudflare 530 when the tunnel is bouncing). Caller
+  errors (4xx) and oversize responses are still surfaced immediately.
 - `send_tts_voice_message` now transcodes Chatterbox's WAV output
   to Ogg/Opus (`audio/ogg`) before uploading to the homeserver.
   WAV-mimetype voice messages rendered as generic file attachments

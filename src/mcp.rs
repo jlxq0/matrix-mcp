@@ -659,15 +659,30 @@ fn validate_tts_params(
     Ok(())
 }
 
+/// Distinguishes transient (retryable) and permanent (caller-visible)
+/// errors during TTS synthesis. Transient = mid-stream cuts and 5xx
+/// from the TTS endpoint, both typical signatures of Chatterbox cold
+/// start or a Cloudflare Tunnel blip — the second attempt is usually
+/// warm and works.
+enum TtsAttemptError {
+    Transient(ErrorData),
+    Permanent(ErrorData),
+}
+
 /// POST `params` to `{tts.base_url}/audio/speech` and return the
-/// audio bytes. Caps the response at `max_bytes` and the request at
-/// `timeout`. Never logs the bearer token or response body.
+/// audio bytes. Retries once on transient failures so a single cold
+/// start doesn't surface as a user-visible error. Caps the response
+/// at `max_bytes` and each attempt at `timeout`. Never logs the
+/// bearer token or response body.
 async fn synthesize_tts(
     tts: &crate::config::TtsConfig,
     params: &SendTtsVoiceMessageParams,
     timeout: Duration,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ErrorData> {
+    const MAX_ATTEMPTS: u32 = 2;
+    const RETRY_BACKOFF_SECS: u64 = 2;
+
     let url = format!("{}/audio/speech", tts.base_url);
     url_safety::validate_https_url(&url)
         .await
@@ -688,40 +703,100 @@ async fn synthesize_tts(
         body["language_id"] = serde_json::json!(lang);
     }
 
+    // http1_only: Cloudflare's HTTP/2 implementation cuts streams that
+    // trickle bytes slower than its idle threshold (~60 s), and
+    // Chatterbox's first-call cold start regularly trips that — we
+    // see `error decoding response body` after ~60 s with only part
+    // of the WAV delivered. HTTP/1.1 doesn't have a per-stream idle
+    // timeout, so the same slow trickle stays connected until the
+    // response completes.
     let http = reqwest::Client::builder()
         .use_rustls_tls()
+        .http1_only()
         .timeout(timeout)
         .build()
         .map_err(|e| ErrorData::internal_error(format!("build tts http client: {e}"), None))?;
+
+    let mut last_err: Option<ErrorData> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match send_tts_once(&http, &url, &tts.bearer_token, &body, max_bytes).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(TtsAttemptError::Permanent(e)) => return Err(e),
+            Err(TtsAttemptError::Transient(e)) => {
+                tracing::warn!(
+                    attempt,
+                    error = %e.message,
+                    "TTS attempt failed transiently"
+                );
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(RETRY_BACKOFF_SECS)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        ErrorData::internal_error("tts: all attempts failed without recording an error", None)
+    }))
+}
+
+/// Single attempt at the TTS POST. Classifies failures so the
+/// retry loop in `synthesize_tts` only retries the ones a second
+/// attempt could plausibly recover.
+async fn send_tts_once(
+    http: &reqwest::Client,
+    url: &str,
+    bearer_token: &str,
+    body: &serde_json::Value,
+    max_bytes: usize,
+) -> Result<Vec<u8>, TtsAttemptError> {
     let response = http
-        .post(&url)
-        .bearer_auth(&tts.bearer_token)
-        .json(&body)
+        .post(url)
+        .bearer_auth(bearer_token)
+        .json(body)
         .send()
         .await
-        .map_err(|e| ErrorData::internal_error(format!("tts request: {e}"), None))?;
+        .map_err(|e| {
+            // Connect refusal, DNS failure, timeout, or TCP reset
+            // mid-handshake — all plausibly transient (tunnel
+            // bouncing, GPU saturated). Body / decode errors are
+            // also classified transient because mid-stream cuts
+            // surface as `is_decode` here.
+            let msg = format!("tts request: {e}");
+            if e.is_connect() || e.is_timeout() || e.is_request() || e.is_decode() {
+                TtsAttemptError::Transient(ErrorData::internal_error(msg, None))
+            } else {
+                TtsAttemptError::Permanent(ErrorData::internal_error(msg, None))
+            }
+        })?;
     let status = response.status();
     if !status.is_success() {
         // Deliberately don't include the response body — TTS error
         // pages can echo request fields and we'd rather not surface
-        // them in MCP audit logs.
-        return Err(ErrorData::internal_error(
-            format!("tts endpoint returned {status}"),
-            None,
-        ));
+        // them in MCP audit logs. 5xx (including Cloudflare 530 when
+        // the tunnel is down) is retryable; 4xx is a real client
+        // error and a retry won't change the outcome.
+        let err = ErrorData::internal_error(format!("tts endpoint returned {status}"), None);
+        return Err(if status.is_server_error() {
+            TtsAttemptError::Transient(err)
+        } else {
+            TtsAttemptError::Permanent(err)
+        });
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("read tts body: {e}"), None))?;
+    let bytes = response.bytes().await.map_err(|e| {
+        TtsAttemptError::Transient(ErrorData::internal_error(
+            format!("read tts body: {e}"),
+            None,
+        ))
+    })?;
     if bytes.len() > max_bytes {
-        return Err(ErrorData::invalid_params(
+        return Err(TtsAttemptError::Permanent(ErrorData::invalid_params(
             format!(
                 "tts response {} bytes exceeds upload cap {max_bytes}",
                 bytes.len()
             ),
             None,
-        ));
+        )));
     }
     Ok(bytes.to_vec())
 }
