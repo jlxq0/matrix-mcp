@@ -1,0 +1,36 @@
+# One-off: build the jmap-mcp image on this runner (which has buildkit access)
+# since jmap-mcp's own repo has no runner. Triggered only on this branch.
+name: build-jmap-image
+on:
+  push:
+    branches: [build-jmap-image]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      BUILDKIT_HOST: tcp://10.0.1.57:1234
+    steps:
+      - name: Install buildctl
+        env:
+          BUILDKIT_VERSION: v0.30.0
+          BUILDKIT_SHA256: 2da148c50540409988c837e62b72176e4a9ad7855548a2dd6ea1cd0c0d2d360d
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/bk.tgz "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-amd64.tar.gz"
+          echo "${BUILDKIT_SHA256}  /tmp/bk.tgz" | sha256sum -c -
+          sudo tar -xz -C /usr/local -f /tmp/bk.tgz
+          buildctl --version
+      - name: Login to Forgejo registry
+        run: |
+          mkdir -p ~/.docker
+          F_AUTH=$(printf "%s:%s" "julian" "${{ secrets.FORGE_PUSH_TOKEN }}" | base64 -w0)
+          echo "{\"auths\":{\"forge.oddie.app\":{\"auth\":\"$F_AUTH\"}}}" > ~/.docker/config.json
+      - name: Build jmap-mcp (git context) and push
+        run: |
+          set -euo pipefail
+          buildctl build \
+            --frontend dockerfile.v0 \
+            --opt context=https://forge.oddie.app/jlxq0/jmap-mcp.git#v0.1.0 \
+            --output 'type=image,"name=forge.oddie.app/jlxq0/jmap-mcp:v0.1.0,forge.oddie.app/jlxq0/jmap-mcp:latest",push=true'
