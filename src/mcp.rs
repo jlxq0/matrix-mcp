@@ -2181,7 +2181,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_joined_rooms",
@@ -2268,7 +2268,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "read_recent_messages",
@@ -2368,7 +2368,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "read_thread",
@@ -2970,7 +2970,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "room_members",
@@ -3105,7 +3105,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "get_unread_summary",
@@ -3220,7 +3220,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_recent_activity",
@@ -3472,7 +3472,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "get_user_receipts",
@@ -3555,7 +3555,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "get_event_receipts",
@@ -3679,7 +3679,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_threads_in_room",
@@ -3789,7 +3789,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "get_room_state",
@@ -4079,7 +4079,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_ignored_users",
@@ -5505,7 +5505,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "search_messages",
@@ -6481,7 +6481,7 @@ impl MatrixMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "get_space_hierarchy",
