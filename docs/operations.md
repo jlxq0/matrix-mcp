@@ -23,7 +23,7 @@ matrix-mcp deployment.
 | `MATRIX_MCP_RATE_LIMIT_READS_PER_MIN` | no | `60` | Per-identity read quota. |
 | `MATRIX_MCP_RATE_LIMIT_WRITES_PER_MIN` | no | `30` | Per-identity write quota. |
 | `MATRIX_MCP_DOWNLOAD_MAX_BYTES` | no | `5242880` (5 MiB) | Max attachment size for `download_attachment`. |
-| `MATRIX_MCP_UPLOAD_MAX_BYTES` | no | `10485760` (10 MiB) | Max image size for `send_image_from_url`. |
+| `MATRIX_MCP_UPLOAD_MAX_BYTES` | no | `10485760` (10 MiB) | Max streamed fetch size for URL media uploads and TTS responses. |
 
 ---
 

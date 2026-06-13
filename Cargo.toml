@@ -53,7 +53,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 # HTTP client for talking to MAS. rustls-only — no system OpenSSL needed,
 # slimmer distroless image. JSON feature for ergonomic response parsing.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # SHA-256 of access tokens for cache keys — never store the raw token as a
 # hashmap key, even in-process, to reduce blast radius of a memory dump.
 sha2 = "0.10"

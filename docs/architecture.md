@@ -142,16 +142,16 @@ The sync task is aborted via `JoinHandle::abort()` when `CachedClient` drops.
 
 | Concept | Value |
 |---|---|
-| Cache key | `sha256(mas_subject + device_id)[..32]` |
-| Store dir | `{STORE_DIR}/{cache_key}/` |
-| Store cipher passphrase | `HKDF-SHA256(salt=cache_key, ikm=pepper, info="matrix-mcp-store-cipher v1", len=32) → hex` |
+| Cache key | `identity.mxid` |
+| Store dir | `{STORE_DIR}/{sha256(mxid)[..32]}/` |
+| Store cipher passphrase | `HKDF-SHA256(salt=mxid, ikm=pepper, info="matrix-mcp-store-cipher v1", len=32) → hex` |
 | Sync task | `JoinHandle<()>`, aborted on eviction |
 
 ### Store files
 
 ```
 {STORE_DIR}/
-  {cache_key}/
+  {sha256(mxid)[..32]}/
     matrix-sdk-state.sqlite3    — room state, timelines, members
     matrix-sdk-crypto.sqlite3   — Olm/Megolm sessions, cross-signing keys
 ```

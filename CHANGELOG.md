@@ -6,7 +6,32 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Security
+- URL media uploads (`send_image_from_url`, `send_file`, `send_audio`,
+  `send_video`, `me_set_avatar`, and `upload_media_from_url`) now enforce
+  `MATRIX_MCP_UPLOAD_MAX_BYTES` while streaming the HTTP response instead of
+  after buffering the full body. Oversized responses are rejected before the
+  process allocates beyond the configured cap.
+- `send_tts_voice_message` now disables automatic redirects so the configured
+  bearer token is never forwarded to an unvalidated redirect target. TTS
+  responses also use the same streaming cap as URL media uploads.
+- `room_members` now refuses to enumerate rooms whose cached joined-member
+  count is above the hard cap (1000), avoiding a full SDK member-list load for
+  very large rooms. Use `room_info` for counts in those rooms.
+- Pull-request CI no longer runs the Docker/BuildKit job. PRs still run cargo
+  checks, but untrusted branches no longer get access to the LAN BuildKit
+  daemon.
+- Store-keying documentation is now consistent with the implementation:
+  matrix-sdk cache/store/passphrase keying is MXID-based as an accepted
+  device-key-continuity tradeoff, documented in ADR-11 and `docs/multi-user.md`.
+
 ### Changed
+- `read_recent_messages` now exposes Matrix `/messages` pagination. Responses
+  include `start_token` and `end_token`; pass `end_token` back as `from` to
+  page older E2EE history without relying on homeserver full-text search.
+- `read_recent_messages` now defaults to 50 events per page and allows callers
+  to request up to 200 events per page, so deep encrypted-history scans need
+  fewer round trips while staying bounded.
 - `send_tts_voice_message` is more resilient to TTS endpoint flakiness:
   the reqwest client is now pinned to HTTP/1.1 (so a slow Chatterbox
   cold start doesn't get killed by Cloudflare's HTTP/2 stream-idle

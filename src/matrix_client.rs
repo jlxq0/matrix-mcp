@@ -10,29 +10,29 @@
 //!
 //! ```text
 //! {MATRIX_MCP_STORE_DIR}/
-//!   {sha256(mas_subject + device_id)[..32]}/
+//!   {sha256(mxid)[..32]}/
 //!     matrix-sdk-state.sqlite3       — room/state cache
 //!     matrix-sdk-crypto.sqlite3      — olm/megolm + cross-signing
 //! ```
 //!
-//! We hash the stable MAS subject plus Matrix device id for the directory
-//! name so the filesystem never sees raw user identifiers and a mutable
-//! Matrix localpart cannot reopen another subject's store after rename/reuse.
+//! We hash the MXID for the directory name so the filesystem never sees raw
+//! user identifiers. This deliberately preserves one stable matrix-sdk store
+//! for the Matrix device across token refreshes; see `docs/multi-user.md` for
+//! the accepted localpart-reassignment tradeoff.
 //!
 //! ## Store-cipher key derivation
 //!
 //! ```text
-//!   passphrase = HKDF-SHA256(salt = cache/store owner key,
+//!   passphrase = HKDF-SHA256(salt = mxid,
 //!                            ikm  = pepper,
 //!                            info = "matrix-mcp-store-cipher v1",
 //!                            len  = 32 bytes) → hex
 //! ```
 //!
 //! `pepper` is a single deployment-wide secret in 1Password
-//! (`MATRIX_MCP_STORE_PEPPER`). Per-owner passphrases never appear in
-//! 1Password — they're derived deterministically from the pepper + stable
-//! MAS subject/device owner key at runtime. This is the Option-A passphrase
-//! model. Pepper rotation is destructive (invalidates every user's store; users will be
+//! (`MATRIX_MCP_STORE_PEPPER`). Per-user passphrases never appear in
+//! 1Password — they're derived deterministically from the pepper + MXID at
+//! runtime. Pepper rotation is destructive (invalidates every user's store; users will be
 //! re-prompted to verify the matrix-mcp device in Element X). That's a
 //! known property, not a bug.
 //!
