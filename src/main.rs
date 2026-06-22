@@ -247,6 +247,14 @@ fn build_router(
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
         )
+        // RFC 9728 §3.1 path-inserted location for the `{origin}/mcp`
+        // resource. Strict clients (LangDock) follow the `resource_metadata`
+        // pointer here; lenient ones (claude.ai) hit the root above. Both
+        // return the same document with `resource = {origin}/mcp`.
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(protected_resource_metadata),
+        )
         .merge(setup_routes)
         .merge(mcp_routes)
         .layer(TraceLayer::new_for_http())

@@ -24,10 +24,20 @@ pub struct ProtectedResourceMetadata {
     pub scopes_supported: Vec<String>,
 }
 
+/// The canonical resource identifier for this MCP server: the full endpoint
+/// URL, including the `/mcp` path. RFC 9728 §3.3 and the MCP authorization
+/// spec require the `resource` field to match the URL the client actually
+/// connects to. claude.ai tolerates the bare origin; stricter clients (e.g.
+/// `LangDock`) reject anything that isn't the exact endpoint. `resource_url`
+/// is the origin and `/mcp` is where [`crate::main`] nests the MCP service.
+pub fn mcp_resource(resource_url: &str) -> String {
+    format!("{resource_url}/mcp")
+}
+
 impl ProtectedResourceMetadata {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
-            resource: cfg.resource_url.clone(),
+            resource: mcp_resource(&cfg.resource_url),
             authorization_servers: vec![cfg.authorization_server.clone()],
             bearer_methods_supported: vec!["header"],
             scopes_supported: vec![
@@ -56,10 +66,15 @@ pub async fn protected_resource_metadata(State(cfg): State<Config>) -> impl Into
 }
 
 /// Build the `WWW-Authenticate` value our 401 responses set when no valid
-/// token is presented. claude.ai parses `resource_metadata` and walks back
-/// to discover the authorization server.
+/// token is presented. Clients parse `resource_metadata` and walk back to
+/// discover the authorization server.
+///
+/// We point at the RFC 9728 §3.1 *path-inserted* metadata URL
+/// (`/.well-known/oauth-protected-resource/mcp`) — the well-known location
+/// for the `{origin}/mcp` resource. We also serve the metadata at the bare
+/// `/.well-known/oauth-protected-resource` for clients that probe the root.
 pub fn www_authenticate_header(resource_url: &str) -> String {
-    format!(r#"Bearer resource_metadata="{resource_url}/.well-known/oauth-protected-resource""#)
+    format!(r#"Bearer resource_metadata="{resource_url}/.well-known/oauth-protected-resource/mcp""#)
 }
 
 #[cfg(test)]
@@ -118,7 +133,7 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(json["resource"], "https://example.test");
+        assert_eq!(json["resource"], "https://example.test/mcp");
         assert_eq!(
             json["authorization_servers"][0],
             "https://auth.example.test"
@@ -146,14 +161,14 @@ mod tests {
         let header = www_authenticate_header("https://example.test");
         assert!(header.starts_with("Bearer "));
         assert!(header.contains(
-            r#"resource_metadata="https://example.test/.well-known/oauth-protected-resource""#
+            r#"resource_metadata="https://example.test/.well-known/oauth-protected-resource/mcp""#
         ));
     }
 
     #[test]
     fn from_config_strips_extra_data() {
         let meta = ProtectedResourceMetadata::from_config(&test_config());
-        assert_eq!(meta.resource, "https://example.test");
+        assert_eq!(meta.resource, "https://example.test/mcp");
         assert_eq!(meta.authorization_servers.len(), 1);
         assert!(meta.bearer_methods_supported.contains(&"header"));
     }
