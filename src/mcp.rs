@@ -299,13 +299,75 @@ fn account_data_event_type_is_reserved(event_type: &str) -> bool {
     ) || event_type.starts_with("m.secret_storage.key.")
 }
 
+/// Lenient integer deserialization for tool parameters.
+///
+/// Some MCP clients serialize numeric arguments loosely: they send JSON
+/// strings (`"50"`), or an empty string `""` where the model left a numeric
+/// field blank. Strict serde rejects these with JSON-RPC `-32602`
+/// (`invalid type: string, expected u64`), which surfaces to the user as a
+/// failed tool call (observed with `LangDock`). These helpers accept a JSON
+/// number or a numeric string, and treat null / empty / unparseable input as
+/// "absent" so the field's normal default applies instead of erroring.
+mod lenient_int {
+    use serde::{Deserialize, Deserializer};
+
+    /// `Option<u64>`: number or numeric string → `Some`; null, empty string,
+    /// or anything non-numeric → `None`.
+    pub fn opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        Ok(match Option::<serde_json::Value>::deserialize(d)? {
+            Some(serde_json::Value::Number(n)) => n.as_u64(),
+            Some(serde_json::Value::String(s)) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    t.parse::<u64>().ok()
+                }
+            }
+            _ => None,
+        })
+    }
+
+    /// As [`opt_u64`], narrowed to `u32` (out-of-range → `None`).
+    pub fn opt_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+        Ok(opt_u64(d)?.and_then(|v| u32::try_from(v).ok()))
+    }
+}
+
+/// Generates a `deserialize_with` function for a required `u32` field that
+/// pairs lenient parsing with the field's existing `#[serde(default)]` fn:
+/// a present-but-blank/garbage value falls back to the same default an
+/// omitted field would get.
+macro_rules! lenient_u32_default {
+    ($fn_name:ident, $default:path) => {
+        fn $fn_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+            Ok(lenient_int::opt_u32(d)?.unwrap_or_else($default))
+        }
+    };
+}
+
+lenient_u32_default!(de_message_limit, default_message_limit);
+lenient_u32_default!(de_thread_limit, default_thread_limit);
+lenient_u32_default!(de_member_limit, default_member_limit);
+lenient_u32_default!(de_search_limit, default_search_limit);
+lenient_u32_default!(de_recent_activity_limit, default_recent_activity_limit);
+lenient_u32_default!(de_threads_limit, default_threads_limit);
+lenient_u32_default!(de_space_hierarchy_limit, default_space_hierarchy_limit);
+lenient_u32_default!(
+    de_space_hierarchy_max_depth,
+    default_space_hierarchy_max_depth
+);
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadRecentMessagesParams {
     /// Matrix room id, e.g. `!abc:example.com`.
     pub room_id: String,
     /// Maximum number of events to return. Defaults to 50 if omitted.
     /// Values above 200 are clamped to 200 to bound upstream work.
-    #[serde(default = "default_message_limit")]
+    #[serde(
+        default = "default_message_limit",
+        deserialize_with = "de_message_limit"
+    )]
     pub limit: u32,
     /// Opaque Matrix pagination token. Omit to start from the live end of
     /// the room when `direction` is `backward`. To page older history, pass
@@ -986,7 +1048,7 @@ pub struct ReadThreadParams {
     pub root_event_id: String,
     /// Maximum number of thread events to return. Defaults to 50, capped at
     /// 200.
-    #[serde(default = "default_thread_limit")]
+    #[serde(default = "default_thread_limit", deserialize_with = "de_thread_limit")]
     pub limit: u32,
 }
 
@@ -1148,7 +1210,7 @@ pub struct SendVoiceMessageParams {
     /// Duration of the audio in milliseconds. Optional but
     /// recommended — clients display it without having to decode
     /// the file. Capped at 1 hour.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
     pub duration_ms: Option<u64>,
     /// Pre-computed amplitude samples, one per render bucket. Each
     /// sample is 0..=1024 (saturating). 30–100 entries is typical
@@ -1180,7 +1242,7 @@ pub struct SendBroadcastParams {
     /// Maximum joined-member count per room to send to. Rooms with
     /// more than this many members are skipped. Defaults to 10 to
     /// keep broadcasts DM / small-group shaped.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
     pub max_room_members: Option<u64>,
 }
 
@@ -1428,7 +1490,7 @@ pub struct RoomMembersParams {
     /// Maximum number of members to return. Defaults to 200.
     /// Values above 1000 are clamped to 1000. Rooms whose cached
     /// joined-member count is above 1000 are refused before enumeration.
-    #[serde(default = "default_member_limit")]
+    #[serde(default = "default_member_limit", deserialize_with = "de_member_limit")]
     pub limit: u32,
 }
 
@@ -1470,7 +1532,7 @@ pub struct SearchMessagesParams {
     /// When absent the homeserver searches across all joined rooms.
     pub room_id: Option<String>,
     /// Maximum number of results to return. Defaults to 20, capped at 100.
-    #[serde(default = "default_search_limit")]
+    #[serde(default = "default_search_limit", deserialize_with = "de_search_limit")]
     pub limit: u32,
 }
 
@@ -1589,12 +1651,15 @@ pub struct ListRecentActivityParams {
     /// [`MAX_RECENT_ACTIVITY_LIMIT`] (200). Rooms with no cached
     /// activity sort to the end and are dropped first if the limit
     /// is reached.
-    #[serde(default = "default_recent_activity_limit")]
+    #[serde(
+        default = "default_recent_activity_limit",
+        deserialize_with = "de_recent_activity_limit"
+    )]
     pub limit: u32,
     /// When set, return only rooms whose `latest_origin_server_ts`
     /// is greater than this value (milliseconds since the Unix
     /// epoch). Use to scope to "any activity in the last N days".
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_int::opt_u64")]
     pub since_unix_ms: Option<u64>,
     /// When `true`, restrict the response to E2EE rooms only.
     /// Default `false`.
@@ -1706,7 +1771,10 @@ pub struct ListThreadsParams {
     pub room_id: String,
     /// Maximum number of threads to return. Default 25, capped at
     /// [`MAX_THREADS_LIMIT`] (100).
-    #[serde(default = "default_threads_limit")]
+    #[serde(
+        default = "default_threads_limit",
+        deserialize_with = "de_threads_limit"
+    )]
     pub limit: u32,
     /// When `true`, only return threads the caller has participated
     /// in. Default `false` (return all thread roots).
@@ -1944,10 +2012,16 @@ pub struct GetSpaceHierarchyParams {
     pub room_id: String,
     /// Maximum rooms to return per response. Default 50, capped at
     /// [`MAX_SPACE_HIERARCHY_LIMIT`] (200).
-    #[serde(default = "default_space_hierarchy_limit")]
+    #[serde(
+        default = "default_space_hierarchy_limit",
+        deserialize_with = "de_space_hierarchy_limit"
+    )]
     pub limit: u32,
     /// How deep to descend into nested spaces. Default 3.
-    #[serde(default = "default_space_hierarchy_max_depth")]
+    #[serde(
+        default = "default_space_hierarchy_max_depth",
+        deserialize_with = "de_space_hierarchy_max_depth"
+    )]
     pub max_depth: u32,
     /// When `true`, the homeserver returns only rooms annotated
     /// `suggested: true` in their `m.space.child` events.
@@ -7818,6 +7892,38 @@ mod tests {
         let n = default_message_limit();
         assert_eq!(n, 50);
         assert!((10..=MAX_MESSAGE_LIMIT).contains(&n), "limit was {n}");
+    }
+
+    #[test]
+    fn limit_tolerates_loose_client_serialization() {
+        // LangDock sent limit="" (empty string) for a u64 field, which
+        // strict serde rejected with -32602. Regression lock: blank,
+        // string-encoded, and missing values must all resolve sanely.
+        let blank: ReadRecentMessagesParams =
+            serde_json::from_value(serde_json::json!({"room_id": "!r:x", "limit": ""}))
+                .expect("empty-string limit should fall back to default, not error");
+        assert_eq!(blank.limit, default_message_limit());
+
+        let stringy: ReadRecentMessagesParams =
+            serde_json::from_value(serde_json::json!({"room_id": "!r:x", "limit": "30"}))
+                .expect("numeric-string limit should parse");
+        assert_eq!(stringy.limit, 30);
+
+        let numeric: ReadRecentMessagesParams =
+            serde_json::from_value(serde_json::json!({"room_id": "!r:x", "limit": 25}))
+                .expect("numeric limit should parse");
+        assert_eq!(numeric.limit, 25);
+
+        let missing: ReadRecentMessagesParams =
+            serde_json::from_value(serde_json::json!({"room_id": "!r:x"}))
+                .expect("missing limit should use default");
+        assert_eq!(missing.limit, default_message_limit());
+
+        // Optional integer fields behave the same: blank → None.
+        let opt: ListRecentActivityParams =
+            serde_json::from_value(serde_json::json!({"since_unix_ms": ""}))
+                .expect("empty-string optional int should be None, not error");
+        assert_eq!(opt.since_unix_ms, None);
     }
 
     #[test]
