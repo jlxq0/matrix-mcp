@@ -91,18 +91,12 @@ jobs:
       # a cold build with no buildcache import — slower, but no
       # package-write PAT lands in the runner's docker config for a
       # PR-triggered job to potentially exfiltrate.
-      # GHCR login only when we're about to push real tags.
       - name: Login to Forgejo registry
         if: github.event_name != 'pull_request'
         run: |
           mkdir -p ~/.docker
           F_AUTH=$(printf "%s:%s" "jlxq0" "${{ secrets.FORGE_PUSH_TOKEN }}" | base64 -w0)
           echo "{\"auths\":{\"forge.oddie.app\":{\"auth\":\"$F_AUTH\"}}}" > ~/.docker/config.json
-      - name: Login to GHCR (tag only)
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          G_AUTH=$(printf "%s:%s" "jlxq0" "${{ secrets.GHCR_TOKEN }}" | base64 -w0)
-          jq --arg a "$G_AUTH" '.auths["ghcr.io"] = {auth: $a}' ~/.docker/config.json > /tmp/d && mv /tmp/d ~/.docker/config.json
       - name: Build (and push on tag)
         run: |
           set -euo pipefail
@@ -122,7 +116,7 @@ jobs:
           EXPORT_CACHE_ARG=()
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             V="${GITHUB_REF#refs/tags/}"
-            TAGS="forge.oddie.app/jlxq0/matrix-mcp:${V},forge.oddie.app/jlxq0/matrix-mcp:latest,ghcr.io/jlxq0/matrix-mcp:${V},ghcr.io/jlxq0/matrix-mcp:latest"
+            TAGS="forge.oddie.app/jlxq0/matrix-mcp:${V},forge.oddie.app/jlxq0/matrix-mcp:latest"
             PUSH=true
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
             EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
