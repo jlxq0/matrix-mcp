@@ -72,6 +72,42 @@ pub async fn protected_resource_metadata(State(cfg): State<Config>) -> impl Into
     Json(ProtectedResourceMetadata::from_config(&cfg))
 }
 
+#[derive(Debug, Serialize)]
+pub struct AuthorizationServerMetadata {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub registration_endpoint: String,
+    pub response_types_supported: Vec<&'static str>,
+    pub grant_types_supported: Vec<&'static str>,
+    pub code_challenge_methods_supported: Vec<&'static str>,
+    pub token_endpoint_auth_methods_supported: Vec<&'static str>,
+    pub scopes_supported: Vec<String>,
+}
+
+impl AuthorizationServerMetadata {
+    pub fn from_config(cfg: &Config) -> Self {
+        let mas = cfg.authorization_server.trim_end_matches('/');
+        Self {
+            // RFC 8414: issuer must match the origin this document is served from.
+            issuer: cfg.resource_url.clone(),
+            authorization_endpoint: format!("{mas}/authorize"),
+            token_endpoint: format!("{mas}/oauth2/token"),
+            registration_endpoint: format!("{mas}/oauth2/registration"),
+            response_types_supported: vec!["code"],
+            grant_types_supported: vec!["authorization_code", "refresh_token"],
+            code_challenge_methods_supported: vec!["S256"],
+            token_endpoint_auth_methods_supported: vec!["none"],
+            scopes_supported: ProtectedResourceMetadata::from_config(cfg).scopes_supported,
+        }
+    }
+}
+
+#[allow(clippy::unused_async)]
+pub async fn authorization_server_metadata(State(cfg): State<Config>) -> impl IntoResponse {
+    Json(AuthorizationServerMetadata::from_config(&cfg))
+}
+
 /// Build the `WWW-Authenticate` value our 401 responses set when no valid
 /// token is presented. Clients parse `resource_metadata` and walk back to
 /// discover the authorization server.
@@ -204,5 +240,16 @@ mod tests {
         assert_eq!(meta.resource, "https://example.test/mcp");
         assert_eq!(meta.authorization_servers.len(), 1);
         assert!(meta.bearer_methods_supported.contains(&"header"));
+    }
+
+    #[test]
+    fn as_metadata_advertises_mas_registration() {
+        let meta = AuthorizationServerMetadata::from_config(&test_config());
+        assert_eq!(meta.issuer, "https://example.test");
+        assert_eq!(
+            meta.registration_endpoint,
+            "https://auth.example.test/oauth2/registration"
+        );
+        assert_eq!(meta.authorization_endpoint, "https://auth.example.test/authorize");
     }
 }

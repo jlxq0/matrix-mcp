@@ -56,7 +56,7 @@ use crate::config::IntrospectionCredentials;
 use crate::mas::MasIntrospectionClient;
 use crate::matrix_client::MatrixClientCache;
 use crate::mcp::MatrixMcpService;
-use crate::oauth_metadata::protected_resource_metadata;
+use crate::oauth_metadata::{authorization_server_metadata, protected_resource_metadata};
 use crate::rate_limit::Limiter;
 use crate::rate_limit::{
     INITIALIZE_REFILL_INTERVAL, InitializeLimiter, MAX_INITIALIZES_PER_IDENTITY,
@@ -365,6 +365,14 @@ fn build_router(
         .route(
             "/.well-known/oauth-protected-resource/mcp",
             get(protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get(authorization_server_metadata),
         )
         .merge(setup_routes)
         .merge(mcp_routes)
