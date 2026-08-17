@@ -11,6 +11,18 @@
 - `room_members` cannot rely on truncating after `members_no_sync`; the SDK has
   already loaded the full cached member list. Check the cheap member count
   before enumeration.
+- The RFC 9728 `resource` we publish and the audience we accept in a token are
+  the same identifier. Changing one without the other silently breaks every
+  spec-conformant client (they send `resource=<published value>`, the AS mints
+  that `aud`, and introspection rejects it). Keep them derived from one place.
+- OAuth issuer identifiers are compared byte-for-byte (RFC 8414 §3.3). Do not
+  normalise `MATRIX_MCP_AUTHORIZATION_SERVER` — a stripped trailing slash makes
+  strict clients refuse the AS metadata. Trim only when concatenating an
+  endpoint path.
+- A 401/429/404 on the MCP transport is not a transport detail: it lands on the
+  user's first tool call. Rate limits guarding the handshake need refill
+  periods measured against how often clients legitimately reconnect, not
+  against the session TTL.
 - Matrix SDK store keying is intentionally MXID-based for device-key
   continuity. Re-keying by MAS subject/device id must account for Synapse
   device-key continuity or it can regenerate keys for the same device id.

@@ -68,6 +68,10 @@ rand = "0.8"
 # session manager + http transport + worker bits we need to mount the service
 # via `axum::Router::nest_service("/mcp", ...)`.
 rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
+# rmcp's `SessionStore` trait (durable MCP sessions, see `session_store.rs`)
+# is declared with `#[async_trait::async_trait]`, so implementing it requires
+# the same macro. Already in the tree via rmcp; named here for the import path.
+async-trait = "0.1"
 # `futures` is a transitive dep (via rmcp); listed here explicitly so
 # `session.rs` can name the `Stream` trait in its `SessionManager` impl for
 # `CappedSessionManager`.  `default-features = false` avoids pulling in the

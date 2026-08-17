@@ -85,6 +85,18 @@ pub const ENV_UPLOAD_MAX_BYTES: &str = "MATRIX_MCP_UPLOAD_MAX_BYTES";
 /// out of `X-Forwarded-For`. Default 1 (assumes Traefik in front in
 /// production).
 const ENV_TRUSTED_PROXY_HOPS: &str = "MATRIX_MCP_TRUSTED_PROXY_HOPS";
+/// Comma-separated list of browser origins allowed to talk to `/mcp`
+/// (`Origin` header validation, MCP Streamable HTTP §"Security & Endpoint").
+///
+/// Empty (the default) disables `Origin` checking. That is deliberate: the
+/// DNS-rebinding attack the rule targets is against servers bound to
+/// localhost, and every non-browser MCP client (Claude Desktop, VS Code,
+/// Cursor, CLI tools) either omits `Origin` or sends an app-private value that
+/// no allow-list can enumerate ahead of time — so a default allow-list would
+/// break those clients rather than protect this deployment. Set it when the
+/// only clients are browser-based, e.g.
+/// `MATRIX_MCP_ALLOWED_ORIGINS=https://claude.ai`.
+const ENV_ALLOWED_ORIGINS: &str = "MATRIX_MCP_ALLOWED_ORIGINS";
 /// Base URL of an OpenAI-compatible TTS endpoint (Chatterbox /
 /// `POST /v1/audio/speech`). Optional — if unset, the
 /// `send_tts_voice_message` tool returns `invalid_params`.
@@ -153,6 +165,10 @@ pub struct Config {
     /// Advertised in the protected-resource metadata as the
     /// device-binding OAuth scope claude.ai requests.
     pub device_id: String,
+    /// Browser origins accepted on `/mcp`. Empty disables `Origin`
+    /// validation (rmcp still validates `Host` against `allowed_hosts`).
+    /// See [`ENV_ALLOWED_ORIGINS`].
+    pub allowed_origins: Vec<String>,
     /// Optional TTS endpoint config. When `Some`, `send_tts_voice_message`
     /// posts text to `{base_url}/audio/speech` and forwards the
     /// returned audio as a Matrix voice message. When `None`, the
@@ -228,7 +244,16 @@ impl Config {
         bind_addr: SocketAddr,
     ) -> Result<Self> {
         let resource_url = strip_trailing_slash(resource_url.into());
-        let authorization_server = strip_trailing_slash(authorization_server.into());
+        // NOT slash-stripped: this value is an OAuth *issuer identifier*, not
+        // a base URL. RFC 8414 §3.3 (and the MCP authorization spec, which
+        // cites it) has clients compare the `issuer` in the fetched metadata
+        // against this string exactly — `https://as.example/` and
+        // `https://as.example` are different identifiers, and a strict client
+        // MUST refuse the metadata on a mismatch. MAS publishes its issuer
+        // with a trailing slash, so configure it with one. Use
+        // [`Self::authorization_server_base`] when concatenating endpoint
+        // paths.
+        let authorization_server = authorization_server.into().trim().to_owned();
         let homeserver_url = strip_trailing_slash(homeserver_url.into());
         let server_name = server_name.into();
         if server_name.is_empty() {
@@ -261,8 +286,18 @@ impl Config {
             // it obvious in any accidental dump that resolution hasn't
             // run yet.
             device_id: "UNRESOLVED".to_owned(),
+            allowed_origins: Vec::new(),
             tts: None,
         })
+    }
+
+    /// The authorization server URL with any trailing slash removed, for
+    /// building endpoint URLs (`{base}/oauth2/token`). Never advertise this
+    /// form — [`Self::authorization_server`] is the identifier clients compare
+    /// against the AS metadata document.
+    #[must_use]
+    pub fn authorization_server_base(&self) -> &str {
+        self.authorization_server.trim_end_matches('/')
     }
 
     /// Builder-style: attach introspection credentials.
@@ -345,6 +380,7 @@ impl Config {
         cfg.upload_max_bytes = parse_upload_max_bytes()?;
         cfg.trusted_proxy_hops = parse_trusted_proxy_hops()?;
         cfg.device_id = device_id;
+        cfg.allowed_origins = parse_allowed_origins(std::env::var(ENV_ALLOWED_ORIGINS).ok());
         if let Some(tts) = parse_tts_config()? {
             cfg = cfg.with_tts(tts);
         }
@@ -358,6 +394,22 @@ impl Config {
                 pepper,
             }))
     }
+}
+
+/// Split `MATRIX_MCP_ALLOWED_ORIGINS` on commas, trimming whitespace and
+/// dropping empties. Entries are passed to rmcp verbatim; it compares them per
+/// RFC 6454 `(scheme, host, port)`, so each must carry a scheme
+/// (`https://claude.ai`, not `claude.ai`). `"null"` matches a browser's
+/// `Origin: null`.
+fn parse_allowed_origins(raw: Option<String>) -> Vec<String> {
+    raw.map(|v| {
+        v.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// `(MATRIX_MCP_TTS_BASE_URL, MATRIX_MCP_TTS_BEARER_TOKEN)` should
@@ -517,15 +569,31 @@ mod tests {
     fn strips_trailing_slashes() {
         let cfg = Config::new(
             "https://example.test/",
-            "https://auth.example.test///",
+            "https://auth.example.test",
             "https://matrix.example.test/",
             "example.test",
             bind(),
         )
         .unwrap();
         assert_eq!(cfg.resource_url, "https://example.test");
-        assert_eq!(cfg.authorization_server, "https://auth.example.test");
         assert_eq!(cfg.homeserver_url, "https://matrix.example.test");
+    }
+
+    /// The AS issuer is compared byte-for-byte by clients (RFC 8414 §3.3), so
+    /// a configured trailing slash must survive into the metadata document —
+    /// while endpoint URLs built from it must not double up on slashes.
+    #[test]
+    fn authorization_server_keeps_its_trailing_slash() {
+        let cfg = Config::new(
+            "https://example.test",
+            "https://auth.example.test/",
+            "https://matrix.example.test",
+            "example.test",
+            bind(),
+        )
+        .unwrap();
+        assert_eq!(cfg.authorization_server, "https://auth.example.test/");
+        assert_eq!(cfg.authorization_server_base(), "https://auth.example.test");
     }
 
     #[test]

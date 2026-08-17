@@ -26,6 +26,7 @@ mod metrics;
 mod oauth_metadata;
 mod rate_limit;
 mod session;
+mod session_store;
 mod setup;
 mod telemetry;
 mod token_introspect;
@@ -41,6 +42,7 @@ use axum::http::{Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use rmcp::transport::streamable_http_server::session::store::SessionStore;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -55,7 +57,9 @@ use crate::matrix_client::MatrixClientCache;
 use crate::mcp::MatrixMcpService;
 use crate::oauth_metadata::protected_resource_metadata;
 use crate::rate_limit::Limiter;
-use crate::rate_limit::{InitializeLimiter, MAX_INITIALIZES_PER_IDENTITY};
+use crate::rate_limit::{
+    INITIALIZE_REFILL_INTERVAL, InitializeLimiter, MAX_INITIALIZES_PER_IDENTITY,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -101,7 +105,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         .clone()
         .context("introspection credentials missing from config")?;
     let mas = MasIntrospectionClient::new(
-        &cfg.authorization_server,
+        cfg.authorization_server_base(),
         cfg.resource_url.clone(),
         creds.client_id,
         creds.client_secret,
@@ -115,6 +119,7 @@ fn build_app(cfg: Config) -> Result<Router> {
     let store = cfg.store.clone().context(
         "E2EE store config missing — set MATRIX_MCP_STORE_DIR and MATRIX_MCP_STORE_PEPPER",
     )?;
+    let store_root = store.root.clone();
     let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
     // Shared across SetupState (recover flow) and MatrixMcpService
     // (request_room_keys tool + auto-pull helper) so all room-key
@@ -134,6 +139,22 @@ fn build_app(cfg: Config) -> Result<Router> {
     );
     let download_max_bytes = cfg.download_max_bytes;
     let tts = cfg.tts.clone().map(Arc::new);
+    // Durable MCP sessions live on the same PVC as the matrix-sdk stores, so
+    // a rollout or an idle-eviction doesn't 404 a client's session id. A
+    // failure to create the directory is a volume misconfiguration: log it and
+    // run without persistence rather than refusing to boot.
+    let session_store: Option<Arc<dyn SessionStore>> =
+        match session_store::FileSessionStore::new(&store_root) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not open the durable session directory; MCP sessions \
+                     will not survive a restart"
+                );
+                None
+            }
+        };
     Ok(build_router(
         cfg,
         auth_state,
@@ -144,6 +165,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         download_max_bytes,
         key_backup_gate,
         tts,
+        session_store,
     ))
 }
 
@@ -158,6 +180,7 @@ fn build_router(
     download_max_bytes: u64,
     key_backup_gate: key_backup_gate::KeyBackupGate,
     tts: Option<Arc<crate::config::TtsConfig>>,
+    session_store: Option<Arc<dyn SessionStore>>,
 ) -> Router {
     // rmcp's StreamableHttpService is a tower::Service that handles all the
     // MCP transport details (initialize, tools/list, tools/call, SSE
@@ -178,6 +201,20 @@ fn build_router(
     //   global session count at session::MAX_SESSIONS (256).
     // - InitializeLimiter (below) rate-limits *fresh* MCP session creation
     //   per identity so one bearer token can't cheaply fill the global pool.
+    //
+    // `session_store` makes sessions durable: an `Mcp-Session-Id` the process
+    // has no in-memory record of (pod restart, rollout, idle eviction) is
+    // reloaded from the PVC and its `initialize` handshake replayed, instead
+    // of 404-ing the client into a re-handshake it may be rate-limited out of.
+    let mut http_config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
+    if !cfg.allowed_origins.is_empty() {
+        info!(
+            origins = ?cfg.allowed_origins,
+            "Origin validation enabled for /mcp"
+        );
+        http_config = http_config.with_allowed_origins(cfg.allowed_origins.clone());
+    }
+    http_config.session_store = session_store;
     let mcp_service = StreamableHttpService::new(
         move || {
             let mas = mas.clone();
@@ -196,14 +233,15 @@ fn build_router(
             ))
         },
         Arc::new(session::CappedSessionManager::new()),
-        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+        http_config,
     );
 
-    // Per-identity initialize-rate-limit. Pairs the refill period with the
-    // session idle TTL so an attacker who has filled their slots can only
-    // open new ones at the rate their old ones idle out.
+    // Per-identity initialize-rate-limit. See
+    // `rate_limit::INITIALIZE_REFILL_INTERVAL` for why the refill is decoupled
+    // from the session idle TTL: a 429 here lands on the user's *first tool
+    // call* after a reconnect, which is the worst possible place for it.
     let initialize_limiter = Arc::new(InitializeLimiter::new(
-        session::SESSION_KEEP_ALIVE,
+        INITIALIZE_REFILL_INTERVAL,
         MAX_INITIALIZES_PER_IDENTITY,
     ));
 
@@ -303,13 +341,35 @@ async fn initialize_rate_limit(
         .check(&bearer_hash, Some(identity.mas_subject.as_str()))
         .is_err()
     {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many MCP initialize requests; try again later\n",
-        )
-            .into_response();
+        return initialize_rate_limited();
     }
     next.run(request).await
+}
+
+/// The 429 for an exhausted initialize bucket.
+///
+/// Shaped for MCP clients rather than for `curl`: a JSON-RPC error body (with
+/// the same `-32029` code the tool layer uses for rate limits) so the client
+/// surfaces a real message instead of "unexpected response", and `Retry-After`
+/// so it knows when the next slot frees up rather than hammering.
+fn initialize_rate_limited() -> axum::response::Response {
+    let retry_after_secs = INITIALIZE_REFILL_INTERVAL.as_secs();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::Value::Null,
+        "error": {
+            "code": crate::audit::RATE_LIMITED_CODE,
+            "message": format!(
+                "too many MCP session handshakes for this identity; retry in {retry_after_secs}s"
+            ),
+        }
+    });
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry_after_secs),
+    );
+    response
 }
 
 fn is_fresh_mcp_session_request(request: &Request<Body>) -> bool {
@@ -407,9 +467,16 @@ mod tests {
     }
 
     fn router(cfg: Config) -> Router {
+        router_with_session_store(cfg, None)
+    }
+
+    fn router_with_session_store(
+        cfg: Config,
+        session_store: Option<Arc<dyn SessionStore>>,
+    ) -> Router {
         let creds = cfg.introspection.clone().unwrap();
         let mas = MasIntrospectionClient::new(
-            &cfg.authorization_server,
+            cfg.authorization_server_base(),
             cfg.resource_url.clone(),
             creds.client_id,
             creds.client_secret,
@@ -448,6 +515,7 @@ mod tests {
             5 * 1024 * 1024, // default 5 MiB cap in tests
             key_backup_gate,
             None,
+            session_store,
         )
     }
 
@@ -654,6 +722,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Durable sessions: a session id minted by one process must keep working
+    /// after that process is gone.
+    ///
+    /// Without the store, the second router has never heard of the session id
+    /// and rmcp answers `404` — which is what left claude.ai wedged after
+    /// every rollout: the connector holds a session id the server has
+    /// forgotten, and recovering costs a fresh `initialize` (which the
+    /// per-identity limiter may refuse).
+    #[tokio::test]
+    async fn session_survives_a_server_restart() {
+        let mas_mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mas_mock)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = || test_config(&mas_mock.uri(), "https://res.example");
+        let store = || -> Option<Arc<dyn SessionStore>> {
+            Some(Arc::new(
+                session_store::FileSessionStore::new(dir.path()).unwrap(),
+            ))
+        };
+
+        // Process 1: handshake, capture the session id.
+        let first = router_with_session_store(cfg(), store());
+        let init = first
+            .oneshot(initialize_request("test-token", 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(init.status(), StatusCode::OK);
+        let session_id = init
+            .headers()
+            .get("mcp-session-id")
+            .expect("stateful mode must mint a session id")
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // Process 2: same PVC, no in-memory state.
+        let second = router_with_session_store(cfg(), store());
+        let call_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}}
+        });
+        let response = second
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a persisted session must be restored, not 404-ed"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let parsed = parse_response_body(&bytes).unwrap();
+        assert_eq!(
+            parsed["result"]["structuredContent"]["mxid"], "@alice:example.test",
+            "body: {parsed}"
+        );
+    }
+
+    /// The same flow without a store is the behaviour we are fixing: the
+    /// restored-session path is what makes the test above pass, not some
+    /// incidental statelessness in the transport.
+    #[tokio::test]
+    async fn unknown_session_without_a_store_is_rejected() {
+        let mas_mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mas_mock)
+            .await;
+
+        let app = router(test_config(&mas_mock.uri(), "https://res.example"));
+        let call_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}}
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("mcp-session-id", "a-session-nobody-remembers")
+                    .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A 429 on the handshake lands on the user's first tool call, so it has
+    /// to be legible to an MCP client: JSON-RPC error body + `Retry-After`.
+    #[tokio::test]
+    async fn initialize_rate_limit_response_is_client_readable() {
+        let response = initialize_rate_limited();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["error"]["code"], crate::audit::RATE_LIMITED_CODE);
     }
 
     #[tokio::test]

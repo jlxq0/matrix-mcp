@@ -10,7 +10,7 @@ matrix-mcp deployment.
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `MATRIX_MCP_RESOURCE_URL` | yes | – | Public URL of this server, e.g. `https://matrix-mcp.example.com`. No trailing slash. |
-| `MATRIX_MCP_AUTHORIZATION_SERVER` | yes | – | MAS issuer URL, e.g. `https://matrixauthservice.example.com`. No trailing slash. |
+| `MATRIX_MCP_AUTHORIZATION_SERVER` | yes | – | MAS **issuer identifier**, copied byte-for-byte from the AS metadata document's `issuer` field (MAS publishes it *with* a trailing slash: `https://matrixauthservice.example.com/`). Clients compare it exactly per RFC 8414 §3.3 and refuse the metadata on a mismatch. Endpoint URLs are built from it with any trailing slash removed. |
 | `MATRIX_MCP_HOMESERVER_URL` | yes | – | Synapse base URL, e.g. `https://matrix.example.com`. No trailing slash. |
 | `MATRIX_MCP_SERVER_NAME` | yes | – | Matrix server name (right side of MXIDs), e.g. `example.com`. Not a URL. |
 | `MATRIX_MCP_INTROSPECTION_CLIENT_ID` | yes | – | OAuth client id for MAS introspection endpoint. |
@@ -24,6 +24,37 @@ matrix-mcp deployment.
 | `MATRIX_MCP_RATE_LIMIT_WRITES_PER_MIN` | no | `30` | Per-identity write quota. |
 | `MATRIX_MCP_DOWNLOAD_MAX_BYTES` | no | `5242880` (5 MiB) | Max attachment size for `download_attachment`. |
 | `MATRIX_MCP_UPLOAD_MAX_BYTES` | no | `10485760` (10 MiB) | Max streamed fetch size for URL media uploads and TTS responses. |
+| `MATRIX_MCP_ALLOWED_ORIGINS` | no | – (disabled) | Comma-separated browser origins accepted on `/mcp`, e.g. `https://claude.ai`. Each entry needs a scheme; `null` matches `Origin: null`. Empty disables `Origin` validation — see below. |
+
+### `Origin` validation
+
+The MCP Streamable HTTP spec says servers MUST validate `Origin`. It is off by
+default here, deliberately: the attack it defends against is DNS rebinding
+against a server bound to localhost, and non-browser MCP clients (Claude
+Desktop, VS Code, Cursor, CLI tools) either omit `Origin` or send an
+app-private value that no allow-list can enumerate in advance — so a default
+allow-list would lock out desktop clients without improving the security of a
+public, bearer-authenticated deployment. `Host` is validated unconditionally.
+
+Set `MATRIX_MCP_ALLOWED_ORIGINS` when the only clients are browser-based.
+Requests with no `Origin` header still pass; only a present-and-unlisted
+`Origin` is rejected (403).
+
+### Durable MCP sessions
+
+Session state is persisted under `{MATRIX_MCP_STORE_DIR}/mcp-sessions/` — one
+small JSON file per session, named `sha256(session_id)`, holding the client's
+`initialize` parameters (no tokens, no identity). A restart, a rollout, or an
+idle eviction therefore does not invalidate a client's `Mcp-Session-Id`: the
+next request carrying it is restored transparently instead of getting a `404`
+that would force a fresh handshake.
+
+Entries expire seven days after their last write and the directory is capped at
+4096 sessions. To wipe them (clients will simply re-handshake):
+
+```
+kubectl exec -n matrix-mcp deploy/matrix-mcp -- rm -rf /var/lib/matrix-mcp/mcp-sessions
+```
 
 ---
 
