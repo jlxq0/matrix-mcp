@@ -6,6 +6,45 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Fixed
+- Tokens audienced at the canonical resource identifier
+  (`https://<host>/mcp` — the value we publish in the RFC 9728 document, and
+  the one the MCP authorization spec requires clients to send as the RFC 8707
+  `resource` parameter) were rejected: the introspection audience check still
+  compared against the bare origin. Both forms are now accepted, and an
+  audience mismatch returns `401` with a `WWW-Authenticate` challenge instead
+  of `500`, so the client re-authorizes rather than retrying a token that can
+  never work.
+- `MATRIX_MCP_AUTHORIZATION_SERVER` is no longer trailing-slash-stripped. It is
+  an OAuth issuer identifier, compared byte-for-byte against the AS metadata
+  document (RFC 8414 §3.3); stripping it made strict clients refuse MAS's
+  metadata, which publishes the issuer *with* a trailing slash. Endpoint URLs
+  are built from the slash-trimmed form. **Deployments should set this variable
+  to exactly the `issuer` value their AS publishes.**
+
+### Added
+- MCP sessions are now durable: session state is persisted under
+  `{MATRIX_MCP_STORE_DIR}/mcp-sessions/` and an `Mcp-Session-Id` the process
+  has no in-memory record of (restart, rollout, idle eviction) is restored and
+  its handshake replayed, instead of returning `404` and wedging the connector.
+  Entries expire after 7 days, the directory is capped at 4096 sessions, and
+  restores are subject to the same global session cap as fresh sessions.
+- `WWW-Authenticate` challenges now carry the `scope` parameter (RFC 6750 §3)
+  listing the scopes required to use this server, including the dynamic
+  device-binding scope. Clients treat the challenge scopes as authoritative, so
+  this removes a path where a client authorized without device binding and
+  silently lost E2EE.
+- `MATRIX_MCP_ALLOWED_ORIGINS` enables `Origin` validation on `/mcp`. Off by
+  default — see `docs/operations.md` for why.
+
+### Changed
+- The per-identity MCP handshake rate limit refills one slot every 2 minutes
+  (was: one every 30 minutes) with a burst of 16 (was: 8). A 429 here lands on
+  the user's *first tool call* after a reconnect, and the old refill period
+  meant an afternoon of ordinary reconnect churn could lock an identity out for
+  hours. The response is now a JSON-RPC error with a `Retry-After` header
+  rather than plain text.
+
 ### Security
 - URL media uploads (`send_image_from_url`, `send_file`, `send_audio`,
   `send_video`, `me_set_avatar`, and `upload_media_from_url`) now enforce

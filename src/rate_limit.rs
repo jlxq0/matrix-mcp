@@ -53,7 +53,25 @@ use governor::{Quota, RateLimiter};
 /// needs one or two live sessions; this leaves headroom for reconnects
 /// while preventing one authenticated identity from filling the global
 /// session pool (`session::MAX_SESSIONS`).
-pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 8;
+///
+/// The burst is what protects the *first* tool call of a conversation.
+/// Every reconnect — new conversation, new tab, a session the server has
+/// evicted or lost across a restart — spends one token here, and spending
+/// the last one turns the user's next `whoami` into a 429. Sized so that a
+/// day's worth of normal reconnect churn cannot exhaust it.
+pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 16;
+
+/// How fast the initialize burst refills: one slot every two minutes.
+///
+/// Previously this was paired with the 30-minute session idle TTL, which read
+/// well as a flood defence ("you can only open sessions as fast as your old
+/// ones expire") but meant an identity that legitimately reconnected a dozen
+/// times in an afternoon stayed locked out for hours. At one slot per two
+/// minutes an identity can hold at most ~31 concurrent sessions
+/// (burst + refills within the idle TTL) — comfortably under the global
+/// `session::MAX_SESSIONS` cap, so the flood defence still holds.
+#[allow(clippy::duration_suboptimal_units)] // `from_mins` is unstable on our MSRV.
+pub const INITIALIZE_REFILL_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Limiter type alias — `governor`'s direct (non-keyed) variant; we
 /// build one per identity and hand it out keyed by bearer-hash or sub.

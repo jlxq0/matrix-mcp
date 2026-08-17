@@ -211,10 +211,29 @@ impl SessionManager for CappedSessionManager {
         Ok(self.inner.resume(id, last_event_id).await?)
     }
 
+    /// Bring a session persisted by [`crate::session_store`] back into memory.
+    ///
+    /// This is the path that keeps a client's `Mcp-Session-Id` valid across a
+    /// restart or an idle eviction. It allocates exactly the same in-memory
+    /// state `create_session` does — a worker task and a transport — so it
+    /// takes the same gate and honours the same cap. rmcp only calls this for
+    /// ids that were found in the persisted store, so this is a bound on
+    /// memory (many surviving sessions reconnecting at once after a rollout),
+    /// not a defence against forged ids.
     async fn restore_session(
         &self,
         id: SessionId,
     ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
+        let _create_guard = self.create_gate.lock().await;
+        let count = self.inner.sessions.read().await.len();
+        if count >= MAX_SESSIONS {
+            warn!(
+                count,
+                limit = MAX_SESSIONS,
+                "session cap reached; refusing to restore a persisted session"
+            );
+            return Err(CappedSessionError::CapReached);
+        }
         Ok(self.inner.restore_session(id).await?)
     }
 }

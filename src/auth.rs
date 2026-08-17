@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use crate::audit::{self, outcome};
 use crate::config::Config;
 use crate::last_used::{self, LastUsedTracker};
-use crate::mas::{AuthenticatedIdentity, MasIntrospectionClient};
+use crate::mas::{AuthenticatedIdentity, IntrospectionError, MasIntrospectionClient};
 use crate::oauth_metadata::www_authenticate_header;
 use std::sync::Arc;
 
@@ -50,7 +50,7 @@ pub async fn bearer_auth(
     next: Next,
 ) -> Response {
     let Some(token) = extract_bearer(request.headers().get(header::AUTHORIZATION)) else {
-        return unauthorized(&state.config.resource_url);
+        return unauthorized(&state.config);
     };
 
     let started = std::time::Instant::now();
@@ -103,7 +103,18 @@ pub async fn bearer_auth(
         Ok(None) => {
             debug!("token rejected by MAS introspection");
             audit::introspect(&token_hash, outcome::INACTIVE, started, None);
-            unauthorized(&state.config.resource_url)
+            unauthorized(&state.config)
+        }
+        // A token minted for a different resource is a *client* problem, not
+        // an upstream failure: RFC 6750 / OAuth 2.1 §5.3 and the MCP
+        // authorization spec both require 401 so the client re-runs the
+        // authorization flow with the right `resource`. Returning 500 here
+        // (the old behaviour) left the client retrying a token that would
+        // never work.
+        Err(IntrospectionError::AudienceMismatch { expected }) => {
+            warn!(%expected, "token audience does not name this MCP server");
+            audit::introspect(&token_hash, outcome::INACTIVE, started, None);
+            unauthorized(&state.config)
         }
         Err(e) => {
             warn!(error = %e, "MAS introspection failure");
@@ -136,8 +147,8 @@ fn extract_bearer(header: Option<&HeaderValue>) -> Option<String> {
     Some(token.to_owned())
 }
 
-fn unauthorized(resource_url: &str) -> Response {
-    let header_value = www_authenticate_header(resource_url);
+fn unauthorized(config: &Config) -> Response {
+    let header_value = www_authenticate_header(config);
     let value =
         HeaderValue::from_str(&header_value).unwrap_or_else(|_| HeaderValue::from_static("Bearer"));
     let mut response = (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
@@ -208,9 +219,20 @@ mod tests {
         assert_eq!(extract_bearer(Some(&h)).as_deref(), Some("xyz"));
     }
 
+    fn test_config() -> Config {
+        Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            "https://matrix.example.test",
+            "example.test",
+            std::net::SocketAddr::from(([0, 0, 0, 0], 3000)),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn unauthorized_response_has_www_authenticate() {
-        let r = unauthorized("https://example.test");
+        let r = unauthorized(&test_config());
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
         let h = r.headers().get(header::WWW_AUTHENTICATE).unwrap();
         let s = h.to_str().unwrap();

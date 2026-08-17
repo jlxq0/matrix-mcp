@@ -273,7 +273,7 @@ pub async fn login(State(state): State<SetupState>) -> Response {
         "{auth}/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}\
          &code_challenge={challenge}&code_challenge_method=S256&state={state_tok}\
          &scope=openid+urn%3Amatrix%3Aorg.matrix.msc2967.client%3Aapi%3A%2A",
-        auth = state.config.authorization_server,
+        auth = state.config.authorization_server_base(),
         client_id = url_encode(&creds.client_id),
         redirect_uri = url_encode(&redirect_uri),
         challenge = url_encode(&challenge),
@@ -817,7 +817,7 @@ async fn exchange_and_introspect(
         .as_ref()
         .ok_or_else(|| anyhow!("introspection credentials missing on Config"))?;
     let redirect_uri = format!("{}/setup/callback", state.config.resource_url);
-    let token_url = format!("{}/oauth2/token", state.config.authorization_server);
+    let token_url = format!("{}/oauth2/token", state.config.authorization_server_base());
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))

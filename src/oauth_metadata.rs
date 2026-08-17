@@ -34,28 +34,35 @@ pub fn mcp_resource(resource_url: &str) -> String {
     format!("{resource_url}/mcp")
 }
 
+/// The scopes a client must hold to drive this server. Shared by the RFC 9728
+/// `scopes_supported` field and the `scope` parameter of the
+/// `WWW-Authenticate` challenge, so the two can never drift.
+pub fn required_scopes(cfg: &Config) -> Vec<String> {
+    vec![
+        "openid".to_owned(),
+        // Matrix C-S API access scope (MSC3861). Issues an
+        // OAuth token Synapse accepts on `/_matrix/*`.
+        "urn:matrix:org.matrix.msc2967.client:api:*".to_owned(),
+        // Device-binding scope (MSC2967). When the client
+        // requests this, MAS creates the device under the
+        // authorising user's account and binds the issued
+        // token to it. Without this, the token is "deviceless"
+        // and matrix-sdk can't use it for E2EE (no vodozemac
+        // identity to attach, no cross-signing target).
+        format!(
+            "urn:matrix:org.matrix.msc2967.client:device:{}",
+            cfg.device_id
+        ),
+    ]
+}
+
 impl ProtectedResourceMetadata {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
             resource: mcp_resource(&cfg.resource_url),
             authorization_servers: vec![cfg.authorization_server.clone()],
             bearer_methods_supported: vec!["header"],
-            scopes_supported: vec![
-                "openid".to_owned(),
-                // Matrix C-S API access scope (MSC3861). Issues an
-                // OAuth token Synapse accepts on `/_matrix/*`.
-                "urn:matrix:org.matrix.msc2967.client:api:*".to_owned(),
-                // Device-binding scope (MSC2967). When the client
-                // requests this, MAS creates the device under the
-                // authorising user's account and binds the issued
-                // token to it. Without this, the token is "deviceless"
-                // and matrix-sdk can't use it for E2EE (no vodozemac
-                // identity to attach, no cross-signing target).
-                format!(
-                    "urn:matrix:org.matrix.msc2967.client:device:{}",
-                    cfg.device_id
-                ),
-            ],
+            scopes_supported: required_scopes(cfg),
         }
     }
 }
@@ -73,8 +80,19 @@ pub async fn protected_resource_metadata(State(cfg): State<Config>) -> impl Into
 /// (`/.well-known/oauth-protected-resource/mcp`) — the well-known location
 /// for the `{origin}/mcp` resource. We also serve the metadata at the bare
 /// `/.well-known/oauth-protected-resource` for clients that probe the root.
-pub fn www_authenticate_header(resource_url: &str) -> String {
-    format!(r#"Bearer resource_metadata="{resource_url}/.well-known/oauth-protected-resource/mcp""#)
+///
+/// The `scope` parameter (RFC 6750 §3) is the MCP authorization spec's
+/// preferred way to tell a client what to ask for: clients that read it
+/// request exactly these scopes instead of guessing from `scopes_supported`.
+/// Without it, a client that never fetches the metadata document (or one that
+/// drops the dynamic device scope) authorizes without device binding and
+/// silently loses E2EE.
+pub fn www_authenticate_header(cfg: &Config) -> String {
+    let resource_url = &cfg.resource_url;
+    let scope = required_scopes(cfg).join(" ");
+    format!(
+        r#"Bearer resource_metadata="{resource_url}/.well-known/oauth-protected-resource/mcp", scope="{scope}""#
+    )
 }
 
 #[cfg(test)]
@@ -158,11 +176,26 @@ mod tests {
 
     #[test]
     fn www_authenticate_includes_resource_metadata_url() {
-        let header = www_authenticate_header("https://example.test");
+        let header = www_authenticate_header(&test_config());
         assert!(header.starts_with("Bearer "));
         assert!(header.contains(
             r#"resource_metadata="https://example.test/.well-known/oauth-protected-resource/mcp""#
         ));
+    }
+
+    /// MCP authorization spec: servers SHOULD include `scope` in the
+    /// challenge, and clients treat it as authoritative. The dynamic device
+    /// scope has to be in there or the client authorizes deviceless and E2EE
+    /// breaks.
+    #[test]
+    fn www_authenticate_includes_required_scopes() {
+        let header = www_authenticate_header(&test_config());
+        assert!(
+            header.contains(r#"scope=""#),
+            "no scope parameter: {header}"
+        );
+        assert!(header.contains("urn:matrix:org.matrix.msc2967.client:api:*"));
+        assert!(header.contains("urn:matrix:org.matrix.msc2967.client:device:TESTDEVICE"));
     }
 
     #[test]
