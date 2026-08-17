@@ -1,7 +1,5 @@
 # matrix-mcp
 
-[![CI](https://forge.oddie.app/julian/matrix-mcp/actions/workflows/ci.yml/badge.svg)](https://forge.oddie.app/julian/matrix-mcp/actions?workflow=ci.yml)
-
 A remote MCP server that lets [claude.ai](https://claude.ai) (or any other
 MCP client) read, search, and write in your [Matrix](https://matrix.org)
 account – including in **end-to-end-encrypted rooms** – using your existing
@@ -144,10 +142,9 @@ otherwise. Conventional Commits for messages.
 
 ## Where this code lives
 
-The canonical source repository is
-[`forge.oddie.app/julian/matrix-mcp`](https://forge.oddie.app/julian/matrix-mcp).
+The canonical source repository is on Forgejo.
 [`github.com/jlxq0/matrix-mcp`](https://github.com/jlxq0/matrix-mcp) is
 a public push-mirror so the code is discoverable and forkable from
-GitHub. PRs opened on either side are fine; merges happen on Forgejo
-and are mirrored.
+GitHub. PRs opened on either side are fine; merges happen on the
+primary Forgejo remote and are mirrored.
 
