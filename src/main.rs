@@ -190,7 +190,7 @@ fn service_factory(
     upload_max_bytes: usize,
     key_backup_gate: key_backup_gate::KeyBackupGate,
     tts: Option<Arc<crate::config::TtsConfig>>,
-    server_name: String,
+    deployment: crate::mcp::Deployment,
     channel: Option<channel::ChannelRegistry>,
 ) -> impl Fn() -> Result<MatrixMcpService, std::io::Error> + Send + Sync + 'static {
     move || {
@@ -202,7 +202,7 @@ fn service_factory(
             upload_max_bytes,
             key_backup_gate.clone(),
             tts.clone(),
-            server_name.clone(),
+            deployment.clone(),
         );
         Ok(match &channel {
             Some(registry) => service.into_channel_mode(registry.clone()),
@@ -263,7 +263,17 @@ fn build_router(
     let http_config = make_http_config("/mcp", session_store.clone());
     let channel_http_config = make_http_config("/channel", session_store);
 
-    let server_name = cfg.server_name.clone();
+    // `/setup` lives next to `/mcp` on the same public origin.
+    let deployment = crate::mcp::Deployment {
+        server_name: cfg.server_name.clone(),
+        setup_url: format!(
+            "{}/setup",
+            cfg.resource_url
+                .strip_suffix("/mcp")
+                .unwrap_or(&cfg.resource_url)
+                .trim_end_matches('/')
+        ),
+    };
     let mcp_service = StreamableHttpService::new(
         service_factory(
             clients.clone(),
@@ -273,7 +283,7 @@ fn build_router(
             upload_max_bytes,
             key_backup_gate.clone(),
             tts.clone(),
-            server_name.clone(),
+            deployment.clone(),
             None,
         ),
         Arc::new(session::CappedSessionManager::new()),
@@ -291,7 +301,7 @@ fn build_router(
             upload_max_bytes,
             key_backup_gate,
             tts,
-            server_name,
+            deployment,
             Some(channel_registry),
         ),
         Arc::new(session::CappedSessionManager::new()),
