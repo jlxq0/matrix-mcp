@@ -108,6 +108,12 @@ pub struct MatrixClientCache {
     homeserver_url: String,
     store: StoreConfig,
     inner: Arc<RwLock<HashMap<String, CachedClientCell>>>,
+    /// Live `/channel` sessions, when the channel mount is enabled.
+    ///
+    /// Held here because the per-user sync task is the only thing that sees
+    /// inbound Matrix traffic, and it has no request context of its own to
+    /// discover which sessions belong to the identity it syncs for.
+    channel: Option<crate::channel::ChannelRegistry>,
 }
 
 impl MatrixClientCache {
@@ -116,7 +122,18 @@ impl MatrixClientCache {
             homeserver_url: homeserver_url.into(),
             store,
             inner: Arc::new(RwLock::new(HashMap::new())),
+            channel: None,
         }
+    }
+
+    /// Push inbound room messages to the sessions in `registry`.
+    ///
+    /// Without this the cache behaves exactly as before: clients still sync,
+    /// but nothing is pushed anywhere.
+    #[must_use]
+    pub fn with_channel(mut self, registry: crate::channel::ChannelRegistry) -> Self {
+        self.channel = Some(registry);
+        self
     }
 
     /// Returns `true` iff a matrix-sdk client is already cached *and
@@ -373,6 +390,14 @@ impl MatrixClientCache {
             .restore_session(session, RoomLoadSettings::default())
             .await
             .context("restore matrix session")?;
+
+        // Turn inbound room messages into channel events. Registered before
+        // the sync task starts so the first sync response is already covered;
+        // matrix-sdk dispatches to handlers from the sync loop, so this is
+        // inert until that task runs.
+        if let Some(registry) = self.channel.clone() {
+            crate::channel::install_event_handler(&client, identity.mxid.clone(), registry);
+        }
 
         // Subscribe the event cache. matrix-sdk's sync handler only feeds the
         // LatestEvents subsystem when the event cache has been subscribed (see
