@@ -7,6 +7,17 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 ## [Unreleased]
 
 ### Added
+- **`MATRIX_MCP_RECOVERY_KEYS`: Secret Storage recovery for accounts with no
+  human.** `/setup` is a browser flow, so a bot account can never use it, and
+  its cross-signing identity therefore exists only in this deployment's store —
+  lose the volume and the identity is stranded permanently, because the
+  homeserver still holds a master key and `bootstrap_cross_signing` rightly
+  refuses to mint a second. An operator-supplied passphrase per account is now
+  written to Secret Storage when the identity is created, and imported when the
+  client is built. Per-account rather than deployment-wide, because this server
+  is multi-user. The operator chooses the value, so nothing sensitive is
+  returned through a tool result; the config prints account names and never
+  keys.
 - **`/channel`: serve Matrix as a Claude Code channel.** A second mount that
   declares the `claude/channel` capability and pushes inbound room messages
   into a running Claude Code session, so a session can react to Matrix while
