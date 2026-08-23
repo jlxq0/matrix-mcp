@@ -2305,6 +2305,10 @@ pub struct BootstrapCrossSigningResult {
     pub device_id: Option<String>,
     /// Whether this device is now signed by the new master key.
     pub cross_signed: bool,
+    /// Whether the identity was also written to Secret Storage under the
+    /// operator's configured recovery passphrase, so it survives this
+    /// deployment's store.
+    pub recovery_enabled: bool,
     /// What happened, and what a human still has to do.
     pub message: String,
 }
@@ -3142,6 +3146,35 @@ impl MatrixMcpService {
                     )
                 })?;
 
+            // Put the new identity into Secret Storage under the operator's
+            // configured passphrase, so it survives this deployment. Without
+            // this the private keys exist only in this store, and a bot has no
+            // way back in: `/setup` needs a browser, and this tool will
+            // correctly refuse to mint a second identity. The passphrase is
+            // supplied by the operator precisely so nothing secret has to be
+            // handed back through a tool result.
+            let recovery_enabled = match self.clients.recovery_key(me.as_ref()) {
+                Some(passphrase) => {
+                    match encryption
+                        .recovery()
+                        .enable()
+                        .with_passphrase(&passphrase)
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                mxid = %me,
+                                error = %e,
+                                "cross-signing created but recovery could not be enabled"
+                            );
+                            false
+                        }
+                    }
+                }
+                None => false,
+            };
+
             // Refresh the local cache so the flags below reflect what was
             // just uploaded rather than the pre-bootstrap state.
             let _ = encryption.request_user_identity(&me).await;
@@ -3160,7 +3193,14 @@ impl MatrixMcpService {
                 mxid: me.to_string(),
                 device_id: device_id.map(|d| d.to_string()),
                 cross_signed,
-                message: if cross_signed {
+                recovery_enabled,
+                message: if !recovery_enabled {
+                    "Cross-signing identity created, but it exists only in this deployment's \
+                     store. Configure a recovery passphrase for this account in \
+                     MATRIX_MCP_RECOVERY_KEYS and run this again on a fresh account, or losing \
+                     the store strands the identity permanently."
+                        .to_owned()
+                } else if cross_signed {
                     "Cross-signing identity created and this device is signed by it. Other \
                      users still have to verify the identity once before their clients show \
                      it as trusted."

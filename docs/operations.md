@@ -17,6 +17,7 @@ matrix-mcp deployment.
 | `MATRIX_MCP_INTROSPECTION_CLIENT_SECRET` | yes | – | OAuth client secret paired with the id above. |
 | `MATRIX_MCP_STORE_DIR` | yes | – | Root directory for per-user SQLite stores. In production: PVC mount at `/var/lib/matrix-mcp`. |
 | `MATRIX_MCP_STORE_PEPPER` | yes | – | ≥32-byte high-entropy string. HKDF input for store-cipher key derivation. See pepper section below. |
+| `MATRIX_MCP_RECOVERY_KEYS` | no | – | JSON object mapping MXID to a Secret Storage recovery passphrase, for accounts that cannot run `/setup`. See "Recovery for accounts with no human" below. |
 | `MATRIX_MCP_BIND_ADDR` | no | `0.0.0.0:3000` | TCP bind for the public API. |
 | `MATRIX_MCP_METRICS_BIND_ADDR` | no | `{POD_IP}:9090` | TCP bind for Prometheus metrics. Never `0.0.0.0` by default. |
 | `POD_IP` | no (k8s injects) | – | Pod IP from downward API. Used to derive the metrics bind address. |
@@ -197,3 +198,53 @@ is already verified.
 To update: user visits `/setup` again and pastes the new recovery key.
 The `recover()` call replaces the old secret storage credentials.
 No data is lost; the existing store remains valid.
+
+
+## Recovery for accounts with no human
+
+`/setup` is how a cross-signing identity gets into this deployment, and it is a
+browser flow: sign in at MAS, paste the recovery key Element produced. That
+assumes somebody can sign in.
+
+A **bot account has nobody**. Its identity therefore lives in exactly one
+place — this deployment's encrypted store. Lose the volume, move the
+deployment, or rebuild the store, and the identity is stranded: the homeserver
+still holds a master key, so `bootstrap_cross_signing` correctly refuses to
+mint a second one, and there is no way back in. The account is left
+permanently unverifiable.
+
+`MATRIX_MCP_RECOVERY_KEYS` closes that. The operator picks a passphrase per
+account and stores it beside the pepper:
+
+```json
+{"@bot:example.com":"correct-horse-battery-staple","@other:example.com":"…"}
+```
+
+Two things then happen automatically:
+
+- **On `bootstrap_cross_signing`**, the new identity is written to Secret
+  Storage under that passphrase. It is not a value the tool returns — the
+  operator chose it, so nothing sensitive travels back through a tool result
+  and into a client's transcript.
+- **On building a client** for a listed account, the identity is imported from
+  Secret Storage. This is the same `recovery().recover()` call `/setup` makes;
+  only the source of the secret differs.
+
+Deliberately per-account rather than one deployment-wide secret: this server is
+multi-user, and a shared recovery secret across every user would be a worse bug
+than the one it fixes. Accounts not listed are unaffected.
+
+The passphrase is as sensitive as the account. It reconstructs the
+cross-signing identity and unlocks key backup, so it belongs in the same secret
+store as the pepper and never in a manifest. `Config` derives `Debug`; the
+recovery map prints its account names and never its values, and there is a test
+that fails if that regresses.
+
+### One matrix-sdk client per device
+
+Related, and learned the hard way: **never point two matrix-sdk clients at the
+same access token.** Both build a crypto store and generate identity keys for
+the same device id, only one set can be advertised, and the loser can decrypt
+nothing while looking perfectly healthy. Reissuing the token does not fix it —
+the device id, and its keys, survive. Recovery cannot fix it either: it
+restores an identity, not a device. Give each consumer its own account.

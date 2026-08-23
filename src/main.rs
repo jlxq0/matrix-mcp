@@ -125,6 +125,7 @@ fn build_app(cfg: Config) -> Result<Router> {
     // cache (whose sync tasks push to them).
     let channel_registry = channel::ChannelRegistry::new();
     let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store)
+        .with_recovery_keys(cfg.recovery_keys.clone())
         .with_channel(channel_registry.clone());
     // Shared across SetupState (recover flow) and MatrixMcpService
     // (request_room_keys tool + auto-pull helper) so all room-key

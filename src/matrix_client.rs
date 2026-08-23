@@ -108,6 +108,9 @@ pub struct MatrixClientCache {
     homeserver_url: String,
     store: StoreConfig,
     inner: Arc<RwLock<HashMap<String, CachedClientCell>>>,
+    /// Recovery keys for accounts that cannot run the browser `/setup` flow.
+    /// See [`crate::config::RecoveryKeys`].
+    recovery_keys: crate::config::RecoveryKeys,
     /// Live `/channel` sessions, when the channel mount is enabled.
     ///
     /// Held here because the per-user sync task is the only thing that sees
@@ -122,8 +125,23 @@ impl MatrixClientCache {
             homeserver_url: homeserver_url.into(),
             store,
             inner: Arc::new(RwLock::new(HashMap::new())),
+            recovery_keys: crate::config::RecoveryKeys::default(),
             channel: None,
         }
+    }
+
+    /// Import a configured account's cross-signing identity when its client is
+    /// built, instead of requiring the browser `/setup` flow.
+    #[must_use]
+    pub fn with_recovery_keys(mut self, keys: crate::config::RecoveryKeys) -> Self {
+        self.recovery_keys = keys;
+        self
+    }
+
+    /// The recovery secret configured for `mxid`, if any.
+    #[must_use]
+    pub fn recovery_key(&self, mxid: &str) -> Option<String> {
+        self.recovery_keys.get(mxid).map(ToOwned::to_owned)
     }
 
     /// Push inbound room messages to the sessions in `registry`.
@@ -390,6 +408,31 @@ impl MatrixClientCache {
             .restore_session(session, RoomLoadSettings::default())
             .await
             .context("restore matrix session")?;
+
+        // Import the cross-signing identity for accounts that cannot run
+        // `/setup`. Same call the browser flow makes; the difference is only
+        // where the key comes from. Best-effort: a failure here costs E2EE,
+        // not the session, and the reason is logged.
+        if let Some(key) = self.recovery_keys.get(&identity.mxid) {
+            match client.encryption().recovery().recover(key).await {
+                Ok(()) => {
+                    info!(
+                        mxid = %identity.mxid,
+                        "imported cross-signing identity from the configured recovery key"
+                    );
+                    // Refresh the cached identity so `verify_status` reflects
+                    // the signature that was just uploaded.
+                    if let Some(me) = client.user_id() {
+                        let _ = client.encryption().request_user_identity(me).await;
+                    }
+                }
+                Err(e) => warn!(
+                    mxid = %identity.mxid,
+                    error = %e,
+                    "configured recovery key did not import; E2EE will be limited"
+                ),
+            }
+        }
 
         // Turn inbound room messages into channel events. Registered before
         // the sync task starts so the first sync response is already covered;
