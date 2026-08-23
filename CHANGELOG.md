@@ -6,6 +6,40 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added
+- **`/channel`: serve Matrix as a Claude Code channel.** A second mount that
+  declares the `claude/channel` capability and pushes inbound room messages
+  into a running Claude Code session, so a session can react to Matrix while
+  nobody is at the terminal. `/mcp` is unchanged: a capability declared there
+  would turn every existing client into a channel and start pushing at sessions
+  that never asked. The channel mount offers seven tools rather than sixty,
+  because every tool schema costs client context before any work happens.
+
+  Inbound messages are gated on the sender's full MXID, read from the account's
+  own `app.matrix_mcp.channel` account data and cached briefly. An absent or
+  empty list pushes nothing — an ungated channel is a prompt-injection vector.
+  Gating is on the sender and never the room, which differ in a group room.
+  Bodies go through the same `content_sandbox` the read tools use, and an event
+  that trips the injection heuristic carries `suspicious="true"`.
+
+  Messages that arrive while no session is listening are replayed when one
+  attaches, watermarked by the account's own read receipt. The server never
+  writes that receipt itself: it cannot observe delivery, because a session
+  object outlives the client that opened it. The agent acknowledges with
+  `mark_read`, so delivery is at-least-once.
+
+- **`bootstrap_cross_signing`**: create a cross-signing identity for an account
+  that has none, so bot accounts stop showing as unverified. The `/setup` flow
+  imports an identity from Secret Storage, which assumes a human has run
+  Element's secure-backup flow; nobody signs into a bot. Refuses when an
+  identity already exists, so it can never become a reset that invalidates
+  other people's verifications.
+
+### Fixed
+- `get_info` and `verify_status` reported a hardcoded `example.com` /
+  `matrix-mcp.example.com` rather than the configured server name and setup
+  URL. The former reached the model's system prompt on every session.
+
 ### Fixed
 - Tokens audienced at the canonical resource identifier
   (`https://<host>/mcp` — the value we publish in the RFC 9728 document, and
