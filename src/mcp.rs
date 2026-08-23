@@ -3153,26 +3153,22 @@ impl MatrixMcpService {
             // correctly refuse to mint a second identity. The passphrase is
             // supplied by the operator precisely so nothing secret has to be
             // handed back through a tool result.
-            let recovery_enabled = match self.clients.recovery_key(me.as_ref()) {
-                Some(passphrase) => {
-                    match encryption
-                        .recovery()
-                        .enable()
-                        .with_passphrase(&passphrase)
-                        .await
-                    {
-                        Ok(_) => true,
-                        Err(e) => {
-                            tracing::warn!(
-                                mxid = %me,
-                                error = %e,
-                                "cross-signing created but recovery could not be enabled"
-                            );
-                            false
-                        }
-                    }
+            let passphrase = self.clients.recovery_passphrase(me.as_ref());
+            let recovery_enabled = match encryption
+                .recovery()
+                .enable()
+                .with_passphrase(&passphrase)
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        mxid = %me,
+                        error = %e,
+                        "cross-signing created but recovery could not be enabled"
+                    );
+                    false
                 }
-                None => false,
             };
 
             // Refresh the local cache so the flags below reflect what was
@@ -3195,10 +3191,9 @@ impl MatrixMcpService {
                 cross_signed,
                 recovery_enabled,
                 message: if !recovery_enabled {
-                    "Cross-signing identity created, but it exists only in this deployment's \
-                     store. Configure a recovery passphrase for this account in \
-                     MATRIX_MCP_RECOVERY_KEYS and run this again on a fresh account, or losing \
-                     the store strands the identity permanently."
+                    "Cross-signing identity created, but it could not be written to Secret \
+                     Storage, so it exists only in this deployment's store. Losing that store \
+                     would strand the identity permanently."
                         .to_owned()
                 } else if cross_signed {
                     "Cross-signing identity created and this device is signed by it. Other \
