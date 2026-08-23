@@ -49,11 +49,39 @@ use tracing::{Instrument as _, Span, warn};
 use crate::audit::{self, outcome};
 use crate::audit_room;
 use crate::auth::AccessToken;
+use crate::channel::{CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, CHANNEL_TOOLS, ChannelRegistry};
 use crate::content_sandbox;
 use crate::mas::AuthenticatedIdentity;
 use crate::matrix_client::MatrixClientCache;
 use crate::rate_limit::{Category, Limiter};
 use crate::url_safety;
+
+/// Deployment-specific strings the service puts in front of the model.
+///
+/// Threaded in from config. These used to be hardcoded to `example.com` and
+/// `matrix-mcp.example.com`, which meant every session's system prompt and
+/// every verification hint named a domain that does not exist.
+#[derive(Debug, Clone)]
+pub struct Deployment {
+    /// Matrix server name this deployment serves, e.g. `example.org`.
+    pub server_name: String,
+    /// Absolute URL of the browser `/setup` flow.
+    pub setup_url: String,
+}
+
+/// Which surface this service instance serves.
+///
+/// The same service type backs both mounts; only the advertised capabilities,
+/// the instructions and the tool surface differ. See `channel.rs` for why the
+/// channel is a separate mount rather than a flag on the main one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceMode {
+    /// `/mcp` — the full tool surface, no pushing. What existing clients use.
+    Full,
+    /// `/channel` — declares `claude/channel`, pushes Matrix events into the
+    /// session, and offers only [`CHANNEL_TOOLS`].
+    Channel,
+}
 
 /// The MCP service. Per-session state is a reference to the shared
 /// `MatrixClientCache`. The per-request identity + token come from
@@ -85,6 +113,14 @@ pub struct MatrixMcpService {
     /// `None` means the operator hasn't configured a TTS endpoint and
     /// the tool returns `invalid_params` when invoked.
     tts: Option<Arc<crate::config::TtsConfig>>,
+    /// Which surface this instance serves. See [`ServiceMode`].
+    mode: ServiceMode,
+    /// Live channel sessions by MXID. Shared across every service instance so
+    /// the sync task, which has no request context of its own, can find the
+    /// sessions belonging to the identity whose room produced an event.
+    channel: ChannelRegistry,
+    /// Deployment-specific strings; see [`Deployment`].
+    deployment: Deployment,
     tool_router: ToolRouter<Self>,
 }
 
@@ -95,6 +131,7 @@ impl std::fmt::Debug for MatrixMcpService {
 }
 
 impl MatrixMcpService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         clients: MatrixClientCache,
         mas: crate::mas::MasIntrospectionClient,
@@ -103,6 +140,7 @@ impl MatrixMcpService {
         upload_max_bytes: usize,
         key_backup_gate: crate::key_backup_gate::KeyBackupGate,
         tts: Option<Arc<crate::config::TtsConfig>>,
+        deployment: Deployment,
     ) -> Self {
         Self {
             clients,
@@ -112,8 +150,36 @@ impl MatrixMcpService {
             upload_max_bytes,
             key_backup_gate,
             tts,
+            mode: ServiceMode::Full,
+            channel: ChannelRegistry::new(),
+            deployment,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Convert this instance into the `/channel` surface.
+    ///
+    /// Narrows the tool router to [`CHANNEL_TOOLS`] by removing every other
+    /// route. Removal rather than an allowlist check at call time is
+    /// deliberate: `#[tool_handler]` derives both `list_tools` and `call_tool`
+    /// from this one router, so a tool that is not in the router can neither
+    /// be advertised nor invoked, and the two can never drift apart.
+    #[must_use]
+    pub fn into_channel_mode(mut self, channel: ChannelRegistry) -> Self {
+        let names: Vec<String> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for name in names {
+            if !CHANNEL_TOOLS.contains(&name.as_str()) {
+                self.tool_router.remove_route(&name);
+            }
+        }
+        self.mode = ServiceMode::Channel;
+        self.channel = channel;
+        self
     }
 
     /// Inspect a tool-call result for the Synapse "auth expired" error
@@ -2231,6 +2297,18 @@ pub struct VerifyStatusResult {
     pub message: String,
 }
 
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct BootstrapCrossSigningResult {
+    /// The account an identity was created for.
+    pub mxid: String,
+    /// This deployment's Matrix device id, if the client has one.
+    pub device_id: Option<String>,
+    /// Whether this device is now signed by the new master key.
+    pub cross_signed: bool,
+    /// What happened, and what a human still has to do.
+    pub message: String,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DownloadAttachmentParams {
     /// Matrix room id containing the attachment event,
@@ -2936,19 +3014,24 @@ impl MatrixMcpService {
                 false
             };
 
+            let setup_url = &self.deployment.setup_url;
             let message = if !user_has_master_key {
-                "No cross-signing identity found on the homeserver. Set up cross-signing in \
-                 Element X first (Settings → Encryption → Set up secure backup), then visit \
-                 https://matrix-mcp.example.com/setup to import the keys here."
-                    .to_owned()
+                format!(
+                    "No cross-signing identity found on the homeserver. If this is your own \
+                     account, set up cross-signing in Element X (Settings → Encryption → Set \
+                     up secure backup) and then visit {setup_url} to import the keys here. If \
+                     this is a bot account that nobody signs into, call \
+                     `bootstrap_cross_signing` instead — it creates the identity directly."
+                )
             } else if cross_signed {
                 "matrix-mcp device is cross-signed; E2EE rooms are accessible.".to_owned()
             } else {
-                "matrix-mcp device exists but isn't yet signed by your master key. Visit \
-                 https://matrix-mcp.example.com/setup, sign in, and paste your Matrix \
-                 Secret Storage recovery key — matrix-mcp will self-sign the device. No \
-                 chat history, no emoji-compare with another device."
-                    .to_owned()
+                format!(
+                    "matrix-mcp device exists but isn't yet signed by your master key. Visit \
+                     {setup_url}, sign in, and paste your Matrix Secret Storage recovery key \
+                     — matrix-mcp will self-sign the device. No chat history, no emoji-compare \
+                     with another device."
+                )
             };
 
             structured_result(&VerifyStatusResult {
@@ -2962,6 +3045,139 @@ impl MatrixMcpService {
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "verify_status",
+            &mxid_for_audit,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Create a cross-signing identity for an account that has none.
+    ///
+    /// The `/setup` flow imports an *existing* identity from Secret Storage,
+    /// which assumes a human has run Element's secure-backup flow at least
+    /// once. A bot account has nobody to do that, so it stays without a master
+    /// key forever, its device is never signed, and every client shows it as
+    /// unverified.
+    ///
+    /// This creates the identity directly. It **refuses** when one already
+    /// exists, so it can never reset an identity and invalidate the
+    /// verifications other people have already done — resetting is a
+    /// deliberately separate, destructive act this tool does not perform.
+    ///
+    /// The private keys live only in this deployment's encrypted store. There
+    /// is no recovery key, deliberately: minting one would mean handing a
+    /// long-lived secret back through a tool result, into the model's context
+    /// and the client's transcript. Losing the store means calling this again,
+    /// which clients will surface as an identity change.
+    #[tool(
+        description = "Create a cross-signing identity for the authenticated account so its \
+                       device stops showing as unverified. For bot accounts, which cannot run \
+                       Element's secure-backup flow. Refuses if an identity already exists.",
+        annotations(
+            title = "Bootstrap cross-signing",
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn bootstrap_cross_signing(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let span = make_tool_span("bootstrap_cross_signing", &mxid_for_audit, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let client = self.client_for(&ctx).await?;
+            let me = client
+                .user_id()
+                .ok_or_else(|| ErrorData::internal_error("no user_id on client", None))?
+                .to_owned();
+            let encryption = client.encryption();
+
+            // Ask the homeserver, not the local cache. An OAuth-restored
+            // session often has no identity cached even when one exists, and
+            // acting on that would overwrite a real identity.
+            let existing = match encryption.request_user_identity(&me).await {
+                Ok(Some(id)) => Some(id),
+                Ok(None) => encryption.get_user_identity(&me).await.map_err(|e| {
+                    ErrorData::internal_error(format!("get_user_identity: {e}"), None)
+                })?,
+                Err(e) => {
+                    // Refuse rather than guess: a transient /keys/query
+                    // failure must not be read as "no identity exists".
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "could not confirm whether a cross-signing identity already \
+                             exists ({e}); refusing to bootstrap"
+                        ),
+                        None,
+                    ));
+                }
+            };
+            if existing.is_some() {
+                return Err(ErrorData::invalid_params(
+                    "this account already has a cross-signing identity; refusing to replace \
+                     it. Import it with the /setup flow instead — replacing it would \
+                     invalidate every verification anyone has already done.",
+                    None,
+                ));
+            }
+
+            encryption
+                .bootstrap_cross_signing(None)
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!(
+                            "bootstrap_cross_signing: {e}. A homeserver that requires \
+                             interactive auth for the first cross-signing upload cannot be \
+                             bootstrapped this way."
+                        ),
+                        None,
+                    )
+                })?;
+
+            // Refresh the local cache so the flags below reflect what was
+            // just uploaded rather than the pre-bootstrap state.
+            let _ = encryption.request_user_identity(&me).await;
+            let device_id = client.device_id().map(ToOwned::to_owned);
+            let cross_signed = if let Some(did) = &device_id {
+                encryption
+                    .get_device(&me, did)
+                    .await
+                    .map_err(|e| ErrorData::internal_error(format!("get_device: {e}"), None))?
+                    .is_some_and(|d| d.is_cross_signed_by_owner())
+            } else {
+                false
+            };
+
+            structured_result(&BootstrapCrossSigningResult {
+                mxid: me.to_string(),
+                device_id: device_id.map(|d| d.to_string()),
+                cross_signed,
+                message: if cross_signed {
+                    "Cross-signing identity created and this device is signed by it. Other \
+                     users still have to verify the identity once before their clients show \
+                     it as trusted."
+                        .to_owned()
+                } else {
+                    "Cross-signing identity created, but this device is not signed by it yet. \
+                     Call `verify_status` again shortly; if it stays unsigned the signature \
+                     upload did not land."
+                        .to_owned()
+                },
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "bootstrap_cross_signing",
             &mxid_for_audit,
             None,
             started,
@@ -6753,13 +6969,106 @@ impl MatrixMcpService {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MatrixMcpService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Matrix MCP server for example.com. Reads, sends, and \
-             (where cross-signing allows) decrypts E2EE messages on \
-             behalf of the authenticated user. Call `verify_status` if \
-             E2EE rooms appear to be missing or undecryptable.",
-        )
+        match self.mode {
+            ServiceMode::Full => {
+                ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                    .with_instructions(format!(
+                        "Matrix MCP server for {}. Reads, sends, and (where \
+                 cross-signing allows) decrypts E2EE messages on behalf of \
+                 the authenticated user. Call `verify_status` if E2EE rooms \
+                 appear to be missing or undecryptable.",
+                        self.deployment.server_name
+                    ))
+            }
+            ServiceMode::Channel => {
+                let mut capabilities = ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_experimental()
+                    .build();
+                // Presence of this key is the whole registration mechanism:
+                // the client reads it from the initialize result and starts
+                // listening for `notifications/claude/channel`. The value is
+                // specified as always empty.
+                if let Some(experimental) = capabilities.experimental.as_mut() {
+                    experimental.insert(CHANNEL_CAPABILITY.to_owned(), serde_json::Map::new());
+                }
+                ServerInfo::new(capabilities).with_instructions(format!(
+                    "Matrix channel for {}. {CHANNEL_INSTRUCTIONS}",
+                    self.deployment.server_name
+                ))
+            }
+        }
     }
+
+    /// Register this session so the sync task can push events to it.
+    ///
+    /// This is the earliest hook that sees both the peer and the
+    /// authenticated identity. Nothing happens on the full mount: a client
+    /// that did not ask to be a channel must never be pushed to.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        if self.mode != ServiceMode::Channel {
+            return;
+        }
+        let Some(parts) = context.extensions.get::<http::request::Parts>() else {
+            tracing::warn!("channel session initialized without HTTP parts; not registered");
+            return;
+        };
+        let Some(identity) = parts.extensions.get::<AuthenticatedIdentity>() else {
+            tracing::warn!("channel session initialized without identity; not registered");
+            return;
+        };
+        let session_key = session_key_from_parts(parts);
+        self.channel
+            .register(&identity.mxid, session_key, context.peer.clone())
+            .await;
+        tracing::info!(mxid = %identity.mxid, "channel session ready");
+
+        // Hand the new session anything that arrived while nothing was
+        // listening. Off the request path: the handshake must not block on
+        // history, and a replay failure must not fail the session.
+        let Some(AccessToken(token)) = parts.extensions.get::<AccessToken>().cloned() else {
+            return;
+        };
+        let identity = identity.clone();
+        let clients = self.clients.clone();
+        let registry = self.channel.clone();
+        tokio::spawn(async move {
+            match clients.for_user(&identity, &token).await {
+                Ok(client) => {
+                    crate::channel::replay_missed(
+                        (*client).clone(),
+                        identity.mxid.clone(),
+                        registry,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(mxid = %identity.mxid, error = %e, "channel replay skipped");
+                }
+            }
+        });
+    }
+}
+
+/// Stable key for one MCP session.
+///
+/// The transport's own session id when present, which is what makes a replayed
+/// handshake replace its entry rather than add a second one. A session that
+/// somehow has no id still gets a unique key, so two such sessions never
+/// collide and silently evict each other — they just cannot be deduplicated.
+fn session_key_from_parts(parts: &http::request::Parts) -> String {
+    parts
+        .headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(
+            || {
+                static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("anon-{n}")
+            },
+            str::to_owned,
+        )
 }
 
 // ---------------------------------------------------------------------
@@ -7540,7 +7849,7 @@ impl MatrixMcpService {
 /// at least one sibling in the same batch has `rel_type: "m.thread"` pointing
 /// at its `event_id`. The `unsigned["m.relations"]["m.thread"]["count"]` field
 /// (when present) is surfaced as `thread_event_count`.
-fn read_events_from_chunk(
+pub fn read_events_from_chunk(
     chunk: Vec<matrix_sdk::deserialized_responses::TimelineEvent>,
 ) -> Vec<ReadEvent> {
     // First pass: deserialise every event and collect the set of event ids
