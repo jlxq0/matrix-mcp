@@ -66,10 +66,6 @@ const ENV_STORE_DIR: &str = "MATRIX_MCP_STORE_DIR";
 /// every user's on-disk crypto store, so it's the Option-A passphrase
 /// model's whole trust anchor — handled with care.
 const ENV_STORE_PEPPER: &str = "MATRIX_MCP_STORE_PEPPER";
-
-/// Per-account Secret Storage recovery keys, as a JSON object mapping MXID to
-/// key. See [`RecoveryKeys`].
-const ENV_RECOVERY_KEYS: &str = "MATRIX_MCP_RECOVERY_KEYS";
 /// Per-identity read quota (per minute). Reads = `whoami`,
 /// `list_joined_rooms`, `read_recent_messages`, `verify_status`.
 const ENV_RATE_LIMIT_READS: &str = "MATRIX_MCP_RATE_LIMIT_READS_PER_MIN";
@@ -143,9 +139,6 @@ pub struct Config {
     /// was built or configured without E2EE (e.g. unit tests, Phase 1/2
     /// smoke deploys); in production `from_env` requires it.
     pub store: Option<StoreConfig>,
-    /// Secret Storage recovery keys for accounts that cannot run `/setup`.
-    /// Empty unless the operator configured any.
-    pub recovery_keys: RecoveryKeys,
     /// Per-minute read quota (Phase 6.1). 0 is rejected at parse time.
     pub rate_limit_reads_per_min: u32,
     /// Per-minute write quota (Phase 6.1). 0 is rejected at parse time.
@@ -224,91 +217,6 @@ impl std::fmt::Debug for StoreConfig {
     }
 }
 
-/// Secret Storage recovery keys the operator supplies, keyed by MXID.
-///
-/// ## Why this exists
-///
-/// `/setup` is how a cross-signing identity is imported into this deployment,
-/// and it is a browser flow: the user signs in at MAS, then pastes the
-/// recovery key their Element produced. That assumes a human.
-///
-/// A **bot account has no human**. Nobody signs into it, so nobody can run
-/// `/setup`, and its identity therefore lives in exactly one place — this
-/// deployment's encrypted store. Lose the volume, move the deployment, or
-/// rebuild the store for any reason and the identity is stranded: the
-/// homeserver still holds a master key, so `bootstrap_cross_signing`
-/// correctly refuses to mint another, and there is no way back in.
-///
-/// Configuring a recovery key here gives such an account the same recovery
-/// path a human gets, without a browser. On building a client for a listed
-/// MXID, the deployment imports the identity exactly as `/setup` would.
-///
-/// Deliberately **per-account**, not one deployment-wide secret: this server
-/// is multi-user, and one shared recovery secret across every user would be a
-/// far worse bug than the one it fixes.
-///
-/// Format — a JSON object in `MATRIX_MCP_RECOVERY_KEYS`, sourced from the same
-/// secret store as the pepper:
-///
-/// ```text
-/// {"@bot:example.com":"EsTc 1234 ...","@other:example.com":"EsTd ..."}
-/// ```
-#[derive(Clone, Default)]
-pub struct RecoveryKeys(std::collections::HashMap<String, String>);
-
-impl RecoveryKeys {
-    /// The recovery key configured for `mxid`, if any.
-    #[must_use]
-    pub fn get(&self, mxid: &str) -> Option<&str> {
-        self.0.get(mxid).map(String::as_str)
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// MXIDs a key is configured for. Safe to log; the keys are not.
-    pub fn accounts(&self) -> impl Iterator<Item = &str> {
-        self.0.keys().map(String::as_str)
-    }
-}
-
-/// Prints which accounts are configured, never the keys. `Config` derives
-/// `Debug`, and a recovery key is as sensitive as the account itself: it
-/// reconstructs the cross-signing identity and unlocks key backup.
-impl std::fmt::Debug for RecoveryKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecoveryKeys")
-            .field("accounts", &self.0.keys().collect::<Vec<_>>())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Parse `MATRIX_MCP_RECOVERY_KEYS`. Absent or empty yields no keys.
-///
-/// A malformed value is an error rather than a warning: the operator set it
-/// intending recovery to work, and silently continuing without it would strand
-/// exactly the account they were protecting.
-fn parse_recovery_keys(raw: Option<String>) -> Result<RecoveryKeys> {
-    let Some(raw) = raw.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) else {
-        return Ok(RecoveryKeys::default());
-    };
-    let parsed: std::collections::HashMap<String, String> = serde_json::from_str(&raw)
-        .with_context(|| {
-            format!("{ENV_RECOVERY_KEYS} must be a JSON object mapping MXID to recovery key")
-        })?;
-    for (mxid, key) in &parsed {
-        if !mxid.starts_with('@') || !mxid.contains(':') {
-            anyhow::bail!("{ENV_RECOVERY_KEYS}: {mxid:?} is not a full MXID");
-        }
-        if key.trim().is_empty() {
-            anyhow::bail!("{ENV_RECOVERY_KEYS}: empty recovery key for {mxid}");
-        }
-    }
-    Ok(RecoveryKeys(parsed))
-}
-
 #[derive(Clone)]
 pub struct IntrospectionCredentials {
     pub client_id: String,
@@ -369,7 +277,6 @@ impl Config {
             homeserver_url,
             introspection: None,
             store: None,
-            recovery_keys: RecoveryKeys::default(),
             rate_limit_reads_per_min: DEFAULT_RATE_LIMIT_READS,
             rate_limit_writes_per_min: DEFAULT_RATE_LIMIT_WRITES,
             download_max_bytes: DEFAULT_DOWNLOAD_MAX_BYTES,
@@ -474,11 +381,6 @@ impl Config {
         cfg.trusted_proxy_hops = parse_trusted_proxy_hops()?;
         cfg.device_id = device_id;
         cfg.allowed_origins = parse_allowed_origins(std::env::var(ENV_ALLOWED_ORIGINS).ok());
-        cfg.recovery_keys = parse_recovery_keys(std::env::var(ENV_RECOVERY_KEYS).ok())?;
-        if !cfg.recovery_keys.is_empty() {
-            let accounts: Vec<&str> = cfg.recovery_keys.accounts().collect();
-            tracing::info!(?accounts, "Secret Storage recovery configured");
-        }
         if let Some(tts) = parse_tts_config()? {
             cfg = cfg.with_tts(tts);
         }
@@ -804,61 +706,6 @@ mod tests {
             cfg.metrics_bind_addr,
             SocketAddr::from(([127, 0, 0, 1], 9090)),
             "Config::new must default to loopback, not 0.0.0.0"
-        );
-    }
-
-    #[test]
-    fn recovery_keys_absent_or_empty_yields_none() {
-        assert!(parse_recovery_keys(None).unwrap().is_empty());
-        assert!(parse_recovery_keys(Some(String::new())).unwrap().is_empty());
-        assert!(
-            parse_recovery_keys(Some("   ".to_owned()))
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn recovery_keys_parse_per_account() {
-        let keys = parse_recovery_keys(Some(
-            r#"{"@bot:example.com":"EsTc key","@other:example.com":"EsTd key"}"#.to_owned(),
-        ))
-        .unwrap();
-        assert_eq!(keys.get("@bot:example.com"), Some("EsTc key"));
-        assert_eq!(keys.get("@nobody:example.com"), None);
-    }
-
-    #[test]
-    fn malformed_recovery_keys_are_an_error_not_a_shrug() {
-        // The operator set this intending recovery to work. Continuing
-        // without it would strand exactly the account they were protecting.
-        assert!(parse_recovery_keys(Some("not json".to_owned())).is_err());
-        assert!(
-            parse_recovery_keys(Some(r#"{"bot":"k"}"#.to_owned())).is_err(),
-            "not an MXID"
-        );
-        assert!(
-            parse_recovery_keys(Some(r#"{"@b:e.com":"  "}"#.to_owned())).is_err(),
-            "empty key"
-        );
-    }
-
-    #[test]
-    fn recovery_keys_never_print_their_values() {
-        // `Config` derives `Debug`, and a recovery key reconstructs the
-        // cross-signing identity and unlocks key backup.
-        let keys = parse_recovery_keys(Some(
-            r#"{"@bot:example.com":"SUPERSECRETRECOVERYKEY"}"#.to_owned(),
-        ))
-        .unwrap();
-        let rendered = format!("{keys:?}");
-        assert!(
-            !rendered.contains("SUPERSECRETRECOVERYKEY"),
-            "leaked: {rendered}"
-        );
-        assert!(
-            rendered.contains("@bot:example.com"),
-            "should still name the account"
         );
     }
 }

@@ -17,7 +17,6 @@ matrix-mcp deployment.
 | `MATRIX_MCP_INTROSPECTION_CLIENT_SECRET` | yes | – | OAuth client secret paired with the id above. |
 | `MATRIX_MCP_STORE_DIR` | yes | – | Root directory for per-user SQLite stores. In production: PVC mount at `/var/lib/matrix-mcp`. |
 | `MATRIX_MCP_STORE_PEPPER` | yes | – | ≥32-byte high-entropy string. HKDF input for store-cipher key derivation. See pepper section below. |
-| `MATRIX_MCP_RECOVERY_KEYS` | no | – | JSON object mapping MXID to a Secret Storage recovery passphrase, for accounts that cannot run `/setup`. See "Recovery for accounts with no human" below. |
 | `MATRIX_MCP_BIND_ADDR` | no | `0.0.0.0:3000` | TCP bind for the public API. |
 | `MATRIX_MCP_METRICS_BIND_ADDR` | no | `{POD_IP}:9090` | TCP bind for Prometheus metrics. Never `0.0.0.0` by default. |
 | `POD_IP` | no (k8s injects) | – | Pod IP from downward API. Used to derive the metrics bind address. |
@@ -206,39 +205,47 @@ No data is lost; the existing store remains valid.
 browser flow: sign in at MAS, paste the recovery key Element produced. That
 assumes somebody can sign in.
 
-A **bot account has nobody**. Its identity therefore lives in exactly one
+A **bot account has nobody**. Its identity would therefore live in exactly one
 place — this deployment's encrypted store. Lose the volume, move the
 deployment, or rebuild the store, and the identity is stranded: the homeserver
 still holds a master key, so `bootstrap_cross_signing` correctly refuses to
-mint a second one, and there is no way back in. The account is left
-permanently unverifiable.
+mint a second one, and the account is left permanently unverifiable.
 
-`MATRIX_MCP_RECOVERY_KEYS` closes that. The operator picks a passphrase per
-account and stores it beside the pepper:
+**Nothing needs configuring.** When `bootstrap_cross_signing` creates an
+identity, it also writes it to Secret Storage under a passphrase derived from
+the pepper and the MXID:
 
-```json
-{"@bot:example.com":"correct-horse-battery-staple","@other:example.com":"…"}
+```text
+passphrase = HKDF-SHA256(salt = mxid, ikm = pepper,
+                         info = "matrix-mcp-recovery v1")
 ```
 
-Two things then happen automatically:
+the same construction [`derive_store_passphrase`] already uses for the store
+cipher, with a different `info` string. When a client is built for that account
+later — on another pod, after a volume loss, in a fresh deployment — the
+identity is imported back automatically.
 
-- **On `bootstrap_cross_signing`**, the new identity is written to Secret
-  Storage under that passphrase. It is not a value the tool returns — the
-  operator chose it, so nothing sensitive travels back through a tool result
-  and into a client's transcript.
-- **On building a client** for a listed account, the identity is imported from
-  Secret Storage. This is the same `recovery().recover()` call `/setup` makes;
-  only the source of the secret differs.
+This was first built as an operator-maintained map of per-account passphrases.
+That was the wrong shape: this server accepts any active token, so anyone can
+connect any number of accounts, and a feature that needs the operator to add a
+line before each one works is not really available to them.
 
-Deliberately per-account rather than one deployment-wide secret: this server is
-multi-user, and a shared recovery secret across every user would be a worse bug
-than the one it fixes. Accounts not listed are unaffected.
+### What this does and does not grant
 
-The passphrase is as sensitive as the account. It reconstructs the
-cross-signing identity and unlocks key backup, so it belongs in the same secret
-store as the pepper and never in a manifest. `Config` derives `Debug`; the
-recovery map prints its account names and never its values, and there is a test
-that fails if that regresses.
+It grants nobody anything new. The pepper already decrypts every per-user
+store, and those stores already contain the same cross-signing private keys.
+Anyone holding the pepper could read them before this existed.
+
+It never touches a human's identity. The passphrase is only ever *written* by
+`bootstrap_cross_signing`, which refuses to run on an account that already has
+a cross-signing identity — so it only ever applies to accounts this deployment
+set up itself. Reading is a `recover()` attempt that simply fails for every
+human user, whose Secret Storage is locked with their own key and is left
+untouched. `/setup` remains the route for those.
+
+Pepper rotation is already documented as destructive to the stores. It is
+equally destructive here: rotate it and previously created identities can no
+longer be recovered.
 
 ### One matrix-sdk client per device
 
