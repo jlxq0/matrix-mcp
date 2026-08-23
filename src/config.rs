@@ -41,7 +41,7 @@ const ENV_POD_IP: &str = "POD_IP";
 /// OAuth client id we authenticate with against MAS's introspection endpoint.
 /// Issued out-of-band (pre-registered or via `DCR`).
 const ENV_INTROSPECTION_CLIENT_ID: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_ID";
-/// OAuth client secret paired with the id above. Loaded from 1Password via
+/// OAuth client secret paired with the id above. Supplied by the operator via
 /// `ExternalSecret` in production.
 const ENV_INTROSPECTION_CLIENT_SECRET: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_SECRET";
 /// Public URL of the Matrix homeserver this MCP server talks to. We
@@ -61,7 +61,7 @@ const ENV_SERVER_NAME: &str = "MATRIX_MCP_SERVER_NAME";
 /// subject + device id) gets a subdirectory named `sha256(owner_key)[..32]`.
 const ENV_STORE_DIR: &str = "MATRIX_MCP_STORE_DIR";
 /// Pepper used to derive per-user store-cipher keys via
-/// `HKDF-SHA256(salt=mxid, ikm=pepper)`. Stored in 1Password, loaded as
+/// `HKDF-SHA256(salt=mxid, ikm=pepper)`. Held in your secret manager, loaded as
 /// a Kubernetes Secret. Compromise of this single value compromises
 /// every user's on-disk crypto store, so it's the Option-A passphrase
 /// model's whole trust anchor — handled with care.

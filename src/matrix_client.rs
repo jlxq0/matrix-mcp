@@ -29,10 +29,10 @@
 //!                            len  = 32 bytes) → hex
 //! ```
 //!
-//! `pepper` is a single deployment-wide secret in 1Password
-//! (`MATRIX_MCP_STORE_PEPPER`). Per-user passphrases never appear in
-//! 1Password — they're derived deterministically from the pepper + MXID at
-//! runtime. Pepper rotation is destructive (invalidates every user's store; users will be
+//! `pepper` is a single deployment-wide secret
+//! (`MATRIX_MCP_STORE_PEPPER`), held wherever you keep secrets. Per-user
+//! passphrases are never stored anywhere — they're derived deterministically
+//! from the pepper + MXID at runtime. Pepper rotation is destructive (invalidates every user's store; users will be
 //! re-prompted to verify the matrix-mcp device in Element X). That's a
 //! known property, not a bug.
 //!

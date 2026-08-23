@@ -13,7 +13,17 @@ the device is cross-signed, which `/setup` arranges with your recovery key.
 
 ## What you get
 
-~58 tools, all carrying MCP annotations (`read_only_hint`,
+Two mounts, sharing one deployment's auth, clients and encrypted stores:
+
+| Mount | For | Shape |
+|---|---|---|
+| `/mcp` | claude.ai, Claude Code, any MCP client | ~61 tools. You ask, it answers |
+| `/channel` | agents that must react while nobody is watching | Pushes inbound Matrix messages into a running [Claude Code](https://code.claude.com) session, plus a scoped seven-tool subset |
+
+See [Push Matrix into a running agent](#push-matrix-into-a-running-agent) for
+the second one.
+
+Two surfaces, and ~61 tools carrying MCP annotations (`read_only_hint`,
 `destructive_hint`, `idempotent_hint`) so client UIs can auto-approve reads
 and warn before writes.
 
@@ -44,6 +54,69 @@ and warn before writes.
 See [`docs/api-reference.md`](docs/api-reference.md) for arguments and
 return shapes.
 
+## Push Matrix into a running agent
+
+A [Claude Code channel](https://code.claude.com/docs/en/channels) is an MCP
+server that pushes events into a session that is already open, so the agent
+reacts to things happening while you are away from the terminal. `/channel`
+implements it for Matrix: message the account from your phone and it lands in
+the session's context; the agent answers in the room.
+
+Point a session at it — the token is any Matrix access token for the account,
+so a bot registered however you like works:
+
+```json
+{ "mcpServers": { "matrix": {
+    "type": "http",
+    "url": "https://matrix-mcp.your-domain.example/channel",
+    "headers": { "Authorization": "Bearer ${MATRIX_TOKEN}" } } } }
+```
+
+```sh
+export MATRIX_TOKEN=...            # from your secret manager, not a file
+claude --dangerously-load-development-channels server:matrix
+```
+
+The flag is not a testing step. During the channels research preview
+`--channels` accepts only plugins on an Anthropic-maintained allowlist, and a
+private marketplace does not qualify, so any self-hosted channel uses the
+development flag permanently. It shows a full-screen confirmation at startup.
+Channels also need Anthropic authentication (claude.ai or a Console key) and
+are unavailable on Bedrock, Vertex and Foundry.
+
+**Nothing is pushed until you say who may push.** The sender allowlist lives in
+the account's own Matrix account data, so each account configures itself:
+
+```jsonc
+// event type: app.matrix_mcp.channel
+{ "allowed_senders": ["@you:your-domain.example"] }
+```
+
+Absent or empty means nothing is delivered. An ungated channel is a
+prompt-injection vector: message bodies reach a model holding live credentials
+with no human turn in front of them. Gating is on the **sender**, never the
+room, because those differ in a group. Bodies are wrapped and escaped by the
+same content sandbox the read tools use, and anything tripping the injection
+heuristic is tagged `suspicious="true"`.
+
+Messages that arrive while no session is listening are replayed when one
+attaches, watermarked by the account's own read receipt. The server never
+writes that receipt itself — it cannot observe delivery — so the agent
+acknowledges with `mark_read` and delivery is at-least-once.
+
+### Accounts with no human
+
+A bot cannot run the browser `/setup` flow, so `bootstrap_cross_signing`
+creates its cross-signing identity directly and writes it to Secret Storage
+under a passphrase derived from your pepper. Recovery therefore survives losing
+the volume, with nothing to configure. It refuses to run where an identity
+already exists, so it can never reset one.
+
+**One matrix-sdk client per access token.** Two clients on one device id both
+generate identity keys, only one set is advertised, and the loser decrypts
+nothing while looking perfectly healthy. Reissuing the token does not fix it.
+Give every consumer its own account.
+
 ## Prerequisites
 
 - A Synapse homeserver (≥ 1.130) with
@@ -68,11 +141,11 @@ docker run --rm -p 3000:3000 \
   -e MATRIX_MCP_INTROSPECTION_CLIENT_SECRET=... \
   -e MATRIX_MCP_STORE_DIR=/var/lib/matrix-mcp \
   -e MATRIX_MCP_STORE_PEPPER="$(openssl rand -hex 32)" \
-  forge.oddie.app/jlxq0/matrix-mcp:v0.6.0
+  forge.oddie.app/jlxq0/matrix-mcp:v0.9.0
 ```
 
-Then point a public hostname at it over HTTPS (claude.ai requires
-`https://`) and follow [`docs/onboarding.md`](docs/onboarding.md) to
+The image is public — no registry account needed. Then point a public
+hostname at it over HTTPS (claude.ai requires `https://`) and follow [`docs/onboarding.md`](docs/onboarding.md) to
 connect. For a Kubernetes deployment with cert-manager, External
 Secrets, and Traefik Gateway API, see
 [`docs/installation.md`](docs/installation.md). For a single-host
@@ -127,7 +200,7 @@ otherwise. Conventional Commits for messages.
 | [`docs/installation.md`](docs/installation.md) | Deploy on a VPS or Kubernetes |
 | [`docs/architecture.md`](docs/architecture.md) | Component diagrams, OAuth dance, sync loop, storage layout |
 | [`docs/api-reference.md`](docs/api-reference.md) | Arguments + return shapes for the most-used tools (full set returned by `tools/list`) |
-| [`docs/operations.md`](docs/operations.md) | Running in production, debug recipes, pepper rotation |
+| [`docs/operations.md`](docs/operations.md) | Running in production, debug recipes, pepper rotation, recovery for accounts with no human |
 | [`docs/security.md`](docs/security.md) | Implementation-level security notes |
 | [`docs/multi-user.md`](docs/multi-user.md) | Multi-user isolation guarantees |
 | [`docs/cross-signing-recover-flow.md`](docs/cross-signing-recover-flow.md) | E2EE bootstrap, recovery, auto-rotating device id |
