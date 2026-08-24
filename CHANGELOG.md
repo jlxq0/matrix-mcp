@@ -7,6 +7,12 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 ## [Unreleased]
 
 ### Added
+- Release images are mirrored to `ghcr.io/jlxq0/matrix-mcp`, and the image
+  carries standard OCI annotations so the package page links back to the
+  repository, README and licence. The mirror is a registry-to-registry copy of
+  the already-published artifact rather than a second build, and it cannot fail
+  a release: GHCR previously ran inside the build step, where a stale token
+  took a whole tag down with it.
 - **Secret Storage recovery for accounts with no human.** `/setup` is a browser
   flow, so a bot account can never use it, and its cross-signing identity would
   exist only in this deployment's store — lose the volume and it is stranded

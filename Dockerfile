@@ -46,6 +46,17 @@ RUN cargo build --release --locked
 #     "https://gcr.io/v2/distroless/cc-debian12/manifests/nonroot" | grep docker-content-digest
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
 
+# Standard OCI annotations. `image.source` is what makes a registry link the
+# package back to its repository — without it the GHCR package page shows no
+# code, no README and no licence, which is a poor front door for something
+# people are meant to self-host.
+LABEL org.opencontainers.image.source="https://github.com/jlxq0/matrix-mcp" \
+      org.opencontainers.image.url="https://github.com/jlxq0/matrix-mcp" \
+      org.opencontainers.image.documentation="https://github.com/jlxq0/matrix-mcp#readme" \
+      org.opencontainers.image.title="matrix-mcp" \
+      org.opencontainers.image.description="Remote MCP server exposing Matrix — including E2EE rooms — to AI clients, with a Claude Code channel surface" \
+      org.opencontainers.image.licenses="MIT"
+
 WORKDIR /app
 COPY --from=builder /build/target/release/matrix-mcp /app/matrix-mcp
 
