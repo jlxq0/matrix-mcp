@@ -67,7 +67,7 @@ use rmcp::model::{CustomNotification, ServerNotification};
 use rmcp::service::{Peer, RoleServer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// How long a fetched sender allowlist is reused before being re-read.
 ///
@@ -261,13 +261,22 @@ impl ChannelRegistry {
 
     /// Number of live peers for an identity, after sweeping closed ones.
     pub async fn live_peers(&self, mxid: &str) -> usize {
-        let mut guard = self.inner.write().await;
-        let live = guard.get_mut(mxid).map_or(0, |peers| {
-            peers.retain(|_, p| !p.is_transport_closed());
-            peers.len()
+        // Counts, never evicts. This used to `retain` on
+        // `is_transport_closed()`, which made a read-shaped call destructive:
+        // one false positive removed the peer permanently, every later message
+        // found an empty map, and the channel was dead for the rest of the
+        // session with nothing logged. Eviction belongs in `notify`, where a
+        // send has actually failed and the evidence is real.
+        let guard = self.inner.read().await;
+        let (total, closed) = guard.get(mxid).map_or((0, 0), |peers| {
+            let closed = peers.values().filter(|p| p.is_transport_closed()).count();
+            (peers.len(), closed)
         });
         drop(guard);
-        live
+        if closed > 0 {
+            info!(mxid = %mxid, total, closed, "channel: some peers report closed transport");
+        }
+        total - closed
     }
 
     /// Push one event to every live session for `mxid`.
@@ -284,8 +293,16 @@ impl ChannelRegistry {
             };
             // Sweep first: a send to a closed transport resolves Ok, so
             // without this a dead session would look like a live delivery.
+            let before = peers.len();
             peers.retain(|_, p| !p.is_transport_closed());
+            if peers.len() != before {
+                info!(
+                    mxid = %mxid, evicted = before - peers.len(), remaining = peers.len(),
+                    "channel: swept peers with closed transports"
+                );
+            }
             if peers.is_empty() {
+                info!(mxid = %mxid, "channel: no peers left after sweep; nothing written");
                 return 0;
             }
             let snapshot = peers.iter().map(|(k, p)| (k.clone(), p.clone())).collect();
@@ -645,10 +662,16 @@ async fn push_message(
 ) {
     // Cheapest checks first. Sync runs for every authenticated identity
     // whether or not an agent is attached, so the common case is no listener.
-    if registry.live_peers(mxid).await == 0 {
+    let live = registry.live_peers(mxid).await;
+    if live == 0 {
+        info!(mxid = %mxid, room = %room.room_id(), "channel: skipped, no live session");
         return;
     }
     if room.state() != RoomState::Joined {
+        info!(
+            mxid = %mxid, room = %room.room_id(), state = ?room.state(),
+            "channel: skipped, room not joined"
+        );
         return;
     }
     // Never feed an identity its own messages. Without this an agent's reply
@@ -661,12 +684,16 @@ async fn push_message(
     // inject into the session.
     let allowed = registry.allowlist(mxid, client).await;
     if !allowed.iter().any(|s| s == ev.sender.as_str()) {
-        debug!(mxid = %mxid, sender = %ev.sender, "channel: sender not allowlisted; dropped");
+        info!(
+            mxid = %mxid, sender = %ev.sender, allowed = allowed.len(),
+            "channel: skipped, sender not allowlisted"
+        );
         return;
     }
     // Text only for now. Images and files carry a body too, but pushing their
     // filename as if it were a message would misrepresent what arrived.
     let MessageType::Text(text) = &ev.content.msgtype else {
+        info!(mxid = %mxid, room = %room.room_id(), "channel: skipped, not an m.text message");
         return;
     };
 
@@ -694,7 +721,11 @@ async fn push_message(
         .await;
     // Deliberately no read receipt here — see the note above `replay_missed`.
     // The count says the bytes were written, not that anybody read them.
-    debug!(mxid = %mxid, room = %room.room_id(), written = delivered, "channel: pushed");
+    info!(
+        mxid = %mxid, room = %room.room_id(), event = %ev.event_id,
+        live = live, written = delivered, suspicious = verdict.suspicious,
+        "channel: pushed"
+    );
 }
 
 #[cfg(test)]
