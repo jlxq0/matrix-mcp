@@ -144,7 +144,13 @@ docker run --rm -p 3000:3000 \
   forge.oddie.app/jlxq0/matrix-mcp:v0.9.0
 ```
 
-The image is public — no registry account needed. Then point a public
+The image is public on both registries — no account needed:
+
+```text
+forge.oddie.app/jlxq0/matrix-mcp:v0.9.0     # canonical
+ghcr.io/jlxq0/matrix-mcp:v0.9.0             # mirror, identical by digest
+```
+ Then point a public
 hostname at it over HTTPS (claude.ai requires `https://`) and follow [`docs/onboarding.md`](docs/onboarding.md) to
 connect. For a Kubernetes deployment with cert-manager, External
 Secrets, and Traefik Gateway API, see
