@@ -328,8 +328,10 @@ power level is below the room's `redact` threshold, you get an error.
 ## download_attachment
 
 Download an attachment from a Matrix room event (`m.file`, `m.image`,
-`m.audio`, or `m.video`) and return it as base64. The SDK handles
-E2EE decryption transparently. Attachments larger than
+`m.audio`, or `m.video`) and return it as base64 — standard alphabet,
+padded, no line breaks, so a strict decoder takes it with no fix-up.
+`size_bytes` is the decoded length; compare the two to know the file
+arrived whole. The SDK handles E2EE decryption transparently. Attachments larger than
 `MATRIX_MCP_DOWNLOAD_MAX_BYTES` (default 5 MiB) are rejected before
 any media I/O.
 

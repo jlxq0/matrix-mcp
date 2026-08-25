@@ -70,3 +70,16 @@
   rewrite. A thirteenth attribute, `chunks_exact_to_as_chunks`, *was* removable
   and was removed: its comment claimed `as_chunks::<2>()` postdated the MSRV,
   and it compiles on 1.93.0. Check that claim before trusting the next one.
+- **This crate needs two different base64 alphabets and the wrong one fails
+  silently on half its inputs.** PKCE in `setup.rs` requires `URL_SAFE_NO_PAD`
+  — RFC 7636 specifies unpadded — while `download_attachment`'s `body_base64`
+  requires padded `STANDARD`, because Python's `b64decode`, Rust's `STANDARD`
+  and Go's `StdEncoding` all reject unpadded input while Node's `Buffer.from`
+  and `atob` accept it. It shipped as `STANDARD_NO_PAD` and reached production
+  in `v0.10.3`; the other fields came back correct, so the first caller to hit
+  it read a decoder error as a corrupt or still-encrypted file. Encoding is
+  `encode_attachment`, in one place, with the reason on it.
+
+  A payload whose length is a multiple of three encodes identically with and
+  without padding, so any fixture of that length is blind to this. Test 3n+1
+  and 3n+2 and decode strictly.

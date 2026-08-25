@@ -2322,6 +2322,44 @@ pub struct DownloadAttachmentParams {
     pub event_id: String,
 }
 
+/// Build the result from one buffer, so `size_bytes` and `body_base64`
+/// cannot describe different bytes.
+///
+/// They are the pair a caller checks to decide the file arrived whole, and
+/// assembling them at the call site made that pairing a convention rather than
+/// a structure — the two fields could be given different buffers and nothing
+/// would notice. Taking one `bytes` makes the agreement hold by construction
+/// and, more usefully, makes it testable without a homeserver.
+fn attachment_result(
+    bytes: &[u8],
+    content_type: String,
+    filename: Option<String>,
+) -> DownloadAttachmentResult {
+    DownloadAttachmentResult {
+        content_type,
+        size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        body_base64: encode_attachment(bytes),
+        filename,
+    }
+}
+
+/// Encode attachment bytes for [`DownloadAttachmentResult::body_base64`].
+///
+/// **Padded**, standard alphabet. This shipped as `STANDARD_NO_PAD` while the
+/// field documented the standard alphabet, and standard-alphabet base64 is
+/// padded: Python's `base64.b64decode`, Rust's `STANDARD` engine and Go's
+/// `StdEncoding` all reject unpadded input, while Node's `Buffer.from` and
+/// `atob` accept it. So the first caller to try it decided whether the bug was
+/// visible at all — and when it did fail, `content_type`, `size_bytes` and
+/// `filename` were all correct, so it read as a corrupt or still-encrypted
+/// file rather than as an encoding fault.
+///
+/// Do not "simplify" this back to `STANDARD_NO_PAD`. Adding padding is
+/// backwards-compatible; removing it is not.
+fn encode_attachment(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DownloadAttachmentResult {
     /// MIME type reported by the event's `info.mimetype` field,
@@ -2329,7 +2367,9 @@ pub struct DownloadAttachmentResult {
     pub content_type: String,
     /// Number of bytes in the decoded attachment.
     pub size_bytes: u64,
-    /// Base64-encoded (standard alphabet, no line breaks) file contents.
+    /// Base64-encoded file contents: standard alphabet, **padded**, no
+    /// line breaks. Decodes with a strict decoder — `base64.b64decode` in
+    /// Python, `STANDARD` in Rust, `StdEncoding` in Go — with no fix-up.
     pub body_base64: String,
     /// Original filename from the event (`filename` field, falling back
     /// to `body`), or `null` if the event type doesn't carry one.
@@ -5175,16 +5215,10 @@ impl MatrixMcpService {
                 ));
             }
 
-            let body_base64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes);
             let content_type =
                 mimetype.unwrap_or_else(|| "application/octet-stream".to_owned());
 
-            structured_result(&DownloadAttachmentResult {
-                content_type,
-                size_bytes,
-                body_base64,
-                filename,
-            })
+            structured_result(&attachment_result(&bytes, content_type, filename))
         }
         .instrument(span.clone())
         .await;
@@ -8390,6 +8424,80 @@ mod tests {
         assert!(validate_reaction_key(&at_limit).is_ok());
         let oversized = "a".repeat(MAX_REACTION_KEY_BYTES + 1);
         assert!(validate_reaction_key(&oversized).is_err());
+    }
+
+    #[test]
+    fn an_attachment_body_decodes_with_a_strict_decoder() {
+        // The shape of the bug this replaced: a payload whose length is a
+        // multiple of 3 encodes identically padded and unpadded, so a fixture
+        // of that length cannot see the fault at all. The 3n+1 and 3n+2 cases
+        // are the only ones that can, so both are here.
+        //
+        // Both halves are independently load-bearing, which was measured
+        // rather than assumed: with the padding-length assertion deleted and
+        // `STANDARD_NO_PAD` restored, the decode alone still fails with
+        // `InvalidPadding`. So `STANDARD` genuinely requires canonical padding
+        // here and this is not the WAV test's situation, where two mechanisms
+        // enforced one property and either could be removed unseen.
+        //
+        // The blind spot is the call site: a different engine written inline
+        // instead of calling `encode_attachment` is invisible here. That is
+        // why `attachment_result` exists and why the case below goes through
+        // it.
+        use base64::Engine as _;
+        for len in [0usize, 1, 2, 3, 4, 5, 1_000, 1_001, 1_002] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i % 251).unwrap_or(0))
+                .collect();
+            let encoded = encode_attachment(&bytes);
+            assert_eq!(
+                encoded.len() % 4,
+                0,
+                "len {len}: standard base64 is padded to a multiple of four"
+            );
+            let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded);
+            assert!(
+                decoded.is_ok(),
+                "len {len}: a strict decoder rejected the body: {decoded:?}"
+            );
+            let decoded = decoded.unwrap_or_default();
+            // `size_bytes` is the decoded length, and the pair is the contract:
+            // a caller checks one against the other to decide the file arrived
+            // whole. That check is what the missing padding was breaking.
+            assert_eq!(
+                decoded.len(),
+                len,
+                "len {len}: decoded length is size_bytes"
+            );
+            assert_eq!(decoded, bytes, "len {len}: round trip");
+        }
+    }
+
+    #[test]
+    fn size_bytes_and_body_base64_describe_the_same_bytes() {
+        // The pair is the contract: a caller decodes `body_base64` and checks
+        // its length against `size_bytes` to decide the file arrived whole.
+        // Assembling the two at the call site made that a convention — nothing
+        // stopped them being given different buffers — so `attachment_result`
+        // takes one `bytes` and this asserts the pairing on what it emits,
+        // rather than on a fixture length the test chose itself.
+        use base64::Engine as _;
+        for len in [0usize, 1, 2, 1_001] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i % 251).unwrap_or(0))
+                .collect();
+            let result = attachment_result(&bytes, "image/png".to_owned(), None);
+            let decoded = base64::engine::general_purpose::STANDARD.decode(&result.body_base64);
+            assert!(
+                decoded.is_ok(),
+                "len {len}: a strict decoder rejected the emitted body: {decoded:?}"
+            );
+            assert_eq!(
+                u64::try_from(decoded.unwrap_or_default().len()).unwrap_or(u64::MAX),
+                result.size_bytes,
+                "len {len}: decoded body_base64 must be size_bytes long"
+            );
+        }
     }
 
     #[test]
