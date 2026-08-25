@@ -144,8 +144,39 @@ fn cap_wrapped(wrapped: &str) -> std::borrow::Cow<'_, str> {
 /// Per-identity map of live sessions, keyed by session key.
 type PeerMap = HashMap<String, Peer<RoleServer>>;
 
-/// Fetched allowlists by MXID, with the time each was read.
-type AllowlistCache = HashMap<String, (Instant, Vec<String>)>;
+/// Fetched channel configs by MXID, with the time each was read.
+type ConfigCache = HashMap<String, (Instant, ChannelConfigEventContent)>;
+
+/// One outstanding permission prompt.
+struct Pending {
+    issued: Instant,
+    /// The session that asked. The verdict goes back to this peer and no
+    /// other: broadcasting would also work, since a client drops a verdict
+    /// for an id it did not issue, but it would leave us unable to say at our
+    /// own layer whether a verdict was ever routed anywhere.
+    session_key: String,
+    /// Distinguishes this entry from any later one reusing the same key.
+    ///
+    /// A delivery holds no lock while it awaits `send_notification`, so by
+    /// the time it succeeds the map may hold a *different* prompt at the same
+    /// `(mxid, request_id)` — an id can be reissued. Removing by key alone
+    /// would retire that newer prompt on the strength of an older delivery.
+    /// `Instant` cannot serve here: two entries created in the same tick
+    /// compare equal.
+    serial: u64,
+}
+
+/// Source of [`Pending::serial`]. Process-wide and monotonic; wrapping would
+/// need 2^64 permission prompts.
+static PENDING_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Outstanding prompts, keyed by `(mxid, request_id)`.
+///
+/// The MXID is part of the key, not just a stored field: five letters from a
+/// 25-letter alphabet is ~9.8M ids, so two identities colliding on one is
+/// unlikely but not impossible, and a bare-id key would let the later request
+/// silently evict the earlier one across an identity boundary.
+type PendingMap = HashMap<(String, String), Pending>;
 
 /// Clears an identity's in-flight replay flag however the pass ends.
 struct ReplayGuard {
@@ -168,6 +199,206 @@ pub const CHANNEL_CAPABILITY: &str = "claude/channel";
 /// The notification method Claude Code listens for once the capability above
 /// is declared.
 pub const CHANNEL_NOTIFICATION: &str = "notifications/claude/channel";
+
+/// Experimental capability key that opts this channel into **permission
+/// relay**: Claude Code forwards each tool-approval dialog here in parallel
+/// with the terminal one, and applies whichever verdict arrives first.
+///
+/// The value is specified as always `{}`. It must be *omitted* rather than set
+/// to `false` when not wanted — clients before 2.1.234 read `false` as
+/// declared.
+///
+/// Declaring it hands anyone who can push through this channel the ability to
+/// approve tool use in the session, so it belongs only on a mount that gates
+/// its inbound path on the sender. [`classify_inbound`] is where that gate
+/// meets the verdict branch.
+pub const PERMISSION_CAPABILITY: &str = "claude/channel/permission";
+
+/// Notification Claude Code sends when a tool-approval dialog opens.
+pub const PERMISSION_REQUEST_NOTIFICATION: &str = "notifications/claude/channel/permission_request";
+
+/// Notification carrying our verdict back. `{request_id, behavior}`.
+pub const PERMISSION_VERDICT_NOTIFICATION: &str = "notifications/claude/channel/permission";
+
+/// How long an issued request id stays answerable.
+///
+/// The map exists so a verdict goes to the session that asked, and so a
+/// verdict for an id we never issued is visibly dropped rather than
+/// broadcast. Entries must expire or a long-lived server accumulates one per
+/// permission prompt forever.
+// `Duration::from_mins` is unstable on our MSRV; same suppression as
+// `ALLOWLIST_TTL`.
+#[allow(clippy::duration_suboptimal_units)]
+const PENDING_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Hard cap on outstanding permission requests per process.
+///
+/// [`PENDING_TTL`] alone bounds the map only if requests arrive slower than
+/// they expire. A session in a tool-call loop can open prompts far faster than
+/// that, so the cap is what actually bounds the memory.
+const PENDING_MAX: usize = 256;
+
+/// Longest `description` carried into the Matrix prompt.
+///
+/// Claude Code relays up to 3,500 code points per field, and a message that
+/// long is unreadable on a phone. Both fields are capped so the reply
+/// instruction — the only place the request id appears — is never the part
+/// that gets cut.
+const PROMPT_DESCRIPTION_MAX: usize = 512;
+
+/// Longest `input_preview` carried into the Matrix prompt. Larger than
+/// [`PROMPT_DESCRIPTION_MAX`] because for a `Bash` call the preview is the
+/// command and the description may be the constant `Run shell command`.
+const PROMPT_PREVIEW_MAX: usize = 1536;
+
+/// Which way a relayed verdict goes. Serialised as the `behavior` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Behavior {
+    /// The tool call proceeds.
+    Allow,
+    /// The tool call is rejected, as if No had been chosen in the terminal.
+    Deny,
+}
+
+impl Behavior {
+    /// The wire value. Claude Code accepts exactly these two strings.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// What an inbound Matrix message is, once the sender gate has been applied.
+///
+/// The gate is a *parameter* rather than something the caller applies before
+/// calling, because "the allowlist check runs before the verdict branch" is
+/// the security property this whole feature turns on, and a property enforced
+/// by statement order in one long function is only observable end to end.
+/// Here a unit test can ask the question directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inbound {
+    /// A permission verdict for `request_id`. Never forwarded as chat.
+    Verdict {
+        request_id: String,
+        behavior: Behavior,
+    },
+    /// Ordinary text, to be pushed into the session's context.
+    Chat,
+    /// The sender is not allowlisted. Nothing happens, whatever the text says.
+    Ignored,
+}
+
+/// The verdict pattern, copied verbatim from Claude Code's channel reference.
+///
+/// `[a-km-z]` is the id alphabet: lowercase, no `l`, so it never reads as a
+/// `1` or an `I` when typed on a phone. The case-insensitive flag is there
+/// because phone autocorrect capitalises the first word — and, with `(?i)`,
+/// the id too, which is why the capture is lowercased before it is used.
+static PERMISSION_REPLY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    regex::Regex::new(r"(?i)^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$")
+        .expect("the verdict pattern is a literal and compiles")
+});
+
+/// Whether a permission prompt may be sent into a room in this state.
+///
+/// `Client::get_room` reads the local state store and hands back Left,
+/// Invited, Knocked and Banned rooms as readily as joined ones, so `Some` is
+/// not "joined" — the trap #113 fixed in `download_attachment`.
+///
+/// Written as an allowlist of one rather than as `!= Left`: matrix-sdk may add
+/// a state, and a new one must default to *refused*. A prompt is a request for
+/// a tool approval, and sending it into a room this account is not a member of
+/// is the one outcome with no recovery.
+#[must_use]
+pub const fn prompt_room_is_usable(state: RoomState) -> bool {
+    matches!(state, RoomState::Joined)
+}
+
+/// Classify one inbound text message.
+///
+/// `sender_allowed` is the allowlist verdict for this message's sender. When
+/// it is false the answer is [`Inbound::Ignored`] **whatever the text is** —
+/// a stranger's `yes abcde` must never become a tool approval.
+#[must_use]
+pub fn classify_inbound(sender_allowed: bool, text: &str) -> Inbound {
+    if !sender_allowed {
+        return Inbound::Ignored;
+    }
+    let Some(caps) = PERMISSION_REPLY_RE.captures(text) else {
+        return Inbound::Chat;
+    };
+    // Both groups are non-optional in the pattern, so a match has both. The
+    // `else` arm is unreachable rather than a fallback; it exists because the
+    // crate denies `unwrap`.
+    let (Some(word), Some(id)) = (caps.get(1), caps.get(2)) else {
+        return Inbound::Chat;
+    };
+    let behavior = if word.as_str().to_ascii_lowercase().starts_with('y') {
+        Behavior::Allow
+    } else {
+        Behavior::Deny
+    };
+    Inbound::Verdict {
+        request_id: id.as_str().to_ascii_lowercase(),
+        behavior,
+    }
+}
+
+/// The four fields Claude Code sends with a permission prompt.
+///
+/// `description` and `input_preview` are sanitised and credential-masked by
+/// clients from 2.1.211 and 2.1.234 respectively, and neither is trusted here:
+/// they are the model's words about a tool call, and they are rendered to a
+/// human rather than fed back into a context.
+///
+/// Both text fields default to empty rather than being required. A relay that
+/// refuses the whole prompt because one descriptive string was absent would
+/// leave the session hanging on a dialog nobody can see.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PermissionRequest {
+    /// Five lowercase letters from `a`-`z` without `l`.
+    pub request_id: String,
+    /// `Bash`, `Write`, `Edit`, and so on.
+    pub tool_name: String,
+    /// What this specific call does. Never the command itself.
+    #[serde(default)]
+    pub description: String,
+    /// The call's arguments as JSON-shaped display text.
+    #[serde(default)]
+    pub input_preview: String,
+}
+
+/// Truncate on a character boundary, marking the cut.
+fn clip(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if text.len() <= max {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}…", &text[..end]))
+}
+
+/// Render a permission request as the Matrix message a human answers.
+///
+/// The id appears twice and verbatim, because the terminal dialog never
+/// displays it: this message is the only place it can be learned, and a reply
+/// without it matches nothing.
+#[must_use]
+pub fn format_prompt(request: &PermissionRequest) -> String {
+    let id = &request.request_id;
+    format!(
+        "Claude wants to run {}: {}\n{}\n\nReply \"yes {id}\" or \"no {id}\"",
+        request.tool_name,
+        clip(&request.description, PROMPT_DESCRIPTION_MAX),
+        clip(&request.input_preview, PROMPT_PREVIEW_MAX),
+    )
+}
 
 /// Tools offered on the `/channel` mount.
 ///
@@ -228,7 +459,17 @@ instead of complying.";
 #[derive(Clone, Default)]
 pub struct ChannelRegistry {
     inner: Arc<RwLock<HashMap<String, PeerMap>>>,
-    allowlists: Arc<RwLock<AllowlistCache>>,
+    configs: Arc<RwLock<ConfigCache>>,
+    /// Outstanding permission prompts. See [`PendingMap`].
+    pending: Arc<RwLock<PendingMap>>,
+    /// Per-MXID, the room an allowlisted message last arrived in.
+    ///
+    /// A permission request arrives on a peer with no room attached, so this
+    /// is where a prompt goes when the account data names no destination.
+    /// Written **only after** the allowlist gate passes — a stranger who DMs
+    /// the bot must not be able to redirect every future prompt into a room
+    /// he controls.
+    last_rooms: Arc<RwLock<HashMap<String, String>>>,
     /// Identities with a replay pass in flight, so two sessions attaching at
     /// once do not each walk every room.
     ///
@@ -398,51 +639,252 @@ pub struct ChannelConfigEventContent {
     /// are mutable and anyone can set one to impersonate anyone else.
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+
+    /// Where permission prompts go, overriding the room traffic would pick.
+    ///
+    /// A permission request arrives on an MCP peer that carries no room, so
+    /// the destination has to come from somewhere else. Without this key it
+    /// comes from the last room an allowlisted sender wrote in — which is
+    /// inference, and which is nothing at all for a session that has had no
+    /// inbound message yet. This key is the deliberate statement, so it wins:
+    /// a configured destination cannot be moved by traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_room: Option<String>,
 }
 
 impl ChannelRegistry {
-    /// The allowlist for an identity, re-read at most once per
+    /// The channel config for an identity, re-read at most once per
     /// [`ALLOWLIST_TTL`].
     ///
-    /// An absent or empty list means **nothing is pushed**. Failing closed is
-    /// deliberate: the failure mode of an over-permissive default is that any
-    /// stranger who can find the bot gets to put text in front of a model
-    /// holding live credentials.
-    async fn allowlist(&self, mxid: &str, client: &Client) -> Vec<String> {
+    /// Every failure — absent, unreadable, malformed — yields the default,
+    /// whose allowlist is empty and which therefore pushes **nothing**.
+    /// Failing closed is deliberate: the failure mode of an over-permissive
+    /// default is that any stranger who can find the bot gets to put text in
+    /// front of a model holding live credentials.
+    async fn config(&self, mxid: &str, client: &Client) -> ChannelConfigEventContent {
         {
-            let guard = self.allowlists.read().await;
+            let guard = self.configs.read().await;
             let fresh = guard
                 .get(mxid)
                 .filter(|(fetched, _)| fetched.elapsed() < ALLOWLIST_TTL)
-                .map(|(_, list)| list.clone());
+                .map(|(_, config)| config.clone());
             drop(guard);
-            if let Some(list) = fresh {
-                return list;
+            if let Some(config) = fresh {
+                return config;
             }
         }
-        let list = match client
+        let config = match client
             .account()
             .fetch_account_data_static::<ChannelConfigEventContent>()
             .await
         {
             Ok(Some(raw)) => match raw.deserialize() {
-                Ok(ev) => ev.allowed_senders,
+                Ok(ev) => ev,
                 Err(e) => {
-                    warn!(error = %e, "channel allowlist is malformed; refusing to push");
-                    Vec::new()
+                    warn!(error = %e, "channel config is malformed; refusing to push");
+                    ChannelConfigEventContent::default()
                 }
             },
-            Ok(None) => Vec::new(),
+            Ok(None) => ChannelConfigEventContent::default(),
             Err(e) => {
-                warn!(error = %e, "could not read channel allowlist; refusing to push");
-                Vec::new()
+                warn!(error = %e, "could not read channel config; refusing to push");
+                ChannelConfigEventContent::default()
             }
         };
-        self.allowlists
+        self.configs
             .write()
             .await
-            .insert(mxid.to_owned(), (Instant::now(), list.clone()));
-        list
+            .insert(mxid.to_owned(), (Instant::now(), config.clone()));
+        config
+    }
+
+    /// The allowlist for an identity. See [`Self::config`].
+    async fn allowlist(&self, mxid: &str, client: &Client) -> Vec<String> {
+        self.config(mxid, client).await.allowed_senders
+    }
+
+    /// Note the room an allowlisted message arrived in, as the fallback
+    /// destination for this identity's permission prompts.
+    ///
+    /// **Only ever called after the allowlist gate passes.** See
+    /// [`Self::last_rooms`].
+    async fn remember_room(&self, mxid: &str, room_id: &str) {
+        let mut guard = self.last_rooms.write().await;
+        let changed = guard.get(mxid).is_none_or(|old| old != room_id);
+        guard.insert(mxid.to_owned(), room_id.to_owned());
+        drop(guard);
+        if changed {
+            debug!(mxid = %mxid, room = %room_id, "channel: permission prompts now default here");
+        }
+    }
+
+    /// Where a permission prompt for `mxid` should be sent, or `None`.
+    ///
+    /// Account data wins over traffic — see
+    /// [`ChannelConfigEventContent::permission_room`]. `None` means we do not
+    /// know, and the caller must drop the prompt saying so rather than pick a
+    /// room.
+    pub async fn permission_room(&self, mxid: &str, client: &Client) -> Option<String> {
+        if let Some(room) = self.config(mxid, client).await.permission_room {
+            return Some(room);
+        }
+        let guard = self.last_rooms.read().await;
+        let room = guard.get(mxid).cloned();
+        drop(guard);
+        room
+    }
+
+    /// Whether this identity has any permission prompt still answerable.
+    ///
+    /// An in-memory read of the pending map, cheap enough to sit on the
+    /// no-listener path — which is the common one, since sync runs for every
+    /// authenticated identity whether or not an agent is attached.
+    pub async fn has_pending(&self, mxid: &str) -> bool {
+        let guard = self.pending.read().await;
+        let any = guard
+            .iter()
+            .any(|((owner, _), p)| owner == mxid && p.issued.elapsed() < PENDING_TTL);
+        drop(guard);
+        any
+    }
+
+    /// Record that `session_key` is waiting on `request_id`.
+    ///
+    /// Expired entries are pruned here rather than on a timer; if the cap is
+    /// still reached afterwards the oldest live entry goes, because dropping
+    /// the *newest* would mean the prompt just sent to Matrix is the one that
+    /// can never be answered.
+    pub async fn record_request(&self, mxid: &str, request_id: &str, session_key: String) {
+        let mut guard = self.pending.write().await;
+        guard.retain(|_, p| p.issued.elapsed() < PENDING_TTL);
+        while guard.len() >= PENDING_MAX {
+            let Some(oldest) = guard
+                .iter()
+                .min_by_key(|(_, p)| p.issued)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            warn!(
+                mxid = %mxid, pending = guard.len(),
+                "channel: too many outstanding permission prompts; dropping the oldest"
+            );
+            guard.remove(&oldest);
+        }
+        guard.insert(
+            (mxid.to_owned(), request_id.to_owned()),
+            Pending {
+                issued: Instant::now(),
+                session_key,
+                serial: PENDING_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            },
+        );
+        let outstanding = guard.len();
+        drop(guard);
+        debug!(mxid = %mxid, request_id = %request_id, outstanding, "channel: permission prompt issued");
+    }
+
+    /// Retire a delivered prompt, but only if it is still the same one.
+    ///
+    /// No lock is held across `send_notification`, so by the time a delivery
+    /// succeeds the map may hold a *different* prompt at that key — an id can
+    /// be reissued. Removing by key alone would retire the newer prompt on
+    /// the strength of the older delivery, and the reply to it would then
+    /// read as unissued. Returns whether anything was removed.
+    async fn retire_if_current(&self, key: &(String, String), serial: u64) -> bool {
+        let mut guard = self.pending.write().await;
+        let current = guard.get(key).is_some_and(|p| p.serial == serial);
+        if current {
+            guard.remove(key);
+        }
+        drop(guard);
+        current
+    }
+
+    /// Send a verdict back to the session that asked for it.
+    ///
+    /// Returns whether it went anywhere. A verdict for an id we never issued,
+    /// or one whose session has since gone, is dropped and logged — that log
+    /// line is the only place the drop is observable at this layer.
+    pub async fn deliver_verdict(&self, mxid: &str, request_id: &str, behavior: Behavior) -> bool {
+        let key = (mxid.to_owned(), request_id.to_owned());
+        // Look up, do not consume. The entry is retired only once the verdict
+        // has actually reached a peer: a missing peer or a failed send that
+        // had already dropped it would make the *second* `no qmzkd` from
+        // Matrix read as unissued while the terminal dialog is still open,
+        // and an outstanding entry costs nothing — the TTL and the cap bound
+        // the map either way.
+        let looked_up = {
+            let mut guard = self.pending.write().await;
+            guard.retain(|_, p| p.issued.elapsed() < PENDING_TTL);
+            let found = guard.get(&key).map(|p| (p.session_key.clone(), p.serial));
+            drop(guard);
+            found
+        };
+        let Some((session_key, serial)) = looked_up else {
+            warn!(
+                mxid = %mxid, request_id = %request_id, behavior = behavior.as_str(),
+                "channel: verdict for an unissued or expired permission request; dropped"
+            );
+            return false;
+        };
+
+        let peer = {
+            let guard = self.inner.read().await;
+            let found = guard
+                .get(mxid)
+                .and_then(|peers| peers.get(&session_key).cloned());
+            drop(guard);
+            found
+        };
+        let Some(peer) = peer else {
+            warn!(
+                mxid = %mxid, request_id = %request_id,
+                "channel: the session that asked for this permission is gone; verdict not \
+                 delivered, and the request stays answerable until it expires"
+            );
+            return false;
+        };
+
+        let notification = ServerNotification::CustomNotification(CustomNotification::new(
+            PERMISSION_VERDICT_NOTIFICATION,
+            Some(serde_json::json!({
+                "request_id": request_id,
+                "behavior": behavior.as_str(),
+            })),
+        ));
+        match peer.send_notification(notification).await {
+            Ok(()) => {
+                // A `false` here is the case the serial exists for: this
+                // delivery was in flight while the id was reissued, so the
+                // entry at this key belongs to a newer prompt and retiring it
+                // would make that one's reply read as unissued. Declining is
+                // correct; being unable to tell it happened is not, because
+                // the mechanism would then never be observed working.
+                if !self.retire_if_current(&key, serial).await {
+                    warn!(
+                        mxid = %mxid, request_id = %request_id,
+                        "channel: verdict delivered for a request that was reissued \
+                         mid-flight; left the newer prompt answerable"
+                    );
+                }
+                info!(
+                    mxid = %mxid, request_id = %request_id, behavior = behavior.as_str(),
+                    "channel: permission verdict relayed"
+                );
+                true
+            }
+            Err(e) => {
+                // Left pending deliberately: the terminal dialog is still
+                // open, so a second reply from Matrix must still be able to
+                // answer it.
+                warn!(
+                    mxid = %mxid, request_id = %request_id, error = %e,
+                    "channel: could not relay permission verdict; request stays answerable"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -565,20 +1007,7 @@ async fn replay_room(
     unseen.truncate(REPLAY_MAX);
     unseen.reverse(); // oldest first, so the session reads them in order
 
-    let deliverable: Vec<_> = unseen
-        .into_iter()
-        .filter_map(|e| {
-            let allowed_sender = e
-                .sender
-                .as_deref()
-                .is_some_and(|s| s != mxid && allowed.iter().any(|a| a == s));
-            if !allowed_sender {
-                return None;
-            }
-            carried_of(&e).map(|c| (e, c))
-        })
-        .take(budget)
-        .collect();
+    let deliverable = replay_deliverable(unseen, mxid, allowed, budget);
     if deliverable.is_empty() {
         return 0;
     }
@@ -712,6 +1141,72 @@ fn split_caption(body: &str, filename: Option<&str>) -> (Option<String>, String)
     }
 }
 
+/// Decide what a reconnecting session is owed out of the events behind its
+/// read receipt.
+///
+/// A free function rather than a closure inside [`replay_room`] because it is
+/// the whole of replay's judgement and the rest of that function is a
+/// homeserver round trip. As a closure none of this was reachable from a test:
+/// deleting the verdict check left the suite green, which is the state a fix
+/// for a replay bug must not ship in.
+fn replay_deliverable(
+    unseen: Vec<crate::mcp::ReadEvent>,
+    mxid: &str,
+    allowed: &[String],
+    budget: usize,
+) -> Vec<(crate::mcp::ReadEvent, Carried)> {
+    unseen
+        .into_iter()
+        .filter_map(|e| {
+            let allowed_sender = e
+                .sender
+                .as_deref()
+                .is_some_and(|s| s != mxid && allowed.iter().any(|a| a == s));
+            if !allowed_sender {
+                return None;
+            }
+            // A permission verdict is answered live and never acknowledged,
+            // so the receipt watermark still sits behind it and replay finds
+            // it again. It is `m.text` with a body, so `carried_of` says
+            // `Message` and it would go out as prose — a fresh session
+            // reading `no qmzkd` with nothing to refer to, which is exactly
+            // what the live path refuses to do. The receipt is not the fix:
+            // advancing it would skip the unacknowledged messages behind it.
+            if is_replayed_verdict(&e) {
+                debug!(
+                    mxid = %mxid, event = ?e.event_id,
+                    "channel: not replaying a permission verdict as chat"
+                );
+                return None;
+            }
+            carried_of(&e).map(|c| (e, c))
+        })
+        .take(budget)
+        .collect()
+}
+
+/// The `content.body` of a raw event, unwrapped.
+///
+/// **Not `ReadEvent::untrusted_body`**, which holds the *sandbox-wrapped*
+/// body: `<matrix:message ...>\n{body}\n</matrix:message>`. Anchored matching
+/// against that never fires, so a check written against it would look correct
+/// and do nothing.
+fn raw_body(event: &crate::mcp::ReadEvent) -> Option<&str> {
+    event.event.as_ref()?.get("content")?.get("body")?.as_str()
+}
+
+/// Whether a replayed event is a permission verdict that was already answered
+/// live, and so must not be delivered as chat.
+///
+/// `sender_allowed` is `true` because this is only reached past the replay
+/// path's own allowlist filter. That is the same gate the live path applies
+/// before [`classify_inbound`]; the two paths must agree about what a session
+/// is owed, and this is the half replay was missing.
+fn is_replayed_verdict(event: &crate::mcp::ReadEvent) -> bool {
+    raw_body(event)
+        .is_some_and(|body| matches!(classify_inbound(true, body), Inbound::Verdict { .. }))
+}
+
 /// Classify a raw `m.room.message` by its `msgtype`, for the replay path.
 ///
 /// Returns `None` for anything the channel does not carry, so replay and the
@@ -720,6 +1215,29 @@ fn split_caption(body: &str, filename: Option<&str>) -> (Option<String>, String)
 /// `read_events_from_chunk` on the next attach, so a caption arrived hours
 /// late, out of order, with nothing marking it as late. That is why this read
 /// as slowness rather than as loss.
+/// Classify a live `m.room.message` by its `msgtype`.
+///
+/// The live-path twin of [`carried_of`], which answers the same question from
+/// a raw event on the replay path. They must agree about what a session is
+/// owed; when they last disagreed, media was dropped live and delivered hours
+/// later by replay, which read as slowness rather than as loss.
+fn carried_of_live(msgtype: &MessageType) -> Option<Carried> {
+    let (kind, body, filename) = match msgtype {
+        MessageType::Text(_) => return Some(Carried::Message),
+        MessageType::Image(c) => ("m.image", &c.body, c.filename.as_deref()),
+        MessageType::File(c) => ("m.file", &c.body, c.filename.as_deref()),
+        MessageType::Audio(c) => ("m.audio", &c.body, c.filename.as_deref()),
+        MessageType::Video(c) => ("m.video", &c.body, c.filename.as_deref()),
+        _ => return None,
+    };
+    let (caption, filename) = split_caption(body, filename);
+    Some(Carried::Attachment {
+        kind,
+        filename,
+        caption,
+    })
+}
+
 fn carried_of(event: &crate::mcp::ReadEvent) -> Option<Carried> {
     let content = event.event.as_ref()?.get("content")?;
     let msgtype = content.get("msgtype")?.as_str()?;
@@ -764,6 +1282,45 @@ pub fn install_event_handler(client: &Client, mxid: String, registry: ChannelReg
     );
 }
 
+/// Route an inbound message that is a permission verdict, and say whether it
+/// was one.
+///
+/// A verdict is answered and **not** also forwarded as chat: relaying `yes
+/// qmzkd` into the model's context as if somebody had said it is noise at
+/// best, and at worst an instruction the model tries to act on.
+///
+/// The ordering this file's security depends on is not statement order in
+/// [`push_message`]: it is the `sender_allowed` argument, which
+/// [`classify_inbound`] answers `Ignored` on whatever the text says. That is
+/// what a unit test can interrogate without a homeserver.
+async fn handled_as_verdict(
+    registry: &ChannelRegistry,
+    mxid: &str,
+    room: &Room,
+    ev: &OriginalSyncRoomMessageEvent,
+    sender_allowed: bool,
+) -> bool {
+    // Only `m.text` can carry a verdict. A media caption that happens to read
+    // `yes abcde` is a caption.
+    let MessageType::Text(text) = &ev.content.msgtype else {
+        return false;
+    };
+    let Inbound::Verdict {
+        request_id,
+        behavior,
+    } = classify_inbound(sender_allowed, &text.body)
+    else {
+        return false;
+    };
+    info!(
+        mxid = %mxid, room = %room.room_id(), sender = %ev.sender,
+        request_id = %request_id, behavior = behavior.as_str(),
+        "channel: inbound permission verdict"
+    );
+    registry.deliver_verdict(mxid, &request_id, behavior).await;
+    true
+}
+
 async fn push_message(
     registry: &ChannelRegistry,
     client: &Client,
@@ -773,8 +1330,19 @@ async fn push_message(
 ) {
     // Cheapest checks first. Sync runs for every authenticated identity
     // whether or not an agent is attached, so the common case is no listener.
+    //
+    // `live_peers` counts without evicting, because `is_transport_closed`
+    // false-positives and evicting on a read once killed the channel for a
+    // whole session. That same false positive would make `live == 0` while
+    // `deliver_verdict` still finds the peer in the map and sends to it
+    // successfully — so returning here unconditionally drops the verdict for
+    // a dialog that is still open at the terminal. An identity with an
+    // outstanding prompt is therefore worth the rest of this function even
+    // when nothing looks live. The extra work is one in-memory map read, and
+    // only on the path that was about to return anyway.
     let live = registry.live_peers(mxid).await;
-    if live == 0 {
+    let outstanding = live == 0 && registry.has_pending(mxid).await;
+    if live == 0 && !outstanding {
         info!(mxid = %mxid, room = %room.room_id(), "channel: skipped, no live session");
         return;
     }
@@ -794,56 +1362,46 @@ async fn push_message(
     // and gating on the room would let any member of an allowlisted room
     // inject into the session.
     let allowed = registry.allowlist(mxid, client).await;
-    if !allowed.iter().any(|s| s == ev.sender.as_str()) {
+    let sender_allowed = allowed.iter().any(|s| s == ev.sender.as_str());
+
+    // The permission-relay branch. It runs here — after the self-sender check
+    // and with the allowlist verdict in hand — because anyone who can get a
+    // verdict through it can approve tool use in the session.
+    if handled_as_verdict(registry, mxid, room, ev, sender_allowed).await {
+        return;
+    }
+
+    // Only reachable with `outstanding` set: this identity has a prompt open
+    // but nothing is listening, and the message was not the answer to it.
+    // Everything below exists to push into a context that is not there.
+    if live == 0 {
+        info!(
+            mxid = %mxid, room = %room.room_id(),
+            "channel: skipped, no live session (looked anyway: a permission prompt is open)"
+        );
+        return;
+    }
+
+    if !sender_allowed {
         info!(
             mxid = %mxid, sender = %ev.sender, allowed = allowed.len(),
             "channel: skipped, sender not allowlisted"
         );
         return;
     }
-    // Text is a message; media is an attachment. See `split_caption` for the
-    // rule and for what dropping media cost.
-    let carried = match &ev.content.msgtype {
-        MessageType::Text(_) => Carried::Message,
-        MessageType::Image(c) => {
-            let (caption, filename) = split_caption(&c.body, c.filename.as_deref());
-            Carried::Attachment {
-                kind: "m.image",
-                filename,
-                caption,
-            }
-        }
-        MessageType::File(c) => {
-            let (caption, filename) = split_caption(&c.body, c.filename.as_deref());
-            Carried::Attachment {
-                kind: "m.file",
-                filename,
-                caption,
-            }
-        }
-        MessageType::Audio(c) => {
-            let (caption, filename) = split_caption(&c.body, c.filename.as_deref());
-            Carried::Attachment {
-                kind: "m.audio",
-                filename,
-                caption,
-            }
-        }
-        MessageType::Video(c) => {
-            let (caption, filename) = split_caption(&c.body, c.filename.as_deref());
-            Carried::Attachment {
-                kind: "m.video",
-                filename,
-                caption,
-            }
-        }
-        other => {
-            info!(
-                mxid = %mxid, room = %room.room_id(), msgtype = other.msgtype(),
-                "channel: skipped, msgtype not carried"
-            );
-            return;
-        }
+
+    // Past the gate, so this room is somewhere an allowlisted human talks to
+    // this identity, and is a defensible place to send a permission prompt.
+    // Recording it before the gate would let a stranger's DM redirect every
+    // future prompt into a room he controls.
+    registry.remember_room(mxid, room.room_id().as_str()).await;
+
+    let Some(carried) = carried_of_live(&ev.content.msgtype) else {
+        info!(
+            mxid = %mxid, room = %room.room_id(), msgtype = ev.content.msgtype.msgtype(),
+            "channel: skipped, msgtype not carried"
+        );
+        return;
     };
 
     // The text the sender wrote, which is the only part that is untrusted
@@ -895,6 +1453,82 @@ async fn push_message(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// `read_event` with the sender overridden, for the replay-filter tests.
+    fn read_event_from(sender: &str, content: &serde_json::Value) -> crate::mcp::ReadEvent {
+        crate::mcp::ReadEvent {
+            sender: Some(sender.to_owned()),
+            ..read_event(content)
+        }
+    }
+
+    #[test]
+    fn replay_drops_verdicts_and_strangers_and_keeps_everything_else() {
+        // This is the whole of replay's judgement, and until it was lifted out
+        // of `replay_room`'s closure none of it was reachable: stubbing the
+        // verdict check left all 235 tests green, which is the state a fix for
+        // a replay bug must not ship in.
+        let allowed = vec!["@a:example.com".to_owned()];
+        let text = |body: &str| serde_json::json!({ "msgtype": "m.text", "body": body });
+        let unseen = vec![
+            read_event_from("@a:example.com", &text("what is the deploy status")),
+            // Answered live, never acknowledged, so the watermark still sits
+            // behind it and replay finds it again.
+            read_event_from("@a:example.com", &text("no qmzkd")),
+            read_event_from("@a:example.com", &text("YES  abcde  ")),
+            // Not allowlisted: `yes abcde` from a stranger is not a verdict
+            // and is not chat either.
+            read_event_from("@stranger:example.com", &text("yes abcde")),
+            // The identity's own message never comes back to it.
+            read_event_from("@me:example.com", &text("hello")),
+            read_event_from("@a:example.com", &text("and the second question")),
+        ];
+        let out = replay_deliverable(unseen, "@me:example.com", &allowed, 100);
+        let bodies: Vec<String> = out
+            .iter()
+            .map(|(e, _)| raw_body(e).unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                "what is the deploy status".to_owned(),
+                "and the second question".to_owned()
+            ],
+            "verdicts, strangers and self must all be dropped, and nothing else"
+        );
+    }
+
+    #[test]
+    fn the_replay_filter_does_not_drop_everything() {
+        // The control for the control. A filter that returns `None` for every
+        // event satisfies "a verdict is not replayed" while destroying the
+        // channel, and the assertion above would still pass if it only checked
+        // that no verdict survived.
+        let allowed = vec!["@a:example.com".to_owned()];
+        let out = replay_deliverable(
+            vec![read_event_from(
+                "@a:example.com",
+                &serde_json::json!({ "msgtype": "m.text", "body": "ordinary" }),
+            )],
+            "@me:example.com",
+            &allowed,
+            100,
+        );
+        assert_eq!(out.len(), 1, "replay stopped delivering anything at all");
+    }
+
+    #[test]
+    fn the_replay_budget_is_respected() {
+        let allowed = vec!["@a:example.com".to_owned()];
+        let text = serde_json::json!({ "msgtype": "m.text", "body": "x" });
+        let unseen: Vec<_> = (0..5)
+            .map(|_| read_event_from("@a:example.com", &text))
+            .collect();
+        assert_eq!(
+            replay_deliverable(unseen, "@me:example.com", &allowed, 2).len(),
+            2
+        );
+    }
 
     fn read_event(content: &serde_json::Value) -> crate::mcp::ReadEvent {
         crate::mcp::ReadEvent {
@@ -989,6 +1623,29 @@ mod tests {
                 "{msgtype} with no body should not be carried"
             );
         }
+    }
+
+    #[test]
+    fn the_live_classifier_agrees_with_the_replay_one() {
+        // `carried_of_live` and `carried_of` answer the same question from the
+        // two shapes the same event arrives in. When they last disagreed,
+        // media was dropped live and delivered hours later by replay, which
+        // read as slowness rather than as loss.
+        use matrix_sdk::ruma::events::room::message::{
+            NoticeMessageEventContent, TextMessageEventContent,
+        };
+        assert_eq!(
+            carried_of_live(&MessageType::Text(TextMessageEventContent::plain("hello"))),
+            carried_of(&read_event(&serde_json::json!({
+                "msgtype": "m.text", "body": "hello",
+            })))
+        );
+        assert_eq!(
+            carried_of_live(&MessageType::Notice(NoticeMessageEventContent::plain("x"))),
+            carried_of(&read_event(&serde_json::json!({
+                "msgtype": "m.notice", "body": "x",
+            })))
+        );
     }
 
     #[test]
@@ -1108,6 +1765,485 @@ mod tests {
         assert!(
             CHANNEL_INSTRUCTIONS.contains("mark_read"),
             "the agent is never told to acknowledge"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Permission relay
+    // ---------------------------------------------------------------
+
+    fn verdict(text: &str) -> Inbound {
+        classify_inbound(true, text)
+    }
+
+    #[test]
+    fn a_verdict_from_a_sender_who_is_not_allowlisted_is_ignored() {
+        // The whole security argument for declaring the capability at all.
+        // Anyone who can get a `Verdict` out of this function can approve a
+        // tool call in a live session, so the gate is a parameter here rather
+        // than statement order in `push_message` — a property enforced by
+        // ordering alone is only observable end to end.
+        for text in ["yes abcde", "y abcde", "no abcde", "  YES   ABCDE  "] {
+            assert_eq!(
+                classify_inbound(false, text),
+                Inbound::Ignored,
+                "{text} from a stranger must never become a verdict"
+            );
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_a_verdict_matches() {
+        for (text, expected) in [
+            ("y abcde", Behavior::Allow),
+            ("yes abcde", Behavior::Allow),
+            ("n abcde", Behavior::Deny),
+            ("no abcde", Behavior::Deny),
+        ] {
+            assert_eq!(
+                verdict(text),
+                Inbound::Verdict {
+                    request_id: "abcde".to_owned(),
+                    behavior: expected,
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn autocorrect_capitalisation_is_tolerated_and_the_id_is_lowercased() {
+        // A phone capitalises the first word, and with the pattern's `(?i)`
+        // an all-caps id matches too. Claude Code only knows the id in
+        // lowercase, so a capture sent back as typed would match nothing.
+        assert_eq!(
+            verdict("Yes ABCDE"),
+            Inbound::Verdict {
+                request_id: "abcde".to_owned(),
+                behavior: Behavior::Allow,
+            }
+        );
+        assert_eq!(
+            verdict("\t NO   xyzab \n"),
+            Inbound::Verdict {
+                request_id: "xyzab".to_owned(),
+                behavior: Behavior::Deny,
+            }
+        );
+    }
+
+    #[test]
+    fn near_misses_fall_through_as_chat_rather_than_as_verdicts() {
+        for text in [
+            // `l` is not in the id alphabet, precisely so it cannot be
+            // confused with a `1`; a reply carrying one is not an id.
+            "yes abcle",
+            "yes abcd",   // four letters
+            "yes abcdef", // six
+            "yes",        // no id at all — the docs call this out by name
+            "yes abcde please",
+            "approve it",
+            "yesabcde",
+            "yes abcde yes abcde",
+            "yes 12345",
+        ] {
+            assert_eq!(
+                verdict(text),
+                Inbound::Chat,
+                "{text} must reach the session as an ordinary message"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prompt_carries_the_request_id_verbatim() {
+        // The terminal dialog never shows the id, so this message is the only
+        // place it can be learned. A prompt without it is unanswerable.
+        let request = PermissionRequest {
+            request_id: "qmzkd".to_owned(),
+            tool_name: "Bash".to_owned(),
+            description: "Run shell command".to_owned(),
+            input_preview: "{\"command\": \"rm -rf /tmp/build\"}".to_owned(),
+        };
+        let prompt = format_prompt(&request);
+        assert!(prompt.contains("Claude wants to run Bash: Run shell command"));
+        assert!(prompt.contains("rm -rf /tmp/build"));
+        assert!(prompt.contains("\"yes qmzkd\""), "{prompt}");
+        assert!(prompt.contains("\"no qmzkd\""), "{prompt}");
+        // And the round trip: what the message tells the reader to type is
+        // what the classifier turns back into that id.
+        assert_eq!(
+            verdict("yes qmzkd"),
+            Inbound::Verdict {
+                request_id: "qmzkd".to_owned(),
+                behavior: Behavior::Allow,
+            }
+        );
+    }
+
+    #[test]
+    fn an_oversized_preview_never_eats_the_reply_instruction() {
+        // Claude Code relays up to 3,500 code points per field. Capping the
+        // whole message from the end would cut off the id and leave a prompt
+        // nobody can answer, so the fields are capped and the tail is not.
+        let request = PermissionRequest {
+            request_id: "qmzkd".to_owned(),
+            tool_name: "Write".to_owned(),
+            description: "d".repeat(3500),
+            input_preview: "p".repeat(3500),
+        };
+        let prompt = format_prompt(&request);
+        assert!(
+            prompt.ends_with("Reply \"yes qmzkd\" or \"no qmzkd\""),
+            "{prompt}"
+        );
+        assert!(prompt.len() < 3500, "prompt was {} bytes", prompt.len());
+    }
+
+    #[test]
+    fn a_multibyte_preview_is_clipped_on_a_character_boundary() {
+        // `clip` slices by byte index; a naive cut inside a multi-byte scalar
+        // panics, and this path is fed text chosen by whoever wrote the file
+        // Claude is being asked to touch.
+        //
+        // The single-byte prefix is load-bearing. Without it, `ü`.repeat()
+        // puts a boundary at every even offset and `→`.repeat() at every
+        // multiple of three, and both caps happen to be such an offset — so a
+        // clip that never walked to a boundary would pass anyway. The prefix
+        // shifts every boundary off the cap by one.
+        for (description, input_preview) in [
+            (
+                format!("a{}", "ü".repeat(PROMPT_DESCRIPTION_MAX)),
+                String::new(),
+            ),
+            (
+                String::new(),
+                format!("a{}", "→".repeat(PROMPT_PREVIEW_MAX)),
+            ),
+            // Two-byte and three-byte scalars land differently against the
+            // same cap, so both are tried against both fields.
+            (
+                format!("a{}", "→".repeat(PROMPT_DESCRIPTION_MAX)),
+                String::new(),
+            ),
+            (
+                String::new(),
+                format!("a{}", "ü".repeat(PROMPT_PREVIEW_MAX)),
+            ),
+        ] {
+            let request = PermissionRequest {
+                request_id: "qmzkd".to_owned(),
+                tool_name: "Edit".to_owned(),
+                description,
+                input_preview,
+            };
+            let prompt = format_prompt(&request);
+            assert!(prompt.ends_with("Reply \"yes qmzkd\" or \"no qmzkd\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verdict_for_an_id_we_never_issued_is_dropped() {
+        let reg = ChannelRegistry::new();
+        assert!(
+            !reg.deliver_verdict("@a:example.com", "abcde", Behavior::Allow)
+                .await,
+            "an unissued id must not be routed anywhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verdict_does_not_cross_an_identity_boundary() {
+        // The pending map is keyed on (mxid, request_id). Five letters from a
+        // 25-letter alphabet collide rarely but not never, and a bare-id key
+        // would let one identity answer another's prompt.
+        let reg = ChannelRegistry::new();
+        reg.record_request("@a:example.com", "abcde", "session-1".to_owned())
+            .await;
+        assert!(
+            !reg.deliver_verdict("@b:example.com", "abcde", Behavior::Allow)
+                .await,
+            "@b must not be able to answer @a's prompt"
+        );
+        // @a's own request survived @b's attempt: it is still pending, and
+        // fails now only because the test registry holds no live peer.
+        assert!(
+            reg.pending
+                .read()
+                .await
+                .contains_key(&("@a:example.com".to_owned(), "abcde".to_owned())),
+            "@b's miss consumed @a's pending request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_verdict_is_answerable_exactly_once() {
+        // What `deliver_verdict` does on its success path, minus the peer it
+        // cannot have in a unit test. Retiring the entry is what stops a
+        // replayed `yes abcde` re-approving a later prompt that reuses the id.
+        let reg = ChannelRegistry::new();
+        let key = ("@a:example.com".to_owned(), "abcde".to_owned());
+        reg.record_request("@a:example.com", "abcde", "session-1".to_owned())
+            .await;
+        let serial = reg.pending.read().await[&key].serial;
+        assert!(reg.retire_if_current(&key, serial).await);
+        assert!(
+            reg.pending.read().await.is_empty(),
+            "an answered request stayed pending"
+        );
+        // Answering it a second time finds nothing to retire.
+        assert!(!reg.retire_if_current(&key, serial).await);
+    }
+
+    #[tokio::test]
+    async fn outstanding_prompts_are_bounded() {
+        // PENDING_TTL alone bounds the map only if prompts arrive slower than
+        // they expire, which a tool-call loop does not.
+        let reg = ChannelRegistry::new();
+        for n in 0..(PENDING_MAX + 50) {
+            reg.record_request("@a:example.com", &format!("id{n}"), "session-1".to_owned())
+                .await;
+        }
+        assert!(reg.pending.read().await.len() <= PENDING_MAX);
+    }
+
+    #[tokio::test]
+    async fn the_newest_prompt_survives_the_cap() {
+        // Evicting the newest would mean the prompt just sent to Matrix is
+        // the one that can never be answered.
+        let reg = ChannelRegistry::new();
+        for n in 0..(PENDING_MAX + 10) {
+            reg.record_request("@a:example.com", &format!("id{n}"), "session-1".to_owned())
+                .await;
+        }
+        let newest = format!("id{}", PENDING_MAX + 9);
+        assert!(
+            reg.pending
+                .read()
+                .await
+                .contains_key(&("@a:example.com".to_owned(), newest.clone())),
+            "{newest} was evicted by its own arrival"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_prompt_destination_starts_unknown_and_follows_allowlisted_traffic() {
+        let reg = ChannelRegistry::new();
+        assert_eq!(
+            reg.last_rooms.read().await.get("@a:example.com"),
+            None,
+            "a fresh identity must have no inferred destination"
+        );
+        reg.remember_room("@a:example.com", "!one:example.com")
+            .await;
+        reg.remember_room("@a:example.com", "!two:example.com")
+            .await;
+        assert_eq!(
+            reg.last_rooms
+                .read()
+                .await
+                .get("@a:example.com")
+                .map(String::as_str),
+            Some("!two:example.com")
+        );
+    }
+
+    #[test]
+    fn the_config_round_trips_and_defaults_to_no_permission_room() {
+        // An older account-data document has no `permission_room`; reading it
+        // must not fail closed into "cannot push", nor invent a destination.
+        let old: ChannelConfigEventContent =
+            serde_json::from_str(r#"{"allowed_senders":["@a:example.com"]}"#).unwrap();
+        assert_eq!(old.allowed_senders, vec!["@a:example.com"]);
+        assert_eq!(old.permission_room, None);
+
+        let set: ChannelConfigEventContent = serde_json::from_str(
+            r#"{"allowed_senders":["@a:example.com"],"permission_room":"!r:example.com"}"#,
+        )
+        .unwrap();
+        assert_eq!(set.permission_room.as_deref(), Some("!r:example.com"));
+    }
+
+    #[test]
+    fn a_verdict_is_not_replayed_into_a_fresh_context_as_chat() {
+        // A verdict is consumed live and never acknowledged, so the receipt
+        // watermark stays behind it and replay finds it again. It is `m.text`
+        // with a body, so `carried_of` says `Message` and it would go out as
+        // prose: a new session reading `no qmzkd` with nothing to refer to.
+        // The live path refuses to do that; replay must agree, or the two
+        // paths disagree about one event — the #107 bug in another costume.
+        for body in ["no qmzkd", "yes qmzkd", "Y QMZKD", "  n abcde  "] {
+            let event = read_event(&serde_json::json!({ "msgtype": "m.text", "body": body }));
+            assert!(
+                is_replayed_verdict(&event),
+                "{body} would be replayed as chat"
+            );
+        }
+        // An ordinary message still replays. A filter that dropped everything
+        // would pass the assertions above and lose the channel's whole point.
+        for body in ["yes", "yes please do it", "no idea", "deploy the thing"] {
+            let event = read_event(&serde_json::json!({ "msgtype": "m.text", "body": body }));
+            assert!(!is_replayed_verdict(&event), "{body} must still replay");
+        }
+    }
+
+    #[test]
+    fn the_replay_verdict_check_reads_the_unwrapped_body() {
+        // `ReadEvent::untrusted_body` holds the *sandbox-wrapped* body, and
+        // the verdict pattern is anchored, so a check written against that
+        // field matches nothing and silently does nothing at all. This test
+        // is what tells the two apart.
+        let mut event = read_event(&serde_json::json!({
+            "msgtype": "m.text", "body": "no qmzkd",
+        }));
+        event.untrusted_body = Some(
+            crate::content_sandbox::evaluate(
+                Some("!r:example.com"),
+                Some("@a:example.com"),
+                Some("$e"),
+                "no qmzkd",
+            )
+            .wrapped,
+        );
+        assert_ne!(
+            event.untrusted_body.as_deref(),
+            Some("no qmzkd"),
+            "the fixture is not exercising the wrapper"
+        );
+        assert_eq!(
+            classify_inbound(true, event.untrusted_body.as_deref().unwrap_or_default()),
+            Inbound::Chat,
+            "the wrapped body must NOT match — that is the trap"
+        );
+        assert!(
+            is_replayed_verdict(&event),
+            "the check must read content.body, not untrusted_body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verdict_that_reached_nobody_stays_answerable() {
+        // The terminal dialog is still open, so a second `no qmzkd` from
+        // Matrix must still be able to answer it. Consuming the entry on a
+        // path that did not deliver makes the retry read as unissued.
+        let reg = ChannelRegistry::new();
+        reg.record_request("@a:example.com", "qmzkd", "session-1".to_owned())
+            .await;
+        // No live peer under that session key, so this cannot have delivered.
+        assert!(
+            !reg.deliver_verdict("@a:example.com", "qmzkd", Behavior::Deny)
+                .await
+        );
+        assert!(
+            reg.pending
+                .read()
+                .await
+                .contains_key(&("@a:example.com".to_owned(), "qmzkd".to_owned())),
+            "an undelivered verdict retired the request anyway"
+        );
+        // And it is still answerable, rather than merely still in the map.
+        assert!(reg.has_pending("@a:example.com").await);
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_delivery_cannot_retire_a_reissued_prompt() {
+        // The conjunction the serial exists for: same key, different prompt.
+        // Removing by key alone would retire the *newer* one, and the reply
+        // to it would then read as unissued while its dialog is still open.
+        let reg = ChannelRegistry::new();
+        let key = ("@a:example.com".to_owned(), "abcde".to_owned());
+        reg.record_request("@a:example.com", "abcde", "session-1".to_owned())
+            .await;
+        let stale = reg.pending.read().await[&key].serial;
+        reg.record_request("@a:example.com", "abcde", "session-2".to_owned())
+            .await;
+        assert!(
+            !reg.retire_if_current(&key, stale).await,
+            "a stale delivery retired the prompt that replaced it"
+        );
+        assert_eq!(
+            reg.pending.read().await[&key].session_key,
+            "session-2",
+            "the reissued prompt must survive, pointing at its own session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verdict_is_looked_for_even_when_nothing_looks_live() {
+        // `live_peers` counts without evicting because `is_transport_closed`
+        // false-positives, so `live == 0` does not mean `deliver_verdict`
+        // would fail to find the peer. An identity with an open prompt is
+        // worth looking at; one without is the common case and returns early.
+        let reg = ChannelRegistry::new();
+        assert_eq!(reg.live_peers("@a:example.com").await, 0);
+        assert!(
+            !reg.has_pending("@a:example.com").await,
+            "nothing outstanding: push_message returns at the top"
+        );
+        reg.record_request("@a:example.com", "qmzkd", "session-1".to_owned())
+            .await;
+        assert!(
+            reg.has_pending("@a:example.com").await,
+            "an open prompt with no live peer must not short-circuit the verdict branch"
+        );
+        // Scoped to the identity: @b's silence is not @a's business.
+        assert!(!reg.has_pending("@b:example.com").await);
+    }
+
+    #[tokio::test]
+    async fn an_expired_prompt_does_not_keep_the_no_listener_path_awake() {
+        // `has_pending` gates work on the common no-listener path, so an
+        // entry past its TTL must not hold it open.
+        let reg = ChannelRegistry::new();
+        reg.record_request("@a:example.com", "qmzkd", "session-1".to_owned())
+            .await;
+        reg.pending
+            .write()
+            .await
+            .values_mut()
+            .for_each(|p| p.issued -= PENDING_TTL + Duration::from_secs(1));
+        assert!(!reg.has_pending("@a:example.com").await);
+    }
+
+    #[test]
+    fn a_prompt_only_goes_into_a_joined_room() {
+        // `get_room` returning `Some` is not "joined": the local state store
+        // holds Left, Invited, Knocked and Banned rooms too. Enumerated so a
+        // check written as `!= Left` fails here, and so a state added by a
+        // future matrix-sdk defaults to refused rather than allowed.
+        assert!(prompt_room_is_usable(RoomState::Joined));
+        for state in [
+            RoomState::Left,
+            RoomState::Invited,
+            RoomState::Knocked,
+            RoomState::Banned,
+        ] {
+            assert!(
+                !prompt_room_is_usable(state),
+                "{state:?} is not a room this account can send into"
+            );
+        }
+    }
+
+    #[test]
+    fn the_verdict_wire_values_are_the_two_claude_code_accepts() {
+        assert_eq!(Behavior::Allow.as_str(), "allow");
+        assert_eq!(Behavior::Deny.as_str(), "deny");
+    }
+
+    #[test]
+    fn the_relay_method_names_are_the_ones_in_the_contract() {
+        // Three string constants are the entire protocol surface. A typo in
+        // any of them fails silently: the capability is never registered, or
+        // the notification is dispatched to nobody.
+        assert_eq!(PERMISSION_CAPABILITY, "claude/channel/permission");
+        assert_eq!(
+            PERMISSION_REQUEST_NOTIFICATION,
+            "notifications/claude/channel/permission_request"
+        );
+        assert_eq!(
+            PERMISSION_VERDICT_NOTIFICATION,
+            "notifications/claude/channel/permission"
         );
     }
 

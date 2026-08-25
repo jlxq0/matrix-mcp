@@ -124,6 +124,12 @@ mime = "0.3"
 # build time (cc-rs), so the distroless runtime image needs no extra
 # system libraries.
 opus = "0.3"
+# Verdict matching on the permission-relay inbound path. The pattern is
+# `^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$`, copied verbatim from Claude Code's
+# channel reference so a reviewer can diff the two strings; a hand-rolled
+# matcher would have to be re-read against the docs instead. Already in the
+# tree transitively, so naming it here adds no compilation.
+regex = "1"
 # Ogg container packetizer for wrapping the raw Opus frames into the
 # RFC 7845 OggOpus stream layout (OpusHead + OpusTags + audio pages).
 ogg = "0.9"

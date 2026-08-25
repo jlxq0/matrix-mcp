@@ -723,6 +723,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_mount_declares_the_permission_capability() {
+        // Same argument as the channel capability above: presence of the key
+        // is the entire opt-in. Without it Claude Code never forwards a
+        // permission prompt and every gated call still stalls at a keyboard.
+        let (_mas, app) = mas_backed_router().await;
+        let body = initialize_on(&app, "/channel").await.unwrap();
+        let experimental = &body["result"]["capabilities"]["experimental"];
+        let declared = experimental
+            .get(crate::channel::PERMISSION_CAPABILITY)
+            .unwrap_or(&Value::Null);
+        assert!(
+            declared.is_object() && declared.as_object().is_some_and(serde_json::Map::is_empty),
+            "the value is specified as `{{}}`, and clients before 2.1.234 read `false` as \
+             declared, so it must never be a bool. body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_main_mount_never_declares_the_permission_capability() {
+        // /mcp has no sender-gated inbound path at all, so a permission
+        // prompt forwarded there could never be answered — and declaring it
+        // would tell Claude Code otherwise.
+        let (_mas, app) = mas_backed_router().await;
+        let body = initialize_on(&app, "/mcp").await.unwrap();
+        let experimental = &body["result"]["capabilities"]["experimental"];
+        assert!(
+            experimental
+                .get(crate::channel::PERMISSION_CAPABILITY)
+                .is_none(),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn channel_mount_offers_only_the_scoped_tools() {
         let (_mas, app) = mas_backed_router().await;
         let channel_tools = tool_names_on(&app, "/channel").await.unwrap();

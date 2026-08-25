@@ -26,6 +26,32 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
   It grants nobody anything new — the pepper already decrypts the stores those
   keys live in — and it never touches a human's Secret Storage, which stays
   locked with their own key.
+- **Answer permission prompts from Matrix.** The `/channel` mount now also
+  declares `claude/channel/permission`, so a session on it forwards each
+  tool-approval dialog to Matrix as a message carrying the five-letter request
+  id, and a reply of `yes <id>` or `no <id>` applies the verdict. Both dialogs
+  stay live and the first answer wins. Without this every gated `Bash`, `Write`
+  or `Edit` in a session driven from a phone stalls until somebody reaches a
+  keyboard, which is most of what the channel exists to avoid.
+
+  The verdict branch runs behind the same sender allowlist as message delivery,
+  because anyone who can reply through the channel can approve tool use in the
+  session. The gate is an argument to a pure classifier rather than statement
+  order in the inbound handler, so "a stranger's `yes abcde` is ignored" is a
+  question a unit test can ask rather than a property of where a `return` sits.
+  A verdict is matched, answered once and never also forwarded as chat.
+
+  A permission request arrives on an MCP peer that carries no room, so the
+  destination comes from `permission_room` in the account's own
+  `app.matrix_mcp.channel` account data, and otherwise from the room an
+  allowlisted sender last wrote in — recorded only *after* the allowlist gate
+  passes, so a stranger who DMs the bot cannot redirect future prompts into a
+  room he controls. Neither known means the prompt is dropped with a log line;
+  a guessed room is an approval handed to whoever is standing in it. Verdicts
+  go back to the session that asked, keyed on `(mxid, request id)` and expiring
+  after fifteen minutes, so a verdict for an id nobody issued is visibly
+  dropped instead of broadcast.
+
 - **`/channel`: serve Matrix as a Claude Code channel.** A second mount that
   declares the `claude/channel` capability and pushes inbound room messages
   into a running Claude Code session, so a session can react to Matrix while

@@ -83,3 +83,16 @@
   A payload whose length is a multiple of three encodes identically with and
   without padding, so any fixture of that length is blind to this. Test 3n+1
   and 3n+2 and decode strictly.
+- A byte-slicing cap is not proven safe by a fixture built from one repeated
+  multi-byte character. `"ü".repeat(n)` puts a character boundary at every even
+  offset and `"→".repeat(n)` at every multiple of three, so if the cap is such
+  an offset — and `PROMPT_DESCRIPTION_MAX`, `PROMPT_PREVIEW_MAX` and
+  `MAX_PUSH_BYTES` all are — a `clip` that never walks to a boundary passes the
+  test and panics in production. Offset the fixture by one ASCII byte.
+- Permission relay hands a tool approval to whoever can reply through the
+  channel. Two orderings carry that: the allowlist gate runs before the verdict
+  branch, and the fallback prompt room is recorded only after that same gate.
+  Recording the room first lets a stranger who DMs the bot redirect every later
+  approval prompt into a room he controls. Neither ordering is visible in a
+  diff, so both live in named functions (`classify_inbound`, `remember_room`)
+  with the gate as an argument rather than as preceding statements.

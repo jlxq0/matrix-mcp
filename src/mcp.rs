@@ -49,7 +49,10 @@ use tracing::{Instrument as _, Span, warn};
 use crate::audit::{self, outcome};
 use crate::audit_room;
 use crate::auth::AccessToken;
-use crate::channel::{CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, CHANNEL_TOOLS, ChannelRegistry};
+use crate::channel::{
+    CHANNEL_CAPABILITY, CHANNEL_INSTRUCTIONS, CHANNEL_TOOLS, ChannelRegistry,
+    PERMISSION_CAPABILITY, PERMISSION_REQUEST_NOTIFICATION, PermissionRequest,
+};
 use crate::content_sandbox;
 use crate::mas::AuthenticatedIdentity;
 use crate::matrix_client::MatrixClientCache;
@@ -7079,6 +7082,12 @@ impl ServerHandler for MatrixMcpService {
                 // specified as always empty.
                 if let Some(experimental) = capabilities.experimental.as_mut() {
                     experimental.insert(CHANNEL_CAPABILITY.to_owned(), serde_json::Map::new());
+                    // Permission relay. Declared here and nowhere else: the
+                    // full mount has no sender-gated inbound path, and this
+                    // key is what lets a reply approve a tool call. Present
+                    // with an empty value, never `false` — clients before
+                    // 2.1.234 read `false` as declared.
+                    experimental.insert(PERMISSION_CAPABILITY.to_owned(), serde_json::Map::new());
                 }
                 ServerInfo::new(capabilities).with_instructions(format!(
                     "Matrix channel for {}. {CHANNEL_INSTRUCTIONS}",
@@ -7135,6 +7144,139 @@ impl ServerHandler for MatrixMcpService {
                 }
             }
         });
+    }
+
+    /// Relay a permission prompt out to Matrix.
+    ///
+    /// rmcp dispatches every notification method it does not recognise here,
+    /// so this is the inbound half of permission relay. The context is the
+    /// same `NotificationContext` `on_initialized` gets, over the same POST:
+    /// the transport inserts `http::request::Parts` into the extensions of
+    /// *any* client notification (rmcp 1.7 `tower.rs:1042`), and the bearer
+    /// middleware has already put the identity and token in there.
+    ///
+    /// rmcp already runs each notification in its own task, so the Matrix
+    /// round trip happens inline rather than in a second spawn.
+    async fn on_custom_notification(
+        &self,
+        notification: rmcp::model::CustomNotification,
+        context: rmcp::service::NotificationContext<RoleServer>,
+    ) {
+        if self.mode != ServiceMode::Channel {
+            return;
+        }
+        if notification.method != PERMISSION_REQUEST_NOTIFICATION {
+            tracing::debug!(method = %notification.method, "channel: custom notification ignored");
+            return;
+        }
+        let request: PermissionRequest = match notification.params_as() {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                tracing::warn!("channel: permission request carried no params; dropped");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "channel: unparseable permission request; dropped");
+                return;
+            }
+        };
+
+        let Some(parts) = context.extensions.get::<http::request::Parts>() else {
+            tracing::warn!(
+                request_id = %request.request_id,
+                "channel: permission request without HTTP parts; cannot relay"
+            );
+            return;
+        };
+        let Some(identity) = parts.extensions.get::<AuthenticatedIdentity>().cloned() else {
+            tracing::warn!(
+                request_id = %request.request_id,
+                "channel: permission request without identity; cannot relay"
+            );
+            return;
+        };
+        let Some(AccessToken(token)) = parts.extensions.get::<AccessToken>().cloned() else {
+            tracing::warn!(
+                mxid = %identity.mxid, request_id = %request.request_id,
+                "channel: permission request without token; cannot relay"
+            );
+            return;
+        };
+        let session_key = session_key_from_parts(parts);
+
+        let client = match self.clients.for_user(&identity, &token).await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(
+                    mxid = %identity.mxid, request_id = %request.request_id, error = %e,
+                    "channel: no matrix client; permission prompt not relayed"
+                );
+                return;
+            }
+        };
+
+        // No destination is a drop, never a guess. Sending a prompt to a room
+        // picked by inference is handing the approval to whoever is in it.
+        let Some(room_id) = self.channel.permission_room(&identity.mxid, &client).await else {
+            tracing::warn!(
+                mxid = %identity.mxid, request_id = %request.request_id,
+                tool = %request.tool_name,
+                "channel: no permission room known for this identity (no allowlisted message \
+                 has arrived and account data sets no permission_room); prompt not relayed"
+            );
+            return;
+        };
+        let parsed: OwnedRoomId = match room_id.parse() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    mxid = %identity.mxid, room = %room_id, error = %e,
+                    "channel: permission room is not a room id; prompt not relayed"
+                );
+                return;
+            }
+        };
+        let Some(room) = client.get_room(&parsed) else {
+            tracing::warn!(
+                mxid = %identity.mxid, room = %room_id,
+                "channel: permission room is unknown to this account; prompt not relayed"
+            );
+            return;
+        };
+        // `get_room` reads the local state store and hands back Left, Invited,
+        // Knocked and Banned rooms too, so `Some` is not "joined" — the same
+        // trap #113 fixed in `download_attachment`. Without this the send
+        // fails with `WrongRoomState` further down, which leaks nothing but
+        // retains a pending id for a prompt nobody ever saw and tells the
+        // operator the wrong thing twice.
+        if !crate::channel::prompt_room_is_usable(room.state()) {
+            tracing::warn!(
+                mxid = %identity.mxid, room = %room_id, state = ?room.state(),
+                "channel: permission room is not joined; prompt not relayed"
+            );
+            return;
+        }
+
+        // Recorded before the send, so a verdict cannot beat its own request
+        // into the map. The reverse order would drop the fastest answers.
+        self.channel
+            .record_request(&identity.mxid, &request.request_id, session_key)
+            .await;
+
+        // `text_plain`, not markdown: the request id has to survive to the
+        // reader's eye byte for byte, and `description` and `input_preview`
+        // are somebody else's text being shown to a human, not rendered.
+        let prompt = RoomMessageEventContent::text_plain(crate::channel::format_prompt(&request));
+        match room.send(prompt).await {
+            Ok(_) => tracing::info!(
+                mxid = %identity.mxid, room = %room_id, request_id = %request.request_id,
+                tool = %request.tool_name, "channel: permission prompt relayed to Matrix"
+            ),
+            Err(e) => tracing::warn!(
+                mxid = %identity.mxid, room = %room_id, request_id = %request.request_id,
+                error = %e, "channel: could not send permission prompt"
+            ),
+        }
     }
 }
 
