@@ -712,6 +712,11 @@ fn split_caption(body: &str, filename: Option<&str>) -> (Option<String>, String)
 fn carried_of(event: &crate::mcp::ReadEvent) -> Option<Carried> {
     let content = event.event.as_ref()?.get("content")?;
     let msgtype = content.get("msgtype")?.as_str()?;
+    // `body` is required for every kind this carries, including `m.text`.
+    // Ruma will not deserialise a message without one, so the live path never
+    // sees such an event; requiring it here keeps the classifier's answer true
+    // rather than leaving replay to discover the absence further down.
+    let body = content.get("body").and_then(serde_json::Value::as_str)?;
     if msgtype == "m.text" {
         return Some(Carried::Message);
     }
@@ -722,7 +727,6 @@ fn carried_of(event: &crate::mcp::ReadEvent) -> Option<Carried> {
         "m.video" => "m.video",
         _ => return None,
     };
-    let body = content.get("body").and_then(serde_json::Value::as_str)?;
     let filename = content.get("filename").and_then(serde_json::Value::as_str);
     let (caption, filename) = split_caption(body, filename);
     Some(Carried::Attachment {
@@ -943,6 +947,20 @@ mod tests {
             "body": "hello",
         })));
         assert_eq!(carried, Some(Carried::Message));
+    }
+
+    #[test]
+    fn a_message_with_no_body_is_not_carried() {
+        // Ruma refuses to deserialise this, so the live path never sees it.
+        // The classifier says so too, rather than answering `Message` and
+        // leaving replay to find the absence further down.
+        for msgtype in ["m.text", "m.image"] {
+            let carried = carried_of(&read_event(&serde_json::json!({ "msgtype": msgtype })));
+            assert_eq!(
+                carried, None,
+                "{msgtype} with no body should not be carried"
+            );
+        }
     }
 
     #[test]
