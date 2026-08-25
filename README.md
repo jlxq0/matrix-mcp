@@ -89,7 +89,11 @@ the account's own Matrix account data, so each account configures itself:
 
 ```jsonc
 // event type: app.matrix_mcp.channel
-{ "allowed_senders": ["@you:your-domain.example"] }
+{
+  "allowed_senders": ["@you:your-domain.example"],
+  // optional: where permission prompts go. See below.
+  "permission_room": "!your-dm-with-the-bot:your-domain.example"
+}
 ```
 
 Absent or empty means nothing is delivered. An ungated channel is a
@@ -103,6 +107,33 @@ Messages that arrive while no session is listening are replayed when one
 attaches, watermarked by the account's own read receipt. The server never
 writes that receipt itself — it cannot observe delivery — so the agent
 acknowledges with `mark_read` and delivery is at-least-once.
+
+**Approving tool calls from Matrix.** The channel mount also declares
+`claude/channel/permission`, so when a session on it hits a permission prompt
+the same prompt arrives as a Matrix message carrying a five-letter request id:
+
+```
+Claude wants to run Bash: Run shell command
+{"command": "cargo test --all-features"}
+
+Reply "yes qmzkd" or "no qmzkd"
+```
+
+Answer `yes <id>` or `no <id>` and the tool call runs or is rejected. The
+terminal dialog stays open the whole time; whichever answer arrives first wins.
+The id is not shown in the terminal, so that message is the only place to learn
+it. Relay covers tool-use approvals only — project trust and MCP consent
+dialogs never leave the terminal.
+
+The reply goes through the **same sender allowlist** as everything else, and it
+must, because anyone who can reply can approve tool use in the session. A
+verdict from a sender who is not on the list is dropped without being applied
+and without being forwarded as chat.
+
+Prompts go to `permission_room` when the account data sets one; otherwise to
+the room an allowlisted sender last wrote in. If neither is known the prompt is
+dropped with a log line rather than sent somewhere guessed — set
+`permission_room` if a session may need approval before anyone has messaged it.
 
 ### Accounts with no human
 
