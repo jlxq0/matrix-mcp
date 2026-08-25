@@ -2322,6 +2322,23 @@ pub struct DownloadAttachmentParams {
     pub event_id: String,
 }
 
+/// Encode attachment bytes for [`DownloadAttachmentResult::body_base64`].
+///
+/// **Padded**, standard alphabet. This shipped as `STANDARD_NO_PAD` while the
+/// field documented the standard alphabet, and standard-alphabet base64 is
+/// padded: Python's `base64.b64decode`, Rust's `STANDARD` engine and Go's
+/// `StdEncoding` all reject unpadded input, while Node's `Buffer.from` and
+/// `atob` accept it. So the first caller to try it decided whether the bug was
+/// visible at all — and when it did fail, `content_type`, `size_bytes` and
+/// `filename` were all correct, so it read as a corrupt or still-encrypted
+/// file rather than as an encoding fault.
+///
+/// Do not "simplify" this back to `STANDARD_NO_PAD`. Adding padding is
+/// backwards-compatible; removing it is not.
+fn encode_attachment(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DownloadAttachmentResult {
     /// MIME type reported by the event's `info.mimetype` field,
@@ -2329,7 +2346,9 @@ pub struct DownloadAttachmentResult {
     pub content_type: String,
     /// Number of bytes in the decoded attachment.
     pub size_bytes: u64,
-    /// Base64-encoded (standard alphabet, no line breaks) file contents.
+    /// Base64-encoded file contents: standard alphabet, **padded**, no
+    /// line breaks. Decodes with a strict decoder — `base64.b64decode` in
+    /// Python, `STANDARD` in Rust, `StdEncoding` in Go — with no fix-up.
     pub body_base64: String,
     /// Original filename from the event (`filename` field, falling back
     /// to `body`), or `null` if the event type doesn't carry one.
@@ -5175,7 +5194,7 @@ impl MatrixMcpService {
                 ));
             }
 
-            let body_base64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes);
+            let body_base64 = encode_attachment(&bytes);
             let content_type =
                 mimetype.unwrap_or_else(|| "application/octet-stream".to_owned());
 
@@ -8390,6 +8409,48 @@ mod tests {
         assert!(validate_reaction_key(&at_limit).is_ok());
         let oversized = "a".repeat(MAX_REACTION_KEY_BYTES + 1);
         assert!(validate_reaction_key(&oversized).is_err());
+    }
+
+    #[test]
+    fn an_attachment_body_decodes_with_a_strict_decoder() {
+        // The shape of the bug this replaced: a payload whose length is a
+        // multiple of 3 encodes identically padded and unpadded, so a fixture
+        // of that length cannot see the fault at all. The 3n+1 and 3n+2 cases
+        // are the only ones that can, so both are here.
+        //
+        // Decoding with `STANDARD` rather than `STANDARD_NO_PAD` is the whole
+        // assertion: `STANDARD` requires canonical padding, so changing
+        // `encode_attachment` back turns this red rather than leaving it
+        // silently equivalent. What it cannot see is the call site choosing a
+        // different engine inline instead of calling this function — there is
+        // one such site and it is two lines from `size_bytes`.
+        use base64::Engine as _;
+        for len in [0usize, 1, 2, 3, 4, 5, 1_000, 1_001, 1_002] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i % 251).unwrap_or(0))
+                .collect();
+            let encoded = encode_attachment(&bytes);
+            assert_eq!(
+                encoded.len() % 4,
+                0,
+                "len {len}: standard base64 is padded to a multiple of four"
+            );
+            let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded);
+            assert!(
+                decoded.is_ok(),
+                "len {len}: a strict decoder rejected the body: {decoded:?}"
+            );
+            let decoded = decoded.unwrap_or_default();
+            // `size_bytes` is the decoded length, and the pair is the contract:
+            // a caller checks one against the other to decide the file arrived
+            // whole. That check is what the missing padding was breaking.
+            assert_eq!(
+                decoded.len(),
+                len,
+                "len {len}: decoded length is size_bytes"
+            );
+            assert_eq!(decoded, bytes, "len {len}: round trip");
+        }
     }
 
     #[test]
