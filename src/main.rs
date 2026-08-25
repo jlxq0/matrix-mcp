@@ -750,6 +750,25 @@ mod tests {
         assert!(full_tools.iter().any(|n| n == "room_ban"));
     }
 
+    #[tokio::test]
+    async fn every_channel_tool_is_actually_advertised() {
+        // The test above runs advertised ⊆ CHANNEL_TOOLS, and that direction
+        // cannot see a name added to the const and never wired to the mount:
+        // the advertised list is simply shorter, and every entry in it still
+        // checks out. The symptom of that bug is indistinguishable from not
+        // having the tool at all — the model is told it exists and every call
+        // fails — so assert the other direction, over the real router.
+        let (_mas, app) = mas_backed_router().await;
+        let channel_tools = tool_names_on(&app, "/channel").await.unwrap();
+        for name in crate::channel::CHANNEL_TOOLS {
+            assert!(
+                channel_tools.iter().any(|n| n == name),
+                "{name} is in CHANNEL_TOOLS but /channel does not advertise it; \
+                 advertised: {channel_tools:?}"
+            );
+        }
+    }
+
     /// Active-token introspection body that audiences correctly for our test
     /// resource URL.
     fn active_introspection_body() -> Value {
