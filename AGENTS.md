@@ -96,3 +96,22 @@
   approval prompt into a room he controls. Neither ordering is visible in a
   diff, so both live in named functions (`classify_inbound`, `remember_room`)
   with the gate as an argument rather than as preceding statements.
+- **When a bug report's acceptance criterion is a count this server already
+  logs, read the log before writing the fix.** Every channel push logs `live`
+  and `written`:
+
+      kubectl logs -n matrix-mcp <pod> | grep '"channel: pushed"'
+
+  so "is `notify` fanning out to stale peers?" is answerable in one command.
+  #120 reported one event delivered three times and named peer accumulation as
+  the cause, reasoning correctly about code that really does write once per live
+  peer. Every push in the pod's life read `live=1 written=1`, the event appeared
+  once, and there had never been a second peer — the duplication was in the
+  client's transcript, byte-identical copies of the original tag with no server
+  write behind two of the three.
+
+  The cost of skipping the check was not the wasted work. The recommended fix,
+  de-duplicating on event id per mxid at the send, would have broken two
+  sessions authenticated as one identity — a supported shape — while suppressing
+  nothing, because there was no second call to suppress. A cause that explains
+  the symptom and fits the code is still a hypothesis.
