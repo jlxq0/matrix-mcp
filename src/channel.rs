@@ -556,12 +556,15 @@ async fn replay_room(
 
     let deliverable: Vec<_> = unseen
         .into_iter()
-        .filter(|e| {
-            e.sender
+        .filter_map(|e| {
+            let allowed_sender = e
+                .sender
                 .as_deref()
-                .is_some_and(|s| s != mxid && allowed.iter().any(|a| a == s))
-                && e.untrusted_body.is_some()
-                && is_text_message(e)
+                .is_some_and(|s| s != mxid && allowed.iter().any(|a| a == s));
+            if !allowed_sender {
+                return None;
+            }
+            carried_of(&e).map(|c| (e, c))
         })
         .take(budget)
         .collect();
@@ -587,9 +590,15 @@ async fn replay_room(
     }
 
     let mut replayed = 0usize;
-    for event in deliverable {
-        let (Some(body), Some(sender), Some(id)) =
-            (&event.untrusted_body, &event.sender, &event.event_id)
+    for (event, carried) in deliverable {
+        let (Some(sender), Some(id)) = (&event.sender, &event.event_id) else {
+            continue;
+        };
+        // `untrusted_body` is filled from `content.body` for any event that
+        // has one, so for an uncaptioned upload it holds the filename. Sending
+        // that as prose is the thing the live path refused to do, and it must
+        // refuse here too or the two paths disagree in the other direction.
+        let Some(body) = replay_body(room, sender, id, &carried, event.untrusted_body.as_deref())
         else {
             continue;
         };
@@ -599,10 +608,14 @@ async fn replay_room(
             ("event", id.clone()),
             ("replayed", "true".to_owned()),
         ];
+        if let Carried::Attachment { kind, filename, .. } = &carried {
+            meta.push(("attachment", (*kind).to_owned()));
+            meta.push(("filename", filename.clone()));
+        }
         if event.suspicious {
             meta.push(("suspicious", "true".to_owned()));
         }
-        let delivered = registry.notify(mxid, &cap_wrapped(body), &meta).await;
+        let delivered = registry.notify(mxid, &cap_wrapped(&body), &meta).await;
         if delivered == 0 {
             break;
         }
@@ -617,23 +630,106 @@ async fn replay_room(
     replayed
 }
 
-/// Whether a read event is an `m.text` message.
+/// The body to deliver for a replayed event, or `None` to skip it.
 ///
-/// The live path filters on `MessageType::Text` because an image or file event
-/// also carries a `body` — the sender's chosen filename — and pushing that as
-/// if it were a message misrepresents what arrived. Replay reads through
-/// `read_events_from_chunk`, which fills `untrusted_body` from `content.body`
-/// for any event that has one, so without this the two paths disagree and a
-/// payload uploaded as a filename is delivered on the next attach having never
-/// appeared live.
-fn is_text_message(event: &crate::mcp::ReadEvent) -> bool {
-    event
-        .event
-        .as_ref()
-        .and_then(|raw| raw.get("content"))
-        .and_then(|content| content.get("msgtype"))
-        .and_then(serde_json::Value::as_str)
-        == Some("m.text")
+/// `untrusted_body` is filled from `content.body` for **any** event that has
+/// one, so for an uncaptioned upload it holds the sender's filename. Delivering
+/// that as prose is exactly what the live path refuses to do, and refusing it
+/// here too is what keeps the two paths agreeing.
+fn replay_body(
+    room: &Room,
+    sender: &str,
+    event_id: &str,
+    carried: &Carried,
+    untrusted_body: Option<&str>,
+) -> Option<String> {
+    if matches!(carried, Carried::Attachment { caption: None, .. }) {
+        // Nothing was written, so nothing is delivered as prose. The wrapper
+        // still goes out, so an attachment has the same shape as any other
+        // event, and the filename travels as an escaped attribute rather than
+        // as a sentence.
+        return Some(
+            crate::content_sandbox::evaluate(
+                Some(room.room_id().as_str()),
+                Some(sender),
+                Some(event_id),
+                "",
+            )
+            .wrapped,
+        );
+    }
+    untrusted_body.map(str::to_owned)
+}
+
+/// What the channel carries for one `m.room.message`, and how to label it.
+///
+/// `m.text` is a message. `m.image`, `m.file`, `m.audio` and `m.video` are
+/// attachments, and the difference is not cosmetic: an agent must be able to
+/// tell "somebody said this" from "somebody sent a file called this".
+#[derive(Debug, PartialEq, Eq)]
+enum Carried {
+    /// An `m.text` body.
+    Message,
+    /// A media event. `caption` is the sender's words about the file, present
+    /// only when they wrote any.
+    Attachment {
+        kind: &'static str,
+        filename: String,
+        caption: Option<String>,
+    },
+}
+
+/// Split a media event's `body` into a caption and a filename.
+///
+/// **Per the Matrix spec, `body` is a caption when a `filename` field is
+/// present and differs from it, and the sender's filename otherwise.**
+/// `send_image` in `mcp.rs` already applies exactly this rule on the way out;
+/// this is the same rule on the way in.
+///
+/// This channel used to drop media events entirely, on the reasoning that a
+/// media `body` is "the sender's chosen filename" and pushing it as a message
+/// would misrepresent what arrived. That is true of an uncaptioned upload and
+/// false of a captioned one — and a photo with a caption, which is what Element
+/// on a phone sends, puts the caption in `body`. Three real instructions were
+/// lost that way before anybody noticed, because the reasoning was sound and
+/// the premise was wrong for the traffic that actually arrives.
+fn split_caption(body: &str, filename: Option<&str>) -> (Option<String>, String) {
+    match filename {
+        Some(f) if f != body => (Some(body.to_owned()), f.to_owned()),
+        Some(f) => (None, f.to_owned()),
+        None => (None, body.to_owned()),
+    }
+}
+
+/// Classify a raw `m.room.message` by its `msgtype`, for the replay path.
+///
+/// Returns `None` for anything the channel does not carry, so replay and the
+/// live handler agree about what a session is owed. They disagreed before: the
+/// live path dropped media and replay delivered its `body` from
+/// `read_events_from_chunk` on the next attach, so a caption arrived hours
+/// late, out of order, with nothing marking it as late. That is why this read
+/// as slowness rather than as loss.
+fn carried_of(event: &crate::mcp::ReadEvent) -> Option<Carried> {
+    let content = event.event.as_ref()?.get("content")?;
+    let msgtype = content.get("msgtype")?.as_str()?;
+    if msgtype == "m.text" {
+        return Some(Carried::Message);
+    }
+    let kind = match msgtype {
+        "m.image" => "m.image",
+        "m.file" => "m.file",
+        "m.audio" => "m.audio",
+        "m.video" => "m.video",
+        _ => return None,
+    };
+    let body = content.get("body").and_then(serde_json::Value::as_str)?;
+    let filename = content.get("filename").and_then(serde_json::Value::as_str);
+    let (caption, filename) = split_caption(body, filename);
+    Some(Carried::Attachment {
+        kind,
+        filename,
+        caption,
+    })
 }
 
 /// Attach the room-message handler that turns Matrix traffic into channel
@@ -690,11 +786,57 @@ async fn push_message(
         );
         return;
     }
-    // Text only for now. Images and files carry a body too, but pushing their
-    // filename as if it were a message would misrepresent what arrived.
-    let MessageType::Text(text) = &ev.content.msgtype else {
-        info!(mxid = %mxid, room = %room.room_id(), "channel: skipped, not an m.text message");
-        return;
+    // Text is a message; media is an attachment. See `split_caption` for the
+    // rule and for what dropping media cost.
+    let carried = match &ev.content.msgtype {
+        MessageType::Text(_) => Carried::Message,
+        MessageType::Image(c) => {
+            let (caption, filename) = split_caption(&c.body, c.filename.as_deref());
+            Carried::Attachment {
+                kind: "m.image",
+                filename,
+                caption,
+            }
+        }
+        MessageType::File(c) => {
+            let (caption, filename) = split_caption(&c.body, c.filename.as_deref());
+            Carried::Attachment {
+                kind: "m.file",
+                filename,
+                caption,
+            }
+        }
+        MessageType::Audio(c) => {
+            let (caption, filename) = split_caption(&c.body, c.filename.as_deref());
+            Carried::Attachment {
+                kind: "m.audio",
+                filename,
+                caption,
+            }
+        }
+        MessageType::Video(c) => {
+            let (caption, filename) = split_caption(&c.body, c.filename.as_deref());
+            Carried::Attachment {
+                kind: "m.video",
+                filename,
+                caption,
+            }
+        }
+        other => {
+            info!(
+                mxid = %mxid, room = %room.room_id(), msgtype = other.msgtype(),
+                "channel: skipped, msgtype not carried"
+            );
+            return;
+        }
+    };
+
+    // The text the sender wrote, which is the only part that is untrusted
+    // prose. An uncaptioned upload contributes none: its filename is metadata
+    // and is delivered as an attribute, escaped, rather than as a message.
+    let untrusted = match &carried {
+        Carried::Message => ev.content.body().to_owned(),
+        Carried::Attachment { caption, .. } => caption.clone().unwrap_or_default(),
     };
 
     // Same sandbox the read tools use. A channel event goes straight into a
@@ -706,13 +848,19 @@ async fn push_message(
         Some(room.room_id().as_str()),
         Some(ev.sender.as_str()),
         Some(ev.event_id.as_str()),
-        &cap_body(&text.body),
+        &cap_body(&untrusted),
     );
     let mut meta = vec![
         ("room", room.room_id().to_string()),
         ("sender", ev.sender.to_string()),
         ("event", ev.event_id.to_string()),
     ];
+    // A filename is chosen by the sender, so it is escaped like every other
+    // meta value rather than trusted because it looks like a filename.
+    if let Carried::Attachment { kind, filename, .. } = &carried {
+        meta.push(("attachment", (*kind).to_owned()));
+        meta.push(("filename", filename.clone()));
+    }
     if verdict.suspicious {
         meta.push(("suspicious", "true".to_owned()));
     }
@@ -732,6 +880,88 @@ async fn push_message(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn read_event(content: &serde_json::Value) -> crate::mcp::ReadEvent {
+        crate::mcp::ReadEvent {
+            event_id: Some("$e".to_owned()),
+            sender: Some("@a:example.com".to_owned()),
+            origin_server_ts: None,
+            status: "plaintext",
+            event: Some(serde_json::json!({ "content": content.clone() })),
+            in_reply_to: None,
+            is_thread_root: false,
+            thread_event_count: None,
+            untrusted_body: None,
+            suspicious: false,
+        }
+    }
+
+    #[test]
+    fn a_captioned_upload_yields_the_caption_and_the_filename() {
+        // The case that was being dropped: Element on a phone puts a photo's
+        // caption in `body` and the filename in `filename`.
+        let (caption, filename) = split_caption("look at this", Some("IMG_4021.jpeg"));
+        assert_eq!(caption.as_deref(), Some("look at this"));
+        assert_eq!(filename, "IMG_4021.jpeg");
+    }
+
+    #[test]
+    fn an_uncaptioned_upload_yields_no_caption() {
+        // Both spellings the spec allows for "no caption": filename absent,
+        // and filename equal to body.
+        let (caption, filename) = split_caption("IMG_4021.jpeg", None);
+        assert_eq!(caption, None);
+        assert_eq!(filename, "IMG_4021.jpeg");
+
+        let (caption, filename) = split_caption("IMG_4021.jpeg", Some("IMG_4021.jpeg"));
+        assert_eq!(caption, None, "a filename equal to body is not a caption");
+        assert_eq!(filename, "IMG_4021.jpeg");
+    }
+
+    #[test]
+    fn a_captioned_image_is_carried_as_an_attachment() {
+        let carried = carried_of(&read_event(&serde_json::json!({
+            "msgtype": "m.image",
+            "body": "the /mcp output you asked about",
+            "filename": "Screenshot.png",
+        })))
+        .expect("an image is carried");
+        assert_eq!(
+            carried,
+            Carried::Attachment {
+                kind: "m.image",
+                filename: "Screenshot.png".to_owned(),
+                caption: Some("the /mcp output you asked about".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn text_is_carried_as_a_message() {
+        let carried = carried_of(&read_event(&serde_json::json!({
+            "msgtype": "m.text",
+            "body": "hello",
+        })));
+        assert_eq!(carried, Some(Carried::Message));
+    }
+
+    #[test]
+    fn msgtypes_the_channel_does_not_carry_are_dropped() {
+        // m.notice is how bots talk, and feeding an agent its own estate's
+        // notices is the loop the sender check exists to prevent.
+        for msgtype in [
+            "m.notice",
+            "m.emote",
+            "m.location",
+            "m.key.verification.request",
+        ] {
+            let carried = carried_of(&read_event(&serde_json::json!({
+                "msgtype": msgtype,
+                "body": "x",
+            })));
+            assert_eq!(carried, None, "{msgtype} should not be carried");
+        }
+    }
 
     #[test]
     fn meta_keys_outside_the_identifier_alphabet_are_dropped() {
