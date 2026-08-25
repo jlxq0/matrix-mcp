@@ -155,7 +155,20 @@ struct Pending {
     /// for an id it did not issue, but it would leave us unable to say at our
     /// own layer whether a verdict was ever routed anywhere.
     session_key: String,
+    /// Distinguishes this entry from any later one reusing the same key.
+    ///
+    /// A delivery holds no lock while it awaits `send_notification`, so by
+    /// the time it succeeds the map may hold a *different* prompt at the same
+    /// `(mxid, request_id)` — an id can be reissued. Removing by key alone
+    /// would retire that newer prompt on the strength of an older delivery.
+    /// `Instant` cannot serve here: two entries created in the same tick
+    /// compare equal.
+    serial: u64,
 }
+
+/// Source of [`Pending::serial`]. Process-wide and monotonic; wrapping would
+/// need 2^64 permission prompts.
+static PENDING_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Outstanding prompts, keyed by `(mxid, request_id)`.
 ///
@@ -289,6 +302,21 @@ static PERMISSION_REPLY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
     regex::Regex::new(r"(?i)^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$")
         .expect("the verdict pattern is a literal and compiles")
 });
+
+/// Whether a permission prompt may be sent into a room in this state.
+///
+/// `Client::get_room` reads the local state store and hands back Left,
+/// Invited, Knocked and Banned rooms as readily as joined ones, so `Some` is
+/// not "joined" — the trap #113 fixed in `download_attachment`.
+///
+/// Written as an allowlist of one rather than as `!= Left`: matrix-sdk may add
+/// a state, and a new one must default to *refused*. A prompt is a request for
+/// a tool approval, and sending it into a room this account is not a member of
+/// is the one outcome with no recovery.
+#[must_use]
+pub const fn prompt_room_is_usable(state: RoomState) -> bool {
+    matches!(state, RoomState::Joined)
+}
 
 /// Classify one inbound text message.
 ///
@@ -706,6 +734,20 @@ impl ChannelRegistry {
         room
     }
 
+    /// Whether this identity has any permission prompt still answerable.
+    ///
+    /// An in-memory read of the pending map, cheap enough to sit on the
+    /// no-listener path — which is the common one, since sync runs for every
+    /// authenticated identity whether or not an agent is attached.
+    pub async fn has_pending(&self, mxid: &str) -> bool {
+        let guard = self.pending.read().await;
+        let any = guard
+            .iter()
+            .any(|((owner, _), p)| owner == mxid && p.issued.elapsed() < PENDING_TTL);
+        drop(guard);
+        any
+    }
+
     /// Record that `session_key` is waiting on `request_id`.
     ///
     /// Expired entries are pruned here rather than on a timer; if the cap is
@@ -734,11 +776,29 @@ impl ChannelRegistry {
             Pending {
                 issued: Instant::now(),
                 session_key,
+                serial: PENDING_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             },
         );
         let outstanding = guard.len();
         drop(guard);
         debug!(mxid = %mxid, request_id = %request_id, outstanding, "channel: permission prompt issued");
+    }
+
+    /// Retire a delivered prompt, but only if it is still the same one.
+    ///
+    /// No lock is held across `send_notification`, so by the time a delivery
+    /// succeeds the map may hold a *different* prompt at that key — an id can
+    /// be reissued. Removing by key alone would retire the newer prompt on
+    /// the strength of the older delivery, and the reply to it would then
+    /// read as unissued. Returns whether anything was removed.
+    async fn retire_if_current(&self, key: &(String, String), serial: u64) -> bool {
+        let mut guard = self.pending.write().await;
+        let current = guard.get(key).is_some_and(|p| p.serial == serial);
+        if current {
+            guard.remove(key);
+        }
+        drop(guard);
+        current
     }
 
     /// Send a verdict back to the session that asked for it.
@@ -748,14 +808,20 @@ impl ChannelRegistry {
     /// line is the only place the drop is observable at this layer.
     pub async fn deliver_verdict(&self, mxid: &str, request_id: &str, behavior: Behavior) -> bool {
         let key = (mxid.to_owned(), request_id.to_owned());
-        let session_key = {
+        // Look up, do not consume. The entry is retired only once the verdict
+        // has actually reached a peer: a missing peer or a failed send that
+        // had already dropped it would make the *second* `no qmzkd` from
+        // Matrix read as unissued while the terminal dialog is still open,
+        // and an outstanding entry costs nothing — the TTL and the cap bound
+        // the map either way.
+        let looked_up = {
             let mut guard = self.pending.write().await;
             guard.retain(|_, p| p.issued.elapsed() < PENDING_TTL);
-            let found = guard.remove(&key).map(|p| p.session_key);
+            let found = guard.get(&key).map(|p| (p.session_key.clone(), p.serial));
             drop(guard);
             found
         };
-        let Some(session_key) = session_key else {
+        let Some((session_key, serial)) = looked_up else {
             warn!(
                 mxid = %mxid, request_id = %request_id, behavior = behavior.as_str(),
                 "channel: verdict for an unissued or expired permission request; dropped"
@@ -774,7 +840,8 @@ impl ChannelRegistry {
         let Some(peer) = peer else {
             warn!(
                 mxid = %mxid, request_id = %request_id,
-                "channel: the session that asked for this permission is gone; verdict dropped"
+                "channel: the session that asked for this permission is gone; verdict not \
+                 delivered, and the request stays answerable until it expires"
             );
             return false;
         };
@@ -788,6 +855,7 @@ impl ChannelRegistry {
         ));
         match peer.send_notification(notification).await {
             Ok(()) => {
+                self.retire_if_current(&key, serial).await;
                 info!(
                     mxid = %mxid, request_id = %request_id, behavior = behavior.as_str(),
                     "channel: permission verdict relayed"
@@ -795,9 +863,12 @@ impl ChannelRegistry {
                 true
             }
             Err(e) => {
+                // Left pending deliberately: the terminal dialog is still
+                // open, so a second reply from Matrix must still be able to
+                // answer it.
                 warn!(
                     mxid = %mxid, request_id = %request_id, error = %e,
-                    "channel: could not relay permission verdict"
+                    "channel: could not relay permission verdict; request stays answerable"
                 );
                 false
             }
@@ -932,6 +1003,20 @@ async fn replay_room(
                 .as_deref()
                 .is_some_and(|s| s != mxid && allowed.iter().any(|a| a == s));
             if !allowed_sender {
+                return None;
+            }
+            // A permission verdict is answered live and never acknowledged,
+            // so the receipt watermark still sits behind it and replay finds
+            // it again. It is `m.text` with a body, so `carried_of` says
+            // `Message` and it would go out as prose — a fresh session
+            // reading `no qmzkd` with nothing to refer to, which is exactly
+            // what the live path refuses to do. The receipt is not the fix:
+            // advancing it would skip the unacknowledged messages behind it.
+            if is_replayed_verdict(&e) {
+                debug!(
+                    mxid = %mxid, event = ?e.event_id,
+                    "channel: not replaying a permission verdict as chat"
+                );
                 return None;
             }
             carried_of(&e).map(|c| (e, c))
@@ -1071,6 +1156,28 @@ fn split_caption(body: &str, filename: Option<&str>) -> (Option<String>, String)
     }
 }
 
+/// The `content.body` of a raw event, unwrapped.
+///
+/// **Not `ReadEvent::untrusted_body`**, which holds the *sandbox-wrapped*
+/// body: `<matrix:message ...>\n{body}\n</matrix:message>`. Anchored matching
+/// against that never fires, so a check written against it would look correct
+/// and do nothing.
+fn raw_body(event: &crate::mcp::ReadEvent) -> Option<&str> {
+    event.event.as_ref()?.get("content")?.get("body")?.as_str()
+}
+
+/// Whether a replayed event is a permission verdict that was already answered
+/// live, and so must not be delivered as chat.
+///
+/// `sender_allowed` is `true` because this is only reached past the replay
+/// path's own allowlist filter. That is the same gate the live path applies
+/// before [`classify_inbound`]; the two paths must agree about what a session
+/// is owed, and this is the half replay was missing.
+fn is_replayed_verdict(event: &crate::mcp::ReadEvent) -> bool {
+    raw_body(event)
+        .is_some_and(|body| matches!(classify_inbound(true, body), Inbound::Verdict { .. }))
+}
+
 /// Classify a raw `m.room.message` by its `msgtype`, for the replay path.
 ///
 /// Returns `None` for anything the channel does not carry, so replay and the
@@ -1194,8 +1301,19 @@ async fn push_message(
 ) {
     // Cheapest checks first. Sync runs for every authenticated identity
     // whether or not an agent is attached, so the common case is no listener.
+    //
+    // `live_peers` counts without evicting, because `is_transport_closed`
+    // false-positives and evicting on a read once killed the channel for a
+    // whole session. That same false positive would make `live == 0` while
+    // `deliver_verdict` still finds the peer in the map and sends to it
+    // successfully — so returning here unconditionally drops the verdict for
+    // a dialog that is still open at the terminal. An identity with an
+    // outstanding prompt is therefore worth the rest of this function even
+    // when nothing looks live. The extra work is one in-memory map read, and
+    // only on the path that was about to return anyway.
     let live = registry.live_peers(mxid).await;
-    if live == 0 {
+    let outstanding = live == 0 && registry.has_pending(mxid).await;
+    if live == 0 && !outstanding {
         info!(mxid = %mxid, room = %room.room_id(), "channel: skipped, no live session");
         return;
     }
@@ -1221,6 +1339,17 @@ async fn push_message(
     // and with the allowlist verdict in hand — because anyone who can get a
     // verdict through it can approve tool use in the session.
     if handled_as_verdict(registry, mxid, room, ev, sender_allowed).await {
+        return;
+    }
+
+    // Only reachable with `outstanding` set: this identity has a prompt open
+    // but nothing is listening, and the message was not the answer to it.
+    // Everything below exists to push into a context that is not there.
+    if live == 0 {
+        info!(
+            mxid = %mxid, room = %room.room_id(),
+            "channel: skipped, no live session (looked anyway: a permission prompt is open)"
+        );
         return;
     }
 
@@ -1743,19 +1872,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_verdict_is_answerable_exactly_once() {
+    async fn a_delivered_verdict_is_answerable_exactly_once() {
+        // What `deliver_verdict` does on its success path, minus the peer it
+        // cannot have in a unit test. Retiring the entry is what stops a
+        // replayed `yes abcde` re-approving a later prompt that reuses the id.
         let reg = ChannelRegistry::new();
+        let key = ("@a:example.com".to_owned(), "abcde".to_owned());
         reg.record_request("@a:example.com", "abcde", "session-1".to_owned())
             .await;
-        // No live peer, so this is false either way; what it proves is that
-        // the entry is consumed, so a replayed `yes abcde` cannot re-approve
-        // a later prompt that happens to reuse the id.
-        reg.deliver_verdict("@a:example.com", "abcde", Behavior::Allow)
-            .await;
+        let serial = reg.pending.read().await[&key].serial;
+        assert!(reg.retire_if_current(&key, serial).await);
         assert!(
             reg.pending.read().await.is_empty(),
             "an answered request stayed pending"
         );
+        // Answering it a second time finds nothing to retire.
+        assert!(!reg.retire_if_current(&key, serial).await);
     }
 
     #[tokio::test]
@@ -1825,6 +1957,167 @@ mod tests {
         )
         .unwrap();
         assert_eq!(set.permission_room.as_deref(), Some("!r:example.com"));
+    }
+
+    #[test]
+    fn a_verdict_is_not_replayed_into_a_fresh_context_as_chat() {
+        // A verdict is consumed live and never acknowledged, so the receipt
+        // watermark stays behind it and replay finds it again. It is `m.text`
+        // with a body, so `carried_of` says `Message` and it would go out as
+        // prose: a new session reading `no qmzkd` with nothing to refer to.
+        // The live path refuses to do that; replay must agree, or the two
+        // paths disagree about one event — the #107 bug in another costume.
+        for body in ["no qmzkd", "yes qmzkd", "Y QMZKD", "  n abcde  "] {
+            let event = read_event(&serde_json::json!({ "msgtype": "m.text", "body": body }));
+            assert!(
+                is_replayed_verdict(&event),
+                "{body} would be replayed as chat"
+            );
+        }
+        // An ordinary message still replays. A filter that dropped everything
+        // would pass the assertions above and lose the channel's whole point.
+        for body in ["yes", "yes please do it", "no idea", "deploy the thing"] {
+            let event = read_event(&serde_json::json!({ "msgtype": "m.text", "body": body }));
+            assert!(!is_replayed_verdict(&event), "{body} must still replay");
+        }
+    }
+
+    #[test]
+    fn the_replay_verdict_check_reads_the_unwrapped_body() {
+        // `ReadEvent::untrusted_body` holds the *sandbox-wrapped* body, and
+        // the verdict pattern is anchored, so a check written against that
+        // field matches nothing and silently does nothing at all. This test
+        // is what tells the two apart.
+        let mut event = read_event(&serde_json::json!({
+            "msgtype": "m.text", "body": "no qmzkd",
+        }));
+        event.untrusted_body = Some(
+            crate::content_sandbox::evaluate(
+                Some("!r:example.com"),
+                Some("@a:example.com"),
+                Some("$e"),
+                "no qmzkd",
+            )
+            .wrapped,
+        );
+        assert_ne!(
+            event.untrusted_body.as_deref(),
+            Some("no qmzkd"),
+            "the fixture is not exercising the wrapper"
+        );
+        assert_eq!(
+            classify_inbound(true, event.untrusted_body.as_deref().unwrap_or_default()),
+            Inbound::Chat,
+            "the wrapped body must NOT match — that is the trap"
+        );
+        assert!(
+            is_replayed_verdict(&event),
+            "the check must read content.body, not untrusted_body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verdict_that_reached_nobody_stays_answerable() {
+        // The terminal dialog is still open, so a second `no qmzkd` from
+        // Matrix must still be able to answer it. Consuming the entry on a
+        // path that did not deliver makes the retry read as unissued.
+        let reg = ChannelRegistry::new();
+        reg.record_request("@a:example.com", "qmzkd", "session-1".to_owned())
+            .await;
+        // No live peer under that session key, so this cannot have delivered.
+        assert!(
+            !reg.deliver_verdict("@a:example.com", "qmzkd", Behavior::Deny)
+                .await
+        );
+        assert!(
+            reg.pending
+                .read()
+                .await
+                .contains_key(&("@a:example.com".to_owned(), "qmzkd".to_owned())),
+            "an undelivered verdict retired the request anyway"
+        );
+        // And it is still answerable, rather than merely still in the map.
+        assert!(reg.has_pending("@a:example.com").await);
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_delivery_cannot_retire_a_reissued_prompt() {
+        // The conjunction the serial exists for: same key, different prompt.
+        // Removing by key alone would retire the *newer* one, and the reply
+        // to it would then read as unissued while its dialog is still open.
+        let reg = ChannelRegistry::new();
+        let key = ("@a:example.com".to_owned(), "abcde".to_owned());
+        reg.record_request("@a:example.com", "abcde", "session-1".to_owned())
+            .await;
+        let stale = reg.pending.read().await[&key].serial;
+        reg.record_request("@a:example.com", "abcde", "session-2".to_owned())
+            .await;
+        assert!(
+            !reg.retire_if_current(&key, stale).await,
+            "a stale delivery retired the prompt that replaced it"
+        );
+        assert_eq!(
+            reg.pending.read().await[&key].session_key,
+            "session-2",
+            "the reissued prompt must survive, pointing at its own session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verdict_is_looked_for_even_when_nothing_looks_live() {
+        // `live_peers` counts without evicting because `is_transport_closed`
+        // false-positives, so `live == 0` does not mean `deliver_verdict`
+        // would fail to find the peer. An identity with an open prompt is
+        // worth looking at; one without is the common case and returns early.
+        let reg = ChannelRegistry::new();
+        assert_eq!(reg.live_peers("@a:example.com").await, 0);
+        assert!(
+            !reg.has_pending("@a:example.com").await,
+            "nothing outstanding: push_message returns at the top"
+        );
+        reg.record_request("@a:example.com", "qmzkd", "session-1".to_owned())
+            .await;
+        assert!(
+            reg.has_pending("@a:example.com").await,
+            "an open prompt with no live peer must not short-circuit the verdict branch"
+        );
+        // Scoped to the identity: @b's silence is not @a's business.
+        assert!(!reg.has_pending("@b:example.com").await);
+    }
+
+    #[tokio::test]
+    async fn an_expired_prompt_does_not_keep_the_no_listener_path_awake() {
+        // `has_pending` gates work on the common no-listener path, so an
+        // entry past its TTL must not hold it open.
+        let reg = ChannelRegistry::new();
+        reg.record_request("@a:example.com", "qmzkd", "session-1".to_owned())
+            .await;
+        reg.pending
+            .write()
+            .await
+            .values_mut()
+            .for_each(|p| p.issued -= PENDING_TTL + Duration::from_secs(1));
+        assert!(!reg.has_pending("@a:example.com").await);
+    }
+
+    #[test]
+    fn a_prompt_only_goes_into_a_joined_room() {
+        // `get_room` returning `Some` is not "joined": the local state store
+        // holds Left, Invited, Knocked and Banned rooms too. Enumerated so a
+        // check written as `!= Left` fails here, and so a state added by a
+        // future matrix-sdk defaults to refused rather than allowed.
+        assert!(prompt_room_is_usable(RoomState::Joined));
+        for state in [
+            RoomState::Left,
+            RoomState::Invited,
+            RoomState::Knocked,
+            RoomState::Banned,
+        ] {
+            assert!(
+                !prompt_room_is_usable(state),
+                "{state:?} is not a room this account can send into"
+            );
+        }
     }
 
     #[test]

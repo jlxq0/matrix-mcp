@@ -2628,7 +2628,7 @@ impl MatrixMcpService {
             // left, knocked, banned) — not only joined rooms. Require
             // Joined to match the tool description and the behaviour of
             // sibling read tools (room_info, etc.).
-            if room.state() != matrix_sdk::RoomState::Joined {
+            if !crate::channel::prompt_room_is_usable(room.state()) {
                 return Err(ErrorData::invalid_params(
                     format!(
                         "not joined to {room_id} (current state: {:?})",
@@ -7239,10 +7239,23 @@ impl ServerHandler for MatrixMcpService {
         let Some(room) = client.get_room(&parsed) else {
             tracing::warn!(
                 mxid = %identity.mxid, room = %room_id,
-                "channel: not joined to the permission room; prompt not relayed"
+                "channel: permission room is unknown to this account; prompt not relayed"
             );
             return;
         };
+        // `get_room` reads the local state store and hands back Left, Invited,
+        // Knocked and Banned rooms too, so `Some` is not "joined" — the same
+        // trap #113 fixed in `download_attachment`. Without this the send
+        // fails with `WrongRoomState` further down, which leaks nothing but
+        // retains a pending id for a prompt nobody ever saw and tells the
+        // operator the wrong thing twice.
+        if room.state() != matrix_sdk::RoomState::Joined {
+            tracing::warn!(
+                mxid = %identity.mxid, room = %room_id, state = ?room.state(),
+                "channel: permission room is not joined; prompt not relayed"
+            );
+            return;
+        }
 
         // Recorded before the send, so a verdict cannot beat its own request
         // into the map. The reverse order would drop the fastest answers.
