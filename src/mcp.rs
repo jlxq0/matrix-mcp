@@ -2628,7 +2628,7 @@ impl MatrixMcpService {
             // left, knocked, banned) — not only joined rooms. Require
             // Joined to match the tool description and the behaviour of
             // sibling read tools (room_info, etc.).
-            if !crate::channel::prompt_room_is_usable(room.state()) {
+            if room.state() != matrix_sdk::RoomState::Joined {
                 return Err(ErrorData::invalid_params(
                     format!(
                         "not joined to {room_id} (current state: {:?})",
@@ -7249,7 +7249,7 @@ impl ServerHandler for MatrixMcpService {
         // fails with `WrongRoomState` further down, which leaks nothing but
         // retains a pending id for a prompt nobody ever saw and tells the
         // operator the wrong thing twice.
-        if room.state() != matrix_sdk::RoomState::Joined {
+        if !crate::channel::prompt_room_is_usable(room.state()) {
             tracing::warn!(
                 mxid = %identity.mxid, room = %room_id, state = ?room.state(),
                 "channel: permission room is not joined; prompt not relayed"

@@ -855,7 +855,19 @@ impl ChannelRegistry {
         ));
         match peer.send_notification(notification).await {
             Ok(()) => {
-                self.retire_if_current(&key, serial).await;
+                // A `false` here is the case the serial exists for: this
+                // delivery was in flight while the id was reissued, so the
+                // entry at this key belongs to a newer prompt and retiring it
+                // would make that one's reply read as unissued. Declining is
+                // correct; being unable to tell it happened is not, because
+                // the mechanism would then never be observed working.
+                if !self.retire_if_current(&key, serial).await {
+                    warn!(
+                        mxid = %mxid, request_id = %request_id,
+                        "channel: verdict delivered for a request that was reissued \
+                         mid-flight; left the newer prompt answerable"
+                    );
+                }
                 info!(
                     mxid = %mxid, request_id = %request_id, behavior = behavior.as_str(),
                     "channel: permission verdict relayed"
@@ -995,34 +1007,7 @@ async fn replay_room(
     unseen.truncate(REPLAY_MAX);
     unseen.reverse(); // oldest first, so the session reads them in order
 
-    let deliverable: Vec<_> = unseen
-        .into_iter()
-        .filter_map(|e| {
-            let allowed_sender = e
-                .sender
-                .as_deref()
-                .is_some_and(|s| s != mxid && allowed.iter().any(|a| a == s));
-            if !allowed_sender {
-                return None;
-            }
-            // A permission verdict is answered live and never acknowledged,
-            // so the receipt watermark still sits behind it and replay finds
-            // it again. It is `m.text` with a body, so `carried_of` says
-            // `Message` and it would go out as prose — a fresh session
-            // reading `no qmzkd` with nothing to refer to, which is exactly
-            // what the live path refuses to do. The receipt is not the fix:
-            // advancing it would skip the unacknowledged messages behind it.
-            if is_replayed_verdict(&e) {
-                debug!(
-                    mxid = %mxid, event = ?e.event_id,
-                    "channel: not replaying a permission verdict as chat"
-                );
-                return None;
-            }
-            carried_of(&e).map(|c| (e, c))
-        })
-        .take(budget)
-        .collect();
+    let deliverable = replay_deliverable(unseen, mxid, allowed, budget);
     if deliverable.is_empty() {
         return 0;
     }
@@ -1154,6 +1139,50 @@ fn split_caption(body: &str, filename: Option<&str>) -> (Option<String>, String)
         Some(f) => (None, f.to_owned()),
         None => (None, body.to_owned()),
     }
+}
+
+/// Decide what a reconnecting session is owed out of the events behind its
+/// read receipt.
+///
+/// A free function rather than a closure inside [`replay_room`] because it is
+/// the whole of replay's judgement and the rest of that function is a
+/// homeserver round trip. As a closure none of this was reachable from a test:
+/// deleting the verdict check left the suite green, which is the state a fix
+/// for a replay bug must not ship in.
+fn replay_deliverable(
+    unseen: Vec<crate::mcp::ReadEvent>,
+    mxid: &str,
+    allowed: &[String],
+    budget: usize,
+) -> Vec<(crate::mcp::ReadEvent, Carried)> {
+    unseen
+        .into_iter()
+        .filter_map(|e| {
+            let allowed_sender = e
+                .sender
+                .as_deref()
+                .is_some_and(|s| s != mxid && allowed.iter().any(|a| a == s));
+            if !allowed_sender {
+                return None;
+            }
+            // A permission verdict is answered live and never acknowledged,
+            // so the receipt watermark still sits behind it and replay finds
+            // it again. It is `m.text` with a body, so `carried_of` says
+            // `Message` and it would go out as prose — a fresh session
+            // reading `no qmzkd` with nothing to refer to, which is exactly
+            // what the live path refuses to do. The receipt is not the fix:
+            // advancing it would skip the unacknowledged messages behind it.
+            if is_replayed_verdict(&e) {
+                debug!(
+                    mxid = %mxid, event = ?e.event_id,
+                    "channel: not replaying a permission verdict as chat"
+                );
+                return None;
+            }
+            carried_of(&e).map(|c| (e, c))
+        })
+        .take(budget)
+        .collect()
 }
 
 /// The `content.body` of a raw event, unwrapped.
@@ -1424,6 +1453,82 @@ async fn push_message(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// `read_event` with the sender overridden, for the replay-filter tests.
+    fn read_event_from(sender: &str, content: &serde_json::Value) -> crate::mcp::ReadEvent {
+        crate::mcp::ReadEvent {
+            sender: Some(sender.to_owned()),
+            ..read_event(content)
+        }
+    }
+
+    #[test]
+    fn replay_drops_verdicts_and_strangers_and_keeps_everything_else() {
+        // This is the whole of replay's judgement, and until it was lifted out
+        // of `replay_room`'s closure none of it was reachable: stubbing the
+        // verdict check left all 235 tests green, which is the state a fix for
+        // a replay bug must not ship in.
+        let allowed = vec!["@a:example.com".to_owned()];
+        let text = |body: &str| serde_json::json!({ "msgtype": "m.text", "body": body });
+        let unseen = vec![
+            read_event_from("@a:example.com", &text("what is the deploy status")),
+            // Answered live, never acknowledged, so the watermark still sits
+            // behind it and replay finds it again.
+            read_event_from("@a:example.com", &text("no qmzkd")),
+            read_event_from("@a:example.com", &text("YES  abcde  ")),
+            // Not allowlisted: `yes abcde` from a stranger is not a verdict
+            // and is not chat either.
+            read_event_from("@stranger:example.com", &text("yes abcde")),
+            // The identity's own message never comes back to it.
+            read_event_from("@me:example.com", &text("hello")),
+            read_event_from("@a:example.com", &text("and the second question")),
+        ];
+        let out = replay_deliverable(unseen, "@me:example.com", &allowed, 100);
+        let bodies: Vec<String> = out
+            .iter()
+            .map(|(e, _)| raw_body(e).unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                "what is the deploy status".to_owned(),
+                "and the second question".to_owned()
+            ],
+            "verdicts, strangers and self must all be dropped, and nothing else"
+        );
+    }
+
+    #[test]
+    fn the_replay_filter_does_not_drop_everything() {
+        // The control for the control. A filter that returns `None` for every
+        // event satisfies "a verdict is not replayed" while destroying the
+        // channel, and the assertion above would still pass if it only checked
+        // that no verdict survived.
+        let allowed = vec!["@a:example.com".to_owned()];
+        let out = replay_deliverable(
+            vec![read_event_from(
+                "@a:example.com",
+                &serde_json::json!({ "msgtype": "m.text", "body": "ordinary" }),
+            )],
+            "@me:example.com",
+            &allowed,
+            100,
+        );
+        assert_eq!(out.len(), 1, "replay stopped delivering anything at all");
+    }
+
+    #[test]
+    fn the_replay_budget_is_respected() {
+        let allowed = vec!["@a:example.com".to_owned()];
+        let text = serde_json::json!({ "msgtype": "m.text", "body": "x" });
+        let unseen: Vec<_> = (0..5)
+            .map(|_| read_event_from("@a:example.com", &text))
+            .collect();
+        assert_eq!(
+            replay_deliverable(unseen, "@me:example.com", &allowed, 2).len(),
+            2
+        );
+    }
 
     fn read_event(content: &serde_json::Value) -> crate::mcp::ReadEvent {
         crate::mcp::ReadEvent {

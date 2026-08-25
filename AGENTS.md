@@ -70,7 +70,6 @@
   rewrite. A thirteenth attribute, `chunks_exact_to_as_chunks`, *was* removable
   and was removed: its comment claimed `as_chunks::<2>()` postdated the MSRV,
   and it compiles on 1.93.0. Check that claim before trusting the next one.
-<<<<<<< HEAD
 - **This crate needs two different base64 alphabets and the wrong one fails
   silently on half its inputs.** PKCE in `setup.rs` requires `URL_SAFE_NO_PAD`
   — RFC 7636 specifies unpadded — while `download_attachment`'s `body_base64`
@@ -84,8 +83,6 @@
   A payload whose length is a multiple of three encodes identically with and
   without padding, so any fixture of that length is blind to this. Test 3n+1
   and 3n+2 and decode strictly.
-||||||| parent of 93d2b1e (feat(channel): relay permission prompts through Matrix)
-=======
 - A byte-slicing cap is not proven safe by a fixture built from one repeated
   multi-byte character. `"ü".repeat(n)` puts a character boundary at every even
   offset and `"→".repeat(n)` at every multiple of three, so if the cap is such
@@ -99,4 +96,3 @@
   approval prompt into a room he controls. Neither ordering is visible in a
   diff, so both live in named functions (`classify_inbound`, `remember_room`)
   with the gate as an argument rather than as preceding statements.
->>>>>>> 93d2b1e (feat(channel): relay permission prompts through Matrix)
