@@ -561,3 +561,30 @@
   **`git diff --check` exits 2, not 1**, and it also fires on whitespace
   errors, so a non-zero exit from it is not specifically a conflict. Use the
   `--diff-filter=U` form when you want the question answered exactly.
+||||||| parent of 3d6df99 (docs: what a merge to main does, and how to read a cancelled run)
+
+## Releasing, and reading CI
+
+**A merge to `main` deploys nothing.** `.forgejo/workflows/ci.yml` runs the
+`docker` job on any non-pull-request event, but its step is *"Build (and push
+on tag)"* and the GHCR mirror is gated on `refs/tags/v`. So a merge builds the
+image and validates it, publishes nothing, and changes nothing that is running.
+
+**Publishing is a `v*` tag**, and that is the deliberate gate. Cutting one is a
+decision; merging is not. Check which of the two you are doing before you do
+it — this repository carries the channel every agent's inbound Matrix traffic
+arrives on, so an unintended rollout is not visible in the usual way. The thing
+that would tell you is the running image tag, not the merge.
+
+**A cancelled run and a failed run look identical from outside.** Forgejo
+cancels an in-flight run when a newer push lands on the same ref, so a branch
+pushed twice in a minute leaves the first run reading `cancelled` whatever it
+was about to do. Two ways it misleads:
+
+- a run that had already reached a real failure reads as "superseded";
+- and the version not changing reads as "still queued" rather than "never
+  built".
+
+Read job *statuses by commit* rather than asking whether anything moved, and
+batch a branch's work into one push rather than resetting your own place in the
+queue.
