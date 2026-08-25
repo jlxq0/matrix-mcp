@@ -34,3 +34,39 @@
   reports as the file. Nothing errors, and a test that only asserts a
   non-empty body passes. Verified against matrix-sdk 0.17 `src/media.rs:450`
   on 2026-08-25. Do not trim that feature to slim the image.
+- **The tree builds on rustc 1.93 and lints only on clippy 1.98, and those are
+  two different floors.** `Cargo.toml`'s `rust-version = "1.93"` and the
+  digest-pinned `rust:1.93-bookworm` builder are correct, and the builder makes
+  that a gate rather than a comment: `cargo check --all-features --locked`
+  passes on 1.93.0, and anything needing past 1.93 fails the release build.
+  `cargo clippy -D warnings` is the other floor, and the reason is not the
+  code. `#[allow]` attributes across `src/` name lints that did not exist yet,
+  and an `#[allow]` naming a lint the running clippy does not have is itself an
+  error under `-D warnings`.
+
+  Counted by clippy rather than by grep, because
+  `#[allow(clippy::unwrap_used, clippy::duration_suboptimal_units)]` in
+  `rate_limit.rs` is one line and two suppressions. Measured 2026-08-25 on
+  `cargo clippy --all-targets --all-features --locked -- -D warnings`:
+
+  | clippy | before this change | after |
+  |---|---|---|
+  | 1.93.0 | 13 `unknown lint` | 12 |
+  | 1.96.0 | 2 | 1 |
+  | 1.97.1 | — | 1 |
+  | 1.98.0 | 0 | 0 |
+
+  The 12 remaining are 11 `duration_suboptimal_units` and one
+  `unused_async_trait_impl`. 1.98.0 is the *first* clean toolchain, not a
+  promise that later ones stay clean — a clippy release adds lints, and each
+  one fires on code nobody touched. That is why `ci.yml` names `1.98.0` rather
+  than `stable` or a range. Classify a red clippy with `cargo clippy --version`
+  before reading the diff.
+- **Do not delete a `duration_suboptimal_units` or `unused_async_trait_impl`
+  allow to lower that floor.** All eleven of the first suppress a suggestion to
+  use `Duration::from_mins`/`from_days`, which are still unstable on 1.98
+  (`E0658: duration_constructors`) — taking clippy's advice does not compile.
+  The second fires on code `#[tool_handler]` generates, so there is nothing to
+  rewrite. A thirteenth attribute, `chunks_exact_to_as_chunks`, *was* removable
+  and was removed: its comment claimed `as_chunks::<2>()` postdated the MSRV,
+  and it compiles on 1.93.0. Check that claim before trusting the next one.

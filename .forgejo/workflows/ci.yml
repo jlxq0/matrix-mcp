@@ -30,9 +30,15 @@ jobs:
       # force-pushes `stable`, so the mirror's 24h sync prunes the old tip and
       # the pin 404s — the job then dies in ~2s with no steps and no error.
       # master/v1 is append-only. It has no default `toolchain`.
+      # An exact version, not `stable`. With `RUSTFLAGS: -Dwarnings` a moving
+      # stable means the next clippy release fires a new lint on untouched code
+      # and reds whatever pull request happens to be open, and each `#[allow]`
+      # added to quiet one raises the version below which nobody can lint the
+      # tree at all — silently, because CI is always on the new side of it.
+      # Bump this deliberately, in its own change, and read AGENTS.md first.
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
         with:
-          toolchain: stable
+          toolchain: "1.98.0"
           components: rustfmt, clippy
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
