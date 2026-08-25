@@ -189,8 +189,8 @@ pub const CHANNEL_TOOLS: &[&str] = &[
     "mark_read",
     // Without this a session is told a file arrived — `attachment="m.image"`,
     // `filename="..."` — and cannot open it, which is the notice and never the
-    // bytes. Routing already scopes this mount to one authenticated identity
-    // and the tool takes a `room_id` the identity must be joined to, so it
+    // bytes. Routing already scopes this mount to one authenticated identity,
+    // and the tool now requires that identity to be joined to the room, so it
     // reaches nothing `read_recent_messages` does not already reach.
     "download_attachment",
 ];

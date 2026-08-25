@@ -5021,6 +5021,20 @@ impl MatrixMcpService {
             let room = client.get_room(&room_id).ok_or_else(|| {
                 ErrorData::invalid_params(format!("not joined to {room_id}"), None)
             })?;
+            // `get_room()` reads the SDK's local store, which holds invited,
+            // left, knocked and banned rooms too — so its `Some` says the
+            // identity has heard of the room, not that it is in it. Same guard
+            // as `read_thread` and `room_info`; without it "not joined to" was
+            // the error message for a case that was never checked.
+            if room.state() != matrix_sdk::RoomState::Joined {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "not joined to {room_id} (current state: {:?})",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
 
             let event_id: OwnedEventId = params.event_id.parse().map_err(|e| {
                 ErrorData::invalid_params(
