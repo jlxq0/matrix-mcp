@@ -34,3 +34,22 @@
   reports as the file. Nothing errors, and a test that only asserts a
   non-empty body passes. Verified against matrix-sdk 0.17 `src/media.rs:450`
   on 2026-08-25. Do not trim that feature to slim the image.
+- **The tree builds on rustc 1.93 and lints only on clippy >= 1.98, and those
+  are two different floors.** `Cargo.toml`'s `rust-version = "1.93"` and the
+  digest-pinned `rust:1.93-bookworm` builder are correct: `cargo check
+  --all-features --locked` passes on 1.93.0. `cargo clippy -D warnings` does
+  not, and the reason is not the code. Twelve `#[allow]` attributes name lints
+  that did not exist yet, and an `#[allow]` naming a lint the running clippy
+  does not have is itself an error under `-D warnings`. Measured 2026-08-25:
+  1.93.0 gives 12 `unknown lint` errors, 1.96.0 gives 1, 1.98.0 is clean.
+  `ci.yml` pins `1.98.0` so the floor is written down rather than inferred from
+  whatever `stable` resolved to that morning. Classify a red clippy with
+  `cargo clippy --version` before reading the diff.
+- **Do not delete a `duration_suboptimal_units` or `unused_async_trait_impl`
+  allow to lower that floor.** All eleven of the first suppress a suggestion to
+  use `Duration::from_mins`/`from_days`, which are still unstable on 1.98
+  (`E0658: duration_constructors`) — taking clippy's advice does not compile.
+  The second fires on code `#[tool_handler]` generates, so there is nothing to
+  rewrite. A twelfth, `chunks_exact_to_as_chunks`, *was* removable and was
+  removed: its comment claimed `as_chunks::<2>()` postdated the MSRV, and it
+  compiles on 1.93.0. Check that claim before trusting the next one.
