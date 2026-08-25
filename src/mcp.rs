@@ -8430,7 +8430,7 @@ mod tests {
         let riff_size = u32::try_from(wav.len() - 8).unwrap();
         wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
 
-        let parsed = parse_wav_mono_16bit(&wav).expect("a well-formed mono 16-bit WAV parses");
+        let parsed = parse_wav_mono_16bit(&wav).expect("mono 16-bit PCM with a data chunk parses");
         assert_eq!(parsed.sample_rate, 24_000);
         assert_eq!(
             parsed.samples,
