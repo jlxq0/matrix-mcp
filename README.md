@@ -18,7 +18,7 @@ Two mounts, sharing one deployment's auth, clients and encrypted stores:
 | Mount | For | Shape |
 |---|---|---|
 | `/mcp` | claude.ai, Claude Code, any MCP client | ~61 tools. You ask, it answers |
-| `/channel` | agents that must react while nobody is watching | Pushes inbound Matrix messages into a running [Claude Code](https://code.claude.com) session, plus a scoped seven-tool subset |
+| `/channel` | agents that must react while nobody is watching | Pushes inbound Matrix messages into a running [Claude Code](https://code.claude.com) session, plus a scoped eight-tool subset |
 
 See [Push Matrix into a running agent](#push-matrix-into-a-running-agent) for
 the second one.

@@ -26,3 +26,11 @@
 - Matrix SDK store keying is intentionally MXID-based for device-key
   continuity. Re-keying by MAS subject/device id must account for Synapse
   device-key continuity or it can regenerate keys for the same device id.
+- `download_attachment` returns plaintext for an E2EE event only because the
+  `e2e-encryption` feature is on. `matrix_sdk::Media::get_media_content`
+  decrypts a `MediaSource::Encrypted` inside `#[cfg(feature =
+  "e2e-encryption")]`; with the feature off that block compiles out and the
+  same call returns the ciphertext, which the tool then base64-encodes and
+  reports as the file. Nothing errors, and a test that only asserts a
+  non-empty body passes. Verified against matrix-sdk 0.17 `src/media.rs:450`
+  on 2026-08-25. Do not trim that feature to slim the image.
