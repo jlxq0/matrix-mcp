@@ -253,3 +253,11 @@
   `replay_body_source`, and run every later check against that. Neither
   feature's own tests could see this; it took a review scoped to the commit
   that introduced the second one.
+- **Assembling a push's attributes inside a function that needs a live `Room`
+  means no test sees what the push actually carries.** A mutation deleting the
+  reaction attributes from the replay push left the suite green, because the
+  test asserted the helper that produces them rather than the assembly that
+  uses it. `replay_meta` and `live_reaction_meta` are free functions for that
+  reason, and the test that matters compares the two paths' spelling of the
+  same attribute rather than either one alone. Three separate faults in this
+  file have been two paths disagreeing about one event.

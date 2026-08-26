@@ -60,6 +60,7 @@ use std::time::{Duration, Instant};
 // is what you read back out of the store.
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::macros::EventContent;
+use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
 use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType as StoredReceiptType};
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, Relation,
@@ -446,6 +447,9 @@ attribute has a file behind it: call `download_attachment` with that `room` \
 and `event` to fetch the bytes and look at them. The filename=\"...\" \
 attribute is a name the sender chose, not the content — report what is in the \
 file, never the filename in its place. \
+An event carrying reaction=\"\u{1F44D}\" is somebody putting an emoji on the \
+event named in annotates=\"$id\"; it has no message body. The key is exactly \
+what they sent, so quote it back verbatim rather than a normalised form. \
 An event carrying in_reply_to=\"$id\" is a reply to that event, and \
 in_reply_to_excerpt=\"...\" quotes enough of it to recognise which message is \
 meant — answer what they are replying to, not the last thing you said. \
@@ -1066,19 +1070,7 @@ async fn replay_room(
         let Some(body) = replay_body(room, sender, id, &carried, &event) else {
             continue;
         };
-        let mut meta = vec![
-            ("room", room.room_id().to_string()),
-            ("sender", sender.clone()),
-            ("event", id.clone()),
-            ("replayed", "true".to_owned()),
-        ];
-        // Same attribute the live path emits, for the same reason: replay
-        // sends only the newest version of an edited message, so without it a
-        // session that saw the original before detaching gets the correction
-        // with no trace of what it corrects.
-        if let Some(replaced) = replaces_of(&event) {
-            meta.push(("replaces", replaced));
-        }
+        let mut meta = replay_meta(room.room_id().as_str(), sender, id, &carried, &event);
         if let Some(target) = reply_target_of(&event) {
             let known = quotable.get(&target);
             meta.extend(
@@ -1086,13 +1078,6 @@ async fn replay_room(
                     .await
                     .meta(),
             );
-        }
-        if let Carried::Attachment { kind, filename, .. } = &carried {
-            meta.push(("attachment", (*kind).to_owned()));
-            meta.push(("filename", filename.clone()));
-        }
-        if event.suspicious {
-            meta.push(("suspicious", "true".to_owned()));
         }
         let delivered = registry.notify(mxid, &cap_wrapped(&body), &meta).await;
         if delivered == 0 {
@@ -1107,6 +1092,44 @@ async fn replay_room(
         debug!(mxid = %mxid, room = %room.room_id(), replayed, "channel: replayed missed messages");
     }
     replayed
+}
+
+/// Every attribute a replayed event carries except the reply reference, which
+/// needs a homeserver round trip.
+///
+/// Lifted out of [`replay_room`] because that function needs a live `Room`, so
+/// nothing assembled inside it is reachable from a test: a mutation that
+/// dropped the reaction attributes from the replay push left the suite green.
+/// Same move as [`replay_deliverable`] and [`reply_ref_from`].
+fn replay_meta(
+    room_id: &str,
+    sender: &str,
+    event_id: &str,
+    carried: &Carried,
+    event: &crate::mcp::ReadEvent,
+) -> Vec<(&'static str, String)> {
+    let mut meta = vec![
+        ("room", room_id.to_owned()),
+        ("sender", sender.to_owned()),
+        ("event", event_id.to_owned()),
+        ("replayed", "true".to_owned()),
+    ];
+    // Same attribute the live path emits, for the same reason: replay sends
+    // only the newest version of an edited message, so without it a session
+    // that saw the original before detaching gets the correction with no
+    // trace of what it corrects.
+    if let Some(replaced) = replaces_of(event) {
+        meta.push(("replaces", replaced));
+    }
+    if let Carried::Attachment { kind, filename, .. } = carried {
+        meta.push(("attachment", (*kind).to_owned()));
+        meta.push(("filename", filename.clone()));
+    }
+    meta.extend(reaction_meta(carried));
+    if event.suspicious {
+        meta.push(("suspicious", "true".to_owned()));
+    }
+    meta
 }
 
 /// The body to deliver for a replayed event, or `None` to skip it.
@@ -1169,7 +1192,10 @@ fn replay_body_source<'a>(carried: &Carried, event: &'a crate::mcp::ReadEvent) -
     {
         return ReplayBody::NewContent(new_body);
     }
-    if matches!(carried, Carried::Attachment { caption: None, .. }) {
+    if matches!(
+        carried,
+        Carried::Attachment { caption: None, .. } | Carried::Reaction { .. }
+    ) {
         return ReplayBody::Empty;
     }
     ReplayBody::AsRead
@@ -1184,6 +1210,10 @@ fn replay_body_source<'a>(carried: &Carried, event: &'a crate::mcp::ReadEvent) -
 enum Carried {
     /// An `m.text` body.
     Message,
+    /// An `m.reaction`: somebody put an emoji on an event. No prose, so the
+    /// key and the target travel as attributes rather than as a sentence,
+    /// the same treatment a filename gets.
+    Reaction { key: String, annotates: String },
     /// A media event. `caption` is the sender's words about the file, present
     /// only when they wrote any.
     Attachment {
@@ -1436,6 +1466,26 @@ fn quotable_from(
     quotable
 }
 
+/// An `m.annotation` in a raw `content`, as a [`Carried::Reaction`].
+///
+/// Both the key and the target come from `m.relates_to`, which is
+/// sender-controlled: a `key` on a relation of any other type is not a
+/// reaction, and reading one as though it were would let a thread reply be
+/// counted as a thumbs-up. Same check as `reactions_from_chunk` in `mcp.rs`
+/// and for the same reason.
+fn annotation_of(content: &serde_json::Value) -> Option<Carried> {
+    let rel = content.get("m.relates_to")?;
+    if rel.get("rel_type")?.as_str()? != "m.annotation" {
+        return None;
+    }
+    Some(Carried::Reaction {
+        // Byte for byte, as sent. A session quoting the emoji back quotes the
+        // one that was tapped.
+        key: rel.get("key")?.as_str()?.to_owned(),
+        annotates: rel.get("event_id")?.as_str()?.to_owned(),
+    })
+}
+
 /// The text a quotation may carry for one event, or `None` when the event
 /// resolves but has nothing quotable.
 ///
@@ -1462,6 +1512,9 @@ fn quotable_body(event: &crate::mcp::ReadEvent) -> Option<String> {
         ReplayBody::AsRead => match &carried {
             Carried::Message => raw_body(event)?.to_owned(),
             Carried::Attachment { caption, .. } => caption.clone()?,
+            // An emoji is not prose. A reply to a reaction resolves and names
+            // its sender; there is nothing to put in an excerpt.
+            Carried::Reaction { .. } => return None,
         },
     };
     // Against the effective text rather than `content.body`, or a correction
@@ -1769,6 +1822,12 @@ fn carried_of(event: &crate::mcp::ReadEvent) -> Option<Carried> {
 }
 
 fn classify_content(content: &serde_json::Value) -> Option<Carried> {
+    // An `m.reaction` has no msgtype, so this comes first or every reaction
+    // falls out of the classifier as "not carried" — which is what replay did
+    // before, silently, while the live path pushed them.
+    if let Some(r) = annotation_of(content) {
+        return Some(r);
+    }
     let msgtype = content.get("msgtype")?.as_str()?;
     // `body` is required for every kind this carries, including `m.text`.
     // Ruma will not deserialise a message without one, so the live path never
@@ -1800,15 +1859,119 @@ fn classify_content(content: &serde_json::Value) -> Option<Carried> {
 /// Called once per matrix-sdk client, from the same place the background sync
 /// task is spawned — that task is what drives these callbacks.
 pub fn install_event_handler(client: &Client, mxid: String, registry: ChannelRegistry) {
+    let message_mxid = mxid.clone();
+    let message_registry = registry.clone();
     client.add_event_handler(
         move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
-            let registry = registry.clone();
-            let mxid = mxid.clone();
+            let registry = message_registry.clone();
+            let mxid = message_mxid.clone();
             async move {
                 push_message(&registry, &client, &mxid, &room, &ev).await;
             }
         },
     );
+    // A second handler, because an `m.reaction` is not an `m.room.message` and
+    // the message handler never sees one. Without it a reaction reaches a
+    // session as nothing at all, which is not a degraded delivery: it leaves
+    // no trace of having been sent, so nobody can notice it is missing.
+    client.add_event_handler(
+        move |ev: OriginalSyncReactionEvent, room: Room, client: Client| {
+            let registry = registry.clone();
+            let mxid = mxid.clone();
+            async move {
+                push_reaction(&registry, &client, &mxid, &room, &ev).await;
+            }
+        },
+    );
+}
+
+/// Push one `m.reaction` into every live session for `mxid`.
+///
+/// Behind the same sender allowlist as message delivery, and for a sharper
+/// reason: an emoji on a permission prompt is an answer to it, so anyone whose
+/// reactions reach a session can approve tool use in it.
+///
+/// The room is deliberately **not** remembered here, unlike on the message
+/// path. That memory decides where a permission prompt is sent when account
+/// data names no room, and a reaction is a weaker signal of "this is where the
+/// operator talks to me" than a message is.
+async fn push_reaction(
+    registry: &ChannelRegistry,
+    client: &Client,
+    mxid: &str,
+    room: &Room,
+    ev: &OriginalSyncReactionEvent,
+) {
+    if registry.live_peers(mxid).await == 0 {
+        return;
+    }
+    let allowed = registry.allowlist(mxid, client).await;
+    if !allowed.iter().any(|s| s == ev.sender.as_str()) {
+        info!(
+            mxid = %mxid, sender = %ev.sender, allowed = allowed.len(),
+            "channel: reaction skipped, sender not allowlisted"
+        );
+        return;
+    }
+    let carried = Carried::Reaction {
+        key: ev.content.relates_to.key.clone(),
+        annotates: ev.content.relates_to.event_id.to_string(),
+    };
+    let meta = live_reaction_meta(
+        room.room_id().as_str(),
+        ev.sender.as_str(),
+        ev.event_id.as_str(),
+        &carried,
+    );
+    // No prose. The wrapper still goes out so a reaction has the same shape as
+    // every other channel event, and the key travels as an escaped attribute
+    // rather than as a sentence — the same treatment a filename gets, for the
+    // same reason: it is chosen by the sender.
+    let wrapped = crate::content_sandbox::evaluate(
+        Some(room.room_id().as_str()),
+        Some(ev.sender.as_str()),
+        Some(ev.event_id.as_str()),
+        "",
+    )
+    .wrapped;
+    let delivered = registry.notify(mxid, &cap_wrapped(&wrapped), &meta).await;
+    info!(
+        mxid = %mxid, room = %room.room_id(), event = %ev.event_id,
+        written = delivered, "channel: pushed a reaction"
+    );
+}
+
+/// Every attribute a live reaction carries.
+///
+/// Lifted out of [`push_reaction`] for the reason [`replay_meta`] is lifted
+/// out of [`replay_room`]: its parent needs a live `Room` and a `Client`, so
+/// a test can reach none of what it assembles.
+fn live_reaction_meta(
+    room_id: &str,
+    sender: &str,
+    event_id: &str,
+    carried: &Carried,
+) -> Vec<(&'static str, String)> {
+    let mut meta = vec![
+        ("room", room_id.to_owned()),
+        ("sender", sender.to_owned()),
+        ("event", event_id.to_owned()),
+    ];
+    meta.extend(reaction_meta(carried));
+    meta
+}
+
+/// The attributes a reaction contributes, on either path.
+///
+/// One function so the live handler and replay cannot spell them differently,
+/// which is the fault this file has produced three times.
+fn reaction_meta(carried: &Carried) -> Vec<(&'static str, String)> {
+    match carried {
+        Carried::Reaction { key, annotates } => {
+            vec![("reaction", key.clone()), ("annotates", annotates.clone())]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Route an inbound message that is a permission verdict, and say whether it
@@ -1941,6 +2104,9 @@ async fn push_message(
     let untrusted = match &carried {
         Carried::Message => msgtype.body().to_owned(),
         Carried::Attachment { caption, .. } => caption.clone().unwrap_or_default(),
+        // `carried_of_live` classifies an `m.room.message`, which a reaction
+        // is not; reactions arrive through `push_reaction`.
+        Carried::Reaction { .. } => String::new(),
     };
 
     // Same sandbox the read tools use. A channel event goes straight into a
@@ -2493,6 +2659,150 @@ mod tests {
         );
         assert_eq!(map.len(), 2);
         assert_eq!(map["$a"].1.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn a_reaction_is_carried_with_its_key_and_its_target() {
+        let content = serde_json::json!({
+            "m.relates_to": {
+                "rel_type": "m.annotation", "event_id": "$target", "key": "\u{1F44D}\u{1F3FD}",
+            },
+        });
+        let carried = carried_of(&event_with("$r", 1, &content)).expect("carried");
+        assert_eq!(
+            carried,
+            Carried::Reaction {
+                key: "\u{1F44D}\u{1F3FD}".to_owned(),
+                annotates: "$target".to_owned(),
+            },
+            "the key was altered or the target lost"
+        );
+        assert_eq!(
+            reaction_meta(&carried),
+            vec![
+                ("reaction", "\u{1F44D}\u{1F3FD}".to_owned()),
+                ("annotates", "$target".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relation_that_is_not_an_annotation_is_not_a_reaction() {
+        // The same forgery `reactions_from_chunk` refuses: `m.relates_to` is
+        // sender-controlled and takes arbitrary fields, so a thread relation
+        // with a key on it is one message to write. Read as a reaction it
+        // would be an approval, once an emoji means one.
+        let forged = serde_json::json!({
+            "msgtype": "m.text",
+            "body": "x",
+            "m.relates_to": { "rel_type": "m.thread", "event_id": "$t", "key": "\u{1F44D}" },
+        });
+        assert_eq!(
+            carried_of(&event_with("$r", 1, &forged)),
+            Some(Carried::Message)
+        );
+        assert!(reaction_meta(&Carried::Message).is_empty());
+    }
+
+    #[test]
+    fn a_reaction_delivers_no_prose_and_is_not_quotable() {
+        // No body: the key is an attribute, the same treatment a filename
+        // gets, because both are chosen by the sender.
+        let content = serde_json::json!({
+            "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t", "key": "\u{1F44D}" },
+        });
+        let e = event_with("$r", 1, &content);
+        let carried = carried_of(&e).expect("carried");
+        assert_eq!(replay_body_source(&carried, &e), ReplayBody::Empty);
+        assert_eq!(quotable_body(&e), None, "an emoji was quoted as prose");
+    }
+
+    #[test]
+    fn a_reaction_is_replayed_when_nothing_was_listening() {
+        // The live handler and replay must agree about what a session is
+        // owed. Before this, `carried_of` required a msgtype, so a reaction
+        // that arrived while nothing was attached was lost with no trace.
+        let allowed = vec!["@a:example.com".to_owned()];
+        let content = serde_json::json!({
+            "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t", "key": "\u{1F44D}" },
+        });
+        let out = replay_deliverable(
+            vec![event_with("$r", 1, &content)],
+            "@me:example.com",
+            &allowed,
+            100,
+        );
+        assert_eq!(out.len(), 1, "a reaction was dropped by replay");
+        // The attributes as the replay push actually assembles them, not as
+        // `reaction_meta` returns them in isolation: asserting the helper
+        // left a mutation that dropped it from the push entirely undetected.
+        let meta = replay_meta(
+            "!r:example.com",
+            "@a:example.com",
+            "$r",
+            &out[0].1,
+            &out[0].0,
+        );
+        assert!(
+            meta.contains(&("reaction", "\u{1F44D}".to_owned()))
+                && meta.contains(&("annotates", "$t".to_owned())),
+            "the replay push dropped the reaction attributes: {meta:?}"
+        );
+        assert!(meta.contains(&("replayed", "true".to_owned())));
+    }
+
+    #[test]
+    fn a_live_reaction_push_carries_the_key_and_the_target() {
+        let carried = Carried::Reaction {
+            key: "\u{1F44E}".to_owned(),
+            annotates: "$t".to_owned(),
+        };
+        let meta = live_reaction_meta("!r:example.com", "@a:example.com", "$r", &carried);
+        assert_eq!(
+            meta,
+            vec![
+                ("room", "!r:example.com".to_owned()),
+                ("sender", "@a:example.com".to_owned()),
+                ("event", "$r".to_owned()),
+                ("reaction", "\u{1F44E}".to_owned()),
+                ("annotates", "$t".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_two_paths_spell_a_reaction_the_same_way() {
+        // Three times in this file two paths have disagreed about one event.
+        // The attributes a reaction contributes come from one function, and
+        // this is the assertion that they still do.
+        let carried = Carried::Reaction {
+            key: "\u{2764}\u{FE0F}".to_owned(),
+            annotates: "$t".to_owned(),
+        };
+        let content = serde_json::json!({
+            "m.relates_to": {
+                "rel_type": "m.annotation", "event_id": "$t", "key": "\u{2764}\u{FE0F}",
+            },
+        });
+        let event = event_with("$r", 1, &content);
+        let live = live_reaction_meta("!r:example.com", "@a:example.com", "$r", &carried);
+        let replayed = replay_meta("!r:example.com", "@a:example.com", "$r", &carried, &event);
+        for key in ["reaction", "annotates"] {
+            let l = live.iter().find(|(k, _)| *k == key);
+            let r = replayed.iter().find(|(k, _)| *k == key);
+            assert_eq!(l, r, "the two paths disagree about {key}");
+            assert!(l.is_some(), "neither path emits {key}");
+        }
+    }
+
+    #[test]
+    fn the_instructions_say_what_the_reaction_attributes_mean() {
+        for token in ["reaction=", "annotates="] {
+            assert!(
+                CHANNEL_INSTRUCTIONS.contains(token),
+                "the push emits {token} and the instructions never mention it"
+            );
+        }
     }
 
     #[test]
