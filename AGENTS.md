@@ -115,3 +115,25 @@
   sessions authenticated as one identity — a supported shape — while suppressing
   nothing, because there was no second call to suppress. A cause that explains
   the symptom and fits the code is still a hypothesis.
+- **`git tag -a` silently eats any line of the annotation that begins with
+  `#`, and an annotation is exactly where issue numbers belong.** The default
+  is `--cleanup=strip`, which removes commentary lines, so whether a reference
+  survives depends on where the paragraph happened to wrap. `v0.10.5` shipped
+  without `#113 trap. And the live_peers(mxid) == 0 early return dropped
+  verdicts for`: the release note breaks mid-clause and two of the four fixes
+  it describes are unnamed in it. `#107` survived in the same annotation only
+  because it sits mid-line. Nothing in git's output says a line was dropped,
+  and the tag was on the remote before anyone read it back.
+
+  Measured with a control on a throwaway tag at the same sha, since the flag
+  is the whole difference: identical message, line kept under
+  `--cleanup=verbatim`, gone under the default. Reflow so no line starts with
+  `#` — that survives the next person writing the tag command without the
+  flag, which is the failure that will actually happen. Read the annotation
+  back out of the tag object before pushing it.
+- The rule that anyone who can reply through the channel can approve tool use
+  extends to any new inbound surface, and a reaction is one: an `m.reaction`
+  from anyone in the room reaches `/relations`, so once an emoji means
+  "approve this tool call", approval is available to whoever is standing in
+  the room. The allowlist gate belongs in the read path and in the push, not
+  in the consumer, or the next consumer omits it. See #124.
