@@ -151,3 +151,18 @@
 
   The same shape is waiting in every other relation: whatever the channel
   drops is invisible rather than degraded, so nothing looks wrong. #124.
+- **A shape check that guesses what a parser will accept turns deliverable
+  input into dropped input.** `carried_of` picked `m.new_content` over the
+  outer content whenever both `msgtype` and `body` were *present*, which
+  `{"msgtype": 7}` satisfies — and then the classifier rejected it and the
+  whole event was dropped, where the old code had delivered the outer content.
+  Ask the parser instead: `get(..).and_then(classify).or_else(|| classify(outer))`
+  cannot disagree with the classifier because it is the classifier. Found by
+  cross-engine review, not by the suite, and the suite stayed green through it.
+- **When two membership checks can both match one event, their order decides
+  whether it vanishes.** In the edit supersession pass a self-replacing event,
+  or two events replacing each other, is in the winner set *and* the
+  superseded set. Asking "superseded?" first drops every one of them and the
+  correction disappears; asking "is it the newest edit?" first keeps exactly
+  one version. Malformed relations are the normal case for this, so decide the
+  order deliberately and test the cycle.

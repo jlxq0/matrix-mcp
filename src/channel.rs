@@ -1279,18 +1279,33 @@ fn supersede_edits(
     candidates
         .into_iter()
         .filter(|(e, _)| {
-            let id = e.event_id.as_deref().unwrap_or_default();
+            // No id: this pass cannot reason about it and must not guess.
+            // `replay_room` skips such events anyway, and treating a missing
+            // id as the empty string once made every unidentified edit a
+            // non-winner and dropped it.
+            let Some(id) = e.event_id.as_deref() else {
+                return true;
+            };
+            // Winner first, and the order is the whole of the cycle handling.
+            // A malformed edit can name itself, and two can name each other,
+            // in which case every id involved is both a winner and a
+            // superseded target. Asking "is it superseded" first drops all of
+            // them and the correction vanishes; asking "is it the newest
+            // edit" first keeps exactly one version of each.
+            if replaces_of(e).is_some() {
+                if winners.contains(id) {
+                    return true;
+                }
+                debug!(
+                    mxid = %mxid, event = %id,
+                    "channel: not replaying an edit a later edit supersedes"
+                );
+                return false;
+            }
             if superseded.contains(id) {
                 debug!(
                     mxid = %mxid, event = %id,
                     "channel: not replaying a message an edit in this batch supersedes"
-                );
-                return false;
-            }
-            if replaces_of(e).is_some() && !winners.contains(id) {
-                debug!(
-                    mxid = %mxid, event = %id,
-                    "channel: not replaying an edit a later edit supersedes"
                 );
                 return false;
             }
@@ -1406,13 +1421,19 @@ fn carried_of(event: &crate::mcp::ReadEvent) -> Option<Carried> {
     let outer = event.event.as_ref()?.get("content")?;
     // A replacement is classified by what it replaces the message *with*. Its
     // own `msgtype` and `body` are the fallback; `m.new_content` is the event.
-    // A malformed edit with no usable `m.new_content` falls back to the outer
-    // content rather than being dropped, which is the same disposition
-    // `replay_body` takes for its body.
-    let content = outer
+    //
+    // Falling back on `None` rather than on a shape check: a check has to
+    // guess which shapes the classifier will accept, and guessing "both keys
+    // present" let `{"msgtype": 7}` through, which passes the check and then
+    // fails to classify — turning a deliverable message into a dropped one.
+    // Asking the classifier is the only test that cannot disagree with it.
+    outer
         .get("m.new_content")
-        .filter(|c| c.get("msgtype").is_some() && c.get("body").is_some())
-        .unwrap_or(outer);
+        .and_then(classify_content)
+        .or_else(|| classify_content(outer))
+}
+
+fn classify_content(content: &serde_json::Value) -> Option<Carried> {
     let msgtype = content.get("msgtype")?.as_str()?;
     // `body` is required for every kind this carries, including `m.text`.
     // Ruma will not deserialise a message without one, so the live path never
@@ -1954,6 +1975,90 @@ mod tests {
         );
         assert_eq!(ids(&out), vec!["$b".to_owned()]);
         assert_eq!(replaces_of(&out[0].0).as_deref(), Some("$a"));
+    }
+
+    #[test]
+    fn an_edit_whose_new_content_is_the_wrong_shape_is_still_delivered() {
+        // Found by a cross-engine review of the first version of this fix,
+        // which selected `m.new_content` whenever both keys were present and
+        // then failed to classify it — turning a message the old code
+        // delivered into one that vanished. A non-string `msgtype` is the
+        // cheapest instance; a non-string `body` and an unsupported `msgtype`
+        // are the same shape.
+        for new_content in [
+            serde_json::json!({ "msgtype": 7, "body": "corrected" }),
+            serde_json::json!({ "msgtype": "m.text", "body": 7 }),
+            serde_json::json!({ "msgtype": "m.location", "body": "corrected" }),
+        ] {
+            let content = serde_json::json!({
+                "msgtype": "m.text",
+                "body": "* corrected",
+                "m.new_content": new_content,
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$a" },
+            });
+            assert_eq!(
+                carried_of(&event_with("$b", 2, &content)),
+                Some(Carried::Message),
+                "an edit with unusable new content was dropped rather than \
+                 falling back to the content the old code delivered"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_that_names_itself_is_delivered_rather_than_vanishing() {
+        // Also from the review. `$b` replacing `$b` makes the same id both a
+        // winner and a superseded target, and asking "superseded?" first
+        // dropped it — the correction disappearing entirely, which is worse
+        // than the defect being fixed.
+        let allowed = vec!["@a:example.com".to_owned()];
+        let out = replay_deliverable(
+            vec![event_with("$b", 2, &edit_of("$b", "corrected"))],
+            "@me:example.com",
+            &allowed,
+            100,
+        );
+        assert_eq!(ids(&out), vec!["$b".to_owned()]);
+    }
+
+    #[test]
+    fn two_edits_naming_each_other_are_both_delivered() {
+        // The cycle. Every id is both a winner and superseded, so the same
+        // ordering fault dropped the whole batch.
+        let allowed = vec!["@a:example.com".to_owned()];
+        let out = replay_deliverable(
+            vec![
+                event_with("$a", 1, &edit_of("$b", "one")),
+                event_with("$b", 2, &edit_of("$a", "two")),
+            ],
+            "@me:example.com",
+            &allowed,
+            100,
+        );
+        assert_eq!(ids(&out), vec!["$a".to_owned(), "$b".to_owned()]);
+    }
+
+    #[test]
+    fn an_edit_with_no_event_id_is_left_for_the_caller_to_drop() {
+        // `replay_room` skips events with no id, so this pass must not decide
+        // their fate on a stand-in value: treating the absence as `""` made
+        // every unidentified edit a non-winner and dropped it, but only when
+        // some other edit in the batch made the winner set non-empty — so it
+        // was invisible to a single-event test.
+        let allowed = vec!["@a:example.com".to_owned()];
+        let mut anonymous = event_with("$x", 1, &edit_of("$a", "no id"));
+        anonymous.event_id = None;
+        let out = replay_deliverable(
+            vec![anonymous, event_with("$c", 3, &edit_of("$d", "identified"))],
+            "@me:example.com",
+            &allowed,
+            100,
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "the unidentified edit was dropped by this pass"
+        );
     }
 
     #[test]
