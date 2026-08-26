@@ -62,14 +62,41 @@
   one fires on code nobody touched. That is why `ci.yml` names `1.98.0` rather
   than `stable` or a range. Classify a red clippy with `cargo clippy --version`
   before reading the diff.
-- **Do not delete a `duration_suboptimal_units` or `unused_async_trait_impl`
-  allow to lower that floor.** All eleven of the first suppress a suggestion to
-  use `Duration::from_mins`/`from_days`, which are still unstable on 1.98
-  (`E0658: duration_constructors`) — taking clippy's advice does not compile.
-  The second fires on code `#[tool_handler]` generates, so there is nothing to
-  rewrite. A thirteenth attribute, `chunks_exact_to_as_chunks`, *was* removable
-  and was removed: its comment claimed `as_chunks::<2>()` postdated the MSRV,
-  and it compiles on 1.93.0. Check that claim before trusting the next one.
+- **Most of the eleven `duration_suboptimal_units` allows are removable, and
+  this file said the opposite until 2026-08-26.** The claim was that they all
+  suppress a suggestion to use `Duration::from_mins`/`from_days`, "which are
+  still unstable on 1.98". Probed one constructor per file, in const context:
+
+    | | 1.93.0 | 1.98.0 |
+    |---|---|---|
+    | `from_mins` | const-stable | const-stable |
+    | `from_hours` | const-stable | const-stable |
+    | `from_days` | `E0658` | `E0658` |
+
+  Only `from_days` is unstable, and pinning forward does not retire it. The
+  original probe put both constructors in one file, got one `E0658`, and
+  attributed it to both — an error message read as being about more than it was
+  about. Caught by the `hevy-mcp` lead, which found the same false sentence in
+  its own tree and deleted both of its allows after compiling the replacement on
+  1.93.0.
+
+  So: `session_store.rs`'s `from_secs(7 * 24 * 60 * 60)` genuinely needs its
+  allow, because `from_days(7)` does not compile. The ones over `from_secs(60)`,
+  `from_secs(5 * 60)`, `from_secs(15 * 60)`, `from_secs(30 * 60)`,
+  `from_secs(300)`, `from_secs(1800)` and `from_secs(120)` are suppressing
+  advice that compiles on the MSRV. Each one removed is one less thing this file
+  has to promise. Verify by compiling, not by reading this bullet.
+
+- **`unused_async_trait_impl` does need its allow.** It fires on code
+  `#[tool_handler]` generates, so there is nothing to rewrite, and it is what
+  puts the lint floor at 1.98.
+
+  A thirteenth attribute, `chunks_exact_to_as_chunks`, was removable and was
+  removed: its comment claimed `as_chunks::<2>()` postdated the MSRV, and it
+  compiles on 1.93.0. That is now twice in one file that a suppression carried a
+  false reason for existing, both found by compiling the thing the comment said
+  would not compile. **Check the claim before trusting the next one** — and this
+  bullet has itself been wrong once, which is the point.
 - **This crate needs two different base64 alphabets and the wrong one fails
   silently on half its inputs.** PKCE in `setup.rs` requires `URL_SAFE_NO_PAD`
   — RFC 7636 specifies unpadded — while `download_attachment`'s `body_base64`
