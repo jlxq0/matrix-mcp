@@ -198,3 +198,29 @@
   feature exists for, so the excerpt travels and says who wrote it:
   `in_reply_to_untrusted_sender`. Any new inbound surface has this question
   and it does not answer itself.
+- **A guard can be load-bearing and pinned by nothing, and the way you find
+  out is that deleting it leaves the suite green.** `reactions_from_chunk`
+  refuses anything whose `rel_type` is not `m.annotation`; deleting that check
+  broke no test, because every fixture in the control set was *also* refused
+  by the missing `key` field. `m.relates_to` is sender-controlled and accepts
+  arbitrary fields, so a thread relation carrying a `key` is one message to
+  write and would have been read as a reaction — an approval, once an emoji
+  means one. The fixture that pins a guard is the one that satisfies every
+  *other* check and fails only this one; a control set where each entry fails
+  for its own reason measures whichever check happens to run first.
+- **A per-entry decoding failure that drops the entry turns "cannot tell"
+  into "none".** `read_reactions` documented that an empty list means no
+  reactions and a failure is an error, and then dropped undecryptable and
+  malformed entries silently, so a chunk holding only an entry we could not
+  read returned `reactions: []`. A caller polling for an authorisation reads
+  that as "nobody has reacted" and either waits forever or concludes from it.
+  Count what was declined and return the count: `unreadable > 0` beside an
+  empty list is a third answer, and the request-level error is only the
+  first two.
+- **A single page is not the answer to "is it there".** `/relations` returns
+  newest first, so a reaction older than one page is invisible to a single
+  request and stays invisible however often a caller polls, since every poll
+  starts at the same newest page. Follow the pagination token, cap the total,
+  and **report having hit the cap** — otherwise a capped page is
+  indistinguishable from the end of the list, which is the same absence fault
+  one layer up.
