@@ -115,3 +115,164 @@
   sessions authenticated as one identity — a supported shape — while suppressing
   nothing, because there was no second call to suppress. A cause that explains
   the symptom and fits the code is still a hypothesis.
+- **`git tag -a` silently eats any line of the annotation that begins with
+  `#`, and an annotation is exactly where issue numbers belong.** The default
+  is `--cleanup=strip`, which removes commentary lines, so whether a reference
+  survives depends on where the paragraph happened to wrap. `v0.10.5` shipped
+  without `#113 trap. And the live_peers(mxid) == 0 early return dropped
+  verdicts for`: the release note breaks mid-clause and two of the four fixes
+  it describes are unnamed in it. `#107` survived in the same annotation only
+  because it sits mid-line. Nothing in git's output says a line was dropped,
+  and the tag was on the remote before anyone read it back.
+
+  Measured with a control on a throwaway tag at the same sha, since the flag
+  is the whole difference: identical message, line kept under
+  `--cleanup=verbatim`, gone under the default. Reflow so no line starts with
+  `#` — that survives the next person writing the tag command without the
+  flag, which is the failure that will actually happen. Read the annotation
+  back out of the tag object before pushing it.
+- The rule that anyone who can reply through the channel can approve tool use
+  extends to any new inbound surface, and a reaction is one: an `m.reaction`
+  from anyone in the room reaches `/relations`, so once an emoji means
+  "approve this tool call", approval is available to whoever is standing in
+  the room. The allowlist gate belongs in the read path and in the push, not
+  in the consumer, or the next consumer omits it. See #124.
+- A relation-carrying event delivered by its **fallback body** reads as
+  ordinary input, because the fallback is designed to be indistinguishable
+  from one. An `m.replace` is an `m.room.message` whose `content.body` is
+  `* <the correction>`, so before #125 a corrected message reached a session
+  as a second, near-identical instruction: nothing absent, nothing malformed,
+  no error anywhere, and a reader that acts twice on something its sender sent
+  once. The `* ` fallback exists for clients that cannot render an edit and a
+  session is not one. Deliver `m.new_content` and mark the event with the id
+  it replaces, on both the live and the replay path, and have replay send only
+  the newest version — the mark is what lets a session that already acted on
+  the original say which of its instructions was withdrawn.
+
+  The same shape is waiting in every other relation: whatever the channel
+  drops is invisible rather than degraded, so nothing looks wrong. #124.
+- **A shape check that guesses what a parser will accept turns deliverable
+  input into dropped input.** `carried_of` picked `m.new_content` over the
+  outer content whenever both `msgtype` and `body` were *present*, which
+  `{"msgtype": 7}` satisfies — and then the classifier rejected it and the
+  whole event was dropped, where the old code had delivered the outer content.
+  Ask the parser instead: `get(..).and_then(classify).or_else(|| classify(outer))`
+  cannot disagree with the classifier because it is the classifier. Found by
+  cross-engine review, not by the suite, and the suite stayed green through it.
+- **When two membership checks can both match one event, their order decides
+  whether it vanishes.** In the edit supersession pass a self-replacing event,
+  or two events replacing each other, is in the winner set *and* the
+  superseded set. Asking "superseded?" first drops every one of them and the
+  correction disappears; asking "is it the newest edit?" first keeps exactly
+  one version. Malformed relations are the normal case for this, so decide the
+  order deliberately and test the cycle.
+- **A field that only means something under a relation must be read only when
+  that relation is present**, or a sender can attach it as a decoy. Reading
+  `m.new_content` on any event carrying the key let an `m.location` — which
+  the channel does not carry — be classified from an `m.text` decoy and
+  delivered with the outer body. Replay only, because the live path reads a
+  typed `Relation` and has no such key, so it was also the two paths
+  disagreeing about one event: the #107 shape, for the third time in this
+  file. When adding a field to one path, ask what the other path reads instead
+  of it.
+- **A quotation is untrusted content arriving by a second route, so it must be
+  escaped by the same functions as the body it quotes**, not by an escaper
+  written beside it. `quote_excerpt` calls `escape_injection_markers` and
+  `is_suspicious` rather than reimplementing them, and the test compares its
+  output against what `content_sandbox::evaluate` produces for the same input,
+  so the two cannot drift. A hand-written expected string would agree with
+  whichever implementation it was copied from.
+- **A lookup keyed on something the sender controls needs a collision policy,
+  and "the map keeps one" is not one.** Two events claiming one event id made
+  a `HashMap` answer for the wrong one, so a reply could quote one message's
+  words under another's name. Neither is quotable now. The same reasoning
+  covers a response fetched *by* id: compare what came back against what was
+  asked for, because keeping the requested id as the label while taking the
+  sender and the body from the response attributes words to a message that
+  never contained them.
+- **Trust does not follow the content, it follows the route it came in by.**
+  The sender allowlist gates who may push into a session; a reply quoting
+  somebody else carries their words in regardless, since the batch a quotation
+  is drawn from is fetched before any allowlist filter. Refusing to quote
+  would make replies to our own messages unresolvable, which is the case the
+  feature exists for, so the excerpt travels and says who wrote it:
+  `in_reply_to_untrusted_sender`. Any new inbound surface has this question
+  and it does not answer itself.
+- **A guard can be load-bearing and pinned by nothing, and the way you find
+  out is that deleting it leaves the suite green.** `reactions_from_chunk`
+  refuses anything whose `rel_type` is not `m.annotation`; deleting that check
+  broke no test, because every fixture in the control set was *also* refused
+  by the missing `key` field. `m.relates_to` is sender-controlled and accepts
+  arbitrary fields, so a thread relation carrying a `key` is one message to
+  write and would have been read as a reaction — an approval, once an emoji
+  means one. The fixture that pins a guard is the one that satisfies every
+  *other* check and fails only this one; a control set where each entry fails
+  for its own reason measures whichever check happens to run first.
+- **A per-entry decoding failure that drops the entry turns "cannot tell"
+  into "none".** `read_reactions` documented that an empty list means no
+  reactions and a failure is an error, and then dropped undecryptable and
+  malformed entries silently, so a chunk holding only an entry we could not
+  read returned `reactions: []`. A caller polling for an authorisation reads
+  that as "nobody has reacted" and either waits forever or concludes from it.
+  Count what was declined and return the count: `unreadable > 0` beside an
+  empty list is a third answer, and the request-level error is only the
+  first two.
+- **A single page is not the answer to "is it there".** `/relations` returns
+  newest first, so a reaction older than one page is invisible to a single
+  request and stays invisible however often a caller polls, since every poll
+  starts at the same newest page. Follow the pagination token, cap the total,
+  and **report having hit the cap** — otherwise a capped page is
+  indistinguishable from the end of the list, which is the same absence fault
+  one layer up.
+- **A second route to the same content needs the first route's judgement, not
+  just its escaping.** Reply quotations were escaped like a body and selected
+  like nothing: `quotable_from` took `raw_body` off any event with an id and a
+  sender, so an allowlisted person replying to a permission verdict, or to an
+  event type the channel does not carry, pulled that body into the session by
+  a route the delivery path refuses. `quotable_body` now applies
+  `is_replayed_verdict` and `carried_of` exactly as delivery does, and quotes
+  a caption rather than a filename for the same reason `replay_body` does.
+  Third instance of two paths disagreeing about one event in this file, and it
+  was introduced while the rule was in a doc comment on the function above.
+- **A mutation that leaves the suite green on a path needing a live `Room` is
+  telling you the judgement is in the wrong place, not that it is safe.**
+  `resolve_reply`'s fetch fallback was unreachable, so making it quote
+  `raw_body` changed nothing anybody could see. It is `reply_ref_from` now, a
+  free function over a decoded event, which also pinned the requested-id check
+  and the undecryptable check that had no tests either. Same move as
+  `replay_deliverable` out of `replay_room` and `live_delivery` out of
+  `push_message`; when a mutation stays green, ask what the function needs in
+  order to run before assuming the test was weak.
+- **Two correct features compose into a wrong one when they disagree about
+  which field *is* the message.** `carried_of` classifies a replacement by
+  `m.new_content`; `quotable_body` took `content.body`. Each was right on its
+  own and together they quoted the `* `-prefixed fallback instead of the
+  correction, measured the injection heuristic on the fallback so a hostile
+  correction was quoted unflagged, and withheld an ordinary correction whose
+  fallback happened to match the verdict pattern. Pick the body once, through
+  `replay_body_source`, and run every later check against that. Neither
+  feature's own tests could see this; it took a review scoped to the commit
+  that introduced the second one.
+- **Assembling a push's attributes inside a function that needs a live `Room`
+  means no test sees what the push actually carries.** A mutation deleting the
+  reaction attributes from the replay push left the suite green, because the
+  test asserted the helper that produces them rather than the assembly that
+  uses it. `replay_meta` and `live_reaction_meta` are free functions for that
+  reason, and the test that matters compares the two paths' spelling of the
+  same attribute rather than either one alone. Three separate faults in this
+  file have been two paths disagreeing about one event.
+- **A cap on the body is not a cap on the attributes.** `MAX_PUSH_BYTES` and
+  `cap_wrapped` bound what a channel event says; they do not touch the meta,
+  and `build_params` escapes meta values without bounding them. A reaction key
+  is an arbitrary string the sender chooses, so a sixty-kilobyte key reached a
+  model's context in full on both paths, past a cap that only ever looked at a
+  body which is empty for a reaction. Anything sender-controlled that lands in
+  attribute position needs its own limit, applied in one place so the paths
+  cannot cap differently.
+- **A new push path must apply every gate the existing one applies, in the
+  same order, and the omission is invisible.** `push_reaction` shipped without
+  the `RoomState::Joined` check and without the self-sender suppression that
+  `push_message` has, so a reaction in a room this identity had left would
+  have been delivered and an agent could have read its own emoji back as
+  inbound context. Nothing about a missing guard shows up in a diff of the new
+  function; read the old one beside it.

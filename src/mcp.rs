@@ -1130,9 +1130,75 @@ const fn default_thread_limit() -> u32 {
 
 const MAX_THREAD_LIMIT: u32 = 200;
 
+/// How many relations one `/relations` request asks for while paging.
+///
+/// The caller's `limit` bounds the answer; this bounds each round trip.
+const MAX_RELATIONS_PAGE: u32 = 100;
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ReadThreadResult {
     pub events: Vec<ReadEvent>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadReactionsParams {
+    /// Matrix room id, e.g. `!abc:example.com`.
+    pub room_id: String,
+    /// Event id whose reactions to read, e.g. `$abc:example.com`.
+    pub event_id: String,
+    /// Maximum number of reactions to return. Defaults to 50, capped at 200.
+    #[serde(default = "default_thread_limit", deserialize_with = "de_thread_limit")]
+    pub limit: u32,
+}
+
+/// One `m.reaction` on the event that was asked about.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct Reaction {
+    /// Event id of the `m.reaction` event itself, not of what it annotates.
+    pub event_id: Option<String>,
+    /// The event this annotates, from the reaction's own `m.relates_to`.
+    /// Always equal to the `event_id` that was asked about: anything else is
+    /// dropped rather than returned, and this is here so a caller can see
+    /// that rather than take it on trust.
+    pub annotates: String,
+    /// Who reacted.
+    pub sender: Option<String>,
+    /// The annotation key, **exactly as the sender sent it**. No
+    /// normalisation: no NFC pass, no folding of variation selectors, no
+    /// stripping of skin-tone modifiers, so a caller quoting it back quotes
+    /// the emoji that was tapped. Matching is the caller's job; a caller
+    /// comparing against a small set of emoji has to strip modifiers itself,
+    /// and it can only do that while it still holds the original.
+    pub key: String,
+    /// When the reacting user's homeserver stamped it. On a single-homeserver
+    /// deployment this orders reactions against each other; across federation
+    /// it is a clock nobody here controls.
+    pub origin_server_ts: Option<u64>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReadReactionsResult {
+    /// The reactions on the event. **Empty is a distinct answer from a
+    /// failure**: an empty list means the event carries no reactions right
+    /// now, and a request that failed is an error rather than an empty list.
+    /// A caller polling for an answer treats empty as "keep waiting" and an
+    /// error as "keep waiting and never act", and it can only do that if the
+    /// two are different results.
+    ///
+    /// Read `unreadable` and `truncated` before treating an empty list as
+    /// "nobody has reacted": both are ways for a present reaction to be
+    /// missing from this list without anything having failed.
+    pub reactions: Vec<Reaction>,
+    /// Entries in the response that could not be read as reactions:
+    /// undecryptable, malformed, or annotating a different event. **An empty
+    /// `reactions` with a non-zero `unreadable` is "cannot tell", not
+    /// "none"** — a caller deciding anything on the absence of a reaction has
+    /// to keep waiting rather than conclude.
+    pub unreadable: usize,
+    /// The server had more relations than the cap allowed and the rest were
+    /// not fetched. A reaction that exists may therefore be absent from
+    /// `reactions`, so this is the second way an empty list can be wrong.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2678,6 +2744,136 @@ impl MatrixMcpService {
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "read_thread",
+            &mxid_for_audit,
+            Some(&room_id_for_audit),
+            started,
+            Some(event_count),
+            &span,
+            &result,
+        );
+        result
+    }
+
+    /// Read the reactions on one event.
+    ///
+    /// `GET /_matrix/client/v1/rooms/{room_id}/relations/{event_id}/m.annotation`,
+    /// the same call `read_thread` makes with a different relation type.
+    ///
+    /// **There is no bundled-aggregation route.** The spec states that
+    /// `m.annotation` relationships are not aggregated by the server and are
+    /// not included in the `m.relations` property, so there is no count to
+    /// read. That is the better outcome: `/relations` returns the annotation
+    /// events themselves, carrying the sender and the timestamp of each,
+    /// which a count could never have given, and "only this person, and only
+    /// after I asked" is checkable because of it.
+    ///
+    /// **Nothing is cached and nothing is aggregated locally.** Each call is a
+    /// fresh request, so a poll reflects what the server holds at the moment
+    /// of the poll, and a caller that waits before deciding is waiting on
+    /// something real.
+    ///
+    /// **What a redacted reaction does here is not documented, because it is
+    /// not measured.** The spec says a redacted child breaks the relation and
+    /// the server must disassociate it, and `m.relates_to` lives in `content`,
+    /// which redaction strips, so it should not come back. That is an argument
+    /// rather than a measurement of any particular homeserver, and a contract
+    /// asserted from the spec is one nobody checked. See jlxq0/matrix-mcp#124.
+    #[tool(
+        description = "Read the reactions (m.annotation relations) on a Matrix event.                        Returns one entry per reaction with its sender, the emoji key                        exactly as sent, and its timestamp. An empty list means the                        event has no reactions; a failure is an error, never an empty                        list.",
+        annotations(title = "Read reactions", read_only_hint = true)
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn read_reactions(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ReadReactionsParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let mxid_for_audit = identity_from_ctx(&ctx).map_or_else(String::new, |i| i.mxid);
+        let room_id_for_audit = params.room_id.clone();
+        let span = make_tool_span("read_reactions", &mxid_for_audit, Some(&room_id_for_audit));
+        let (mut result, event_count) = async {
+            self.rate_limit_check(&ctx, Category::Read)?;
+            let client = self.client_for(&ctx).await?;
+            let room_id: OwnedRoomId = params.room_id.parse().map_err(|e| {
+                ErrorData::invalid_params(format!("invalid room_id {}: {e}", params.room_id), None)
+            })?;
+            let room = client.get_room(&room_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("not joined to {room_id}"), None)
+            })?;
+            // `get_room()` returns any room the SDK cache knows about,
+            // including invited, left, knocked and banned. Same guard as
+            // `read_thread` and `download_attachment`, for the same reason.
+            if room.state() != matrix_sdk::RoomState::Joined {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "not joined to {room_id} (current state: {:?})",
+                        room.state()
+                    ),
+                    None,
+                ));
+            }
+            let event_id: OwnedEventId = params.event_id.parse().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!("invalid event_id {}: {e}", params.event_id),
+                    None,
+                )
+            })?;
+            let limit = params.limit.clamp(1, MAX_THREAD_LIMIT) as usize;
+            // One page is not enough for a caller waiting on a decision. The
+            // endpoint returns newest first, so a reaction older than a page
+            // of others is invisible to a single request and stays invisible
+            // however often the caller polls, since every poll starts at the
+            // same newest page. Pages are followed until the server runs out
+            // or the cap is reached, and hitting the cap is reported rather
+            // than looking like the end of the list.
+            let mut reactions = Vec::new();
+            let mut unreadable = 0usize;
+            let mut from: Option<String> = None;
+            let mut truncated = false;
+            loop {
+                let opts = RelationsOptions {
+                    include_relations: IncludeRelations::RelationsOfType(RelationType::Annotation),
+                    limit: Some(MAX_RELATIONS_PAGE.into()),
+                    from: from.clone(),
+                    ..Default::default()
+                };
+                // A failure here is an error and never an empty list. A caller
+                // polling for a decision must treat "no reactions yet" as keep
+                // waiting and "could not read" as keep waiting and never act,
+                // and it cannot do that if the two arrive as the same value.
+                let relations = room.relations(event_id.clone(), opts).await.map_err(|e| {
+                    ErrorData::internal_error(format!("fetch annotation relations: {e}"), None)
+                })?;
+                let next = relations.next_batch_token.clone();
+                let (page, bad) =
+                    reactions_from_chunk(read_events_from_chunk(relations.chunk), &params.event_id);
+                unreadable += bad;
+                reactions.extend(page);
+                if reactions.len() >= limit {
+                    truncated = next.is_some() || reactions.len() > limit;
+                    reactions.truncate(limit);
+                    break;
+                }
+                match next {
+                    Some(token) => from = Some(token),
+                    None => break,
+                }
+            }
+            let count = reactions.len();
+            let res = structured_result(&ReadReactionsResult {
+                reactions,
+                unreadable,
+                truncated,
+            });
+            Ok::<_, ErrorData>((res, count))
+        }
+        .instrument(span.clone())
+        .await
+        .unwrap_or_else(|e| (Err(e), 0));
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        emit_tool_audit(
+            "read_reactions",
             &mxid_for_audit,
             Some(&room_id_for_audit),
             started,
@@ -8194,6 +8390,78 @@ pub fn read_events_from_chunk(
         .collect()
 }
 
+/// Turn a `/relations` chunk into the reactions it carries.
+///
+/// A free function so the judgement is reachable from a test: whether an
+/// entry counts as a reaction, and what its key is, is decided here rather
+/// than inside a tool that needs a live `Room`.
+///
+/// **A redacted annotation carries no `key`**, because redaction strips
+/// `content`, so anything without one is dropped rather than reported with an
+/// empty key. Whether such an entry is returned by a given homeserver at all
+/// is unmeasured; this is what happens if one is.
+pub fn reactions_from_chunk(events: Vec<ReadEvent>, annotates: &str) -> (Vec<Reaction>, usize) {
+    let mut reactions = Vec::new();
+    let mut unreadable = 0usize;
+    for e in events {
+        match reaction_of(&e, annotates) {
+            Ok(Some(r)) => reactions.push(r),
+            // Not a reaction and not broken: a thread reply or a replacement
+            // sharing the response. Nothing is hidden by skipping it.
+            Ok(None) => {}
+            Err(()) => unreadable += 1,
+        }
+    }
+    (reactions, unreadable)
+}
+
+/// One entry: a reaction, something that is not one, or something we could not
+/// read.
+///
+/// The third case is the one that matters and it used to be the second. An
+/// undecryptable or malformed entry dropped silently made an empty list mean
+/// both "nobody reacted" and "we could not tell", and a caller waiting on a
+/// reaction cannot distinguish those and must not act on either.
+fn reaction_of(e: &ReadEvent, annotates: &str) -> Result<Option<Reaction>, ()> {
+    if e.status == "unable_to_decrypt" {
+        return Err(());
+    }
+    let Some(content) = e.event.as_ref().and_then(|v| v.get("content")) else {
+        return Err(());
+    };
+    let Some(rel) = content.get("m.relates_to") else {
+        return Ok(None);
+    };
+    match rel.get("rel_type").and_then(serde_json::Value::as_str) {
+        Some("m.annotation") => {}
+        Some(_) => return Ok(None),
+        None => return Err(()),
+    }
+    // The response is fetched *by* event id and is not checked against it
+    // anywhere else. A homeserver that answers with an annotation on a
+    // different event would have its thumbs-up read as one on the event asked
+    // about, which for a caller treating that as authorisation is the whole
+    // question. Counted as unreadable rather than skipped: something is there
+    // and we are declining to interpret it.
+    match rel.get("event_id").and_then(serde_json::Value::as_str) {
+        Some(target) if target == annotates => {}
+        _ => return Err(()),
+    }
+    // The key travels exactly as it arrived. Matrix permits any string here,
+    // so this is not always an emoji. A redacted annotation has no key,
+    // because redaction strips `content`.
+    let Some(key) = rel.get("key").and_then(serde_json::Value::as_str) else {
+        return Err(());
+    };
+    Ok(Some(Reaction {
+        event_id: e.event_id.clone(),
+        annotates: annotates.to_owned(),
+        sender: e.sender.clone(),
+        key: key.to_owned(),
+        origin_server_ts: e.origin_server_ts,
+    }))
+}
+
 fn summarize_room(room: &Room) -> JoinedRoom {
     let display_name = room.cached_display_name().map(|n| n.to_string());
     JoinedRoom {
@@ -8890,6 +9158,221 @@ mod tests {
         );
         // Value well below the cap is unchanged.
         assert_eq!(10_u32.clamp(1, MAX_THREAD_LIMIT), 10);
+    }
+
+    /// A `ReadEvent` carrying the given content, for the reaction tests.
+    fn reaction_event(id: &str, sender: &str, ts: u64, content: &serde_json::Value) -> ReadEvent {
+        ReadEvent {
+            event_id: Some(id.to_owned()),
+            sender: Some(sender.to_owned()),
+            origin_server_ts: Some(ts),
+            status: "plaintext",
+            event: Some(serde_json::json!({ "content": content.clone() })),
+            in_reply_to: None,
+            is_thread_root: false,
+            thread_event_count: None,
+            untrusted_body: None,
+            suspicious: false,
+        }
+    }
+
+    fn annotation(target: &str, key: &str) -> serde_json::Value {
+        serde_json::json!({
+            "m.relates_to": { "rel_type": "m.annotation", "event_id": target, "key": key },
+        })
+    }
+
+    #[test]
+    fn a_reaction_key_survives_byte_for_byte() {
+        // The consumer quotes the emoji back to the person who tapped it, so
+        // a normalising read path would quote something they did not send.
+        // Variation selector and skin tone both survive; there is no
+        // normalisation crate in the tree and none of this is folded.
+        for key in [
+            "\u{1F44D}",
+            "\u{1F44D}\u{1F3FD}",
+            "\u{2764}\u{FE0F}",
+            "not an emoji at all",
+        ] {
+            let (out, unreadable) = reactions_from_chunk(
+                vec![reaction_event(
+                    "$r",
+                    "@a:example.com",
+                    7,
+                    &annotation("$t", key),
+                )],
+                "$t",
+            );
+            assert_eq!(unreadable, 0);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].key, key, "the key was altered in transit");
+            assert_eq!(out[0].key.len(), key.len(), "the key changed length");
+        }
+    }
+
+    #[test]
+    fn a_reaction_carries_who_reacted_and_when() {
+        // The two facts a bundled count could never have given, and the reason
+        // /relations is the only usable route: "only this person, and only
+        // after I asked" is checkable because of them.
+        let (out, unreadable) = reactions_from_chunk(
+            vec![reaction_event(
+                "$r",
+                "@julian:example.com",
+                1_724_000_000_000,
+                &annotation("$t", "\u{1F44D}"),
+            )],
+            "$t",
+        );
+        assert_eq!(unreadable, 0);
+        assert_eq!(out[0].sender.as_deref(), Some("@julian:example.com"));
+        assert_eq!(out[0].origin_server_ts, Some(1_724_000_000_000));
+        assert_eq!(out[0].event_id.as_deref(), Some("$r"));
+        assert_eq!(out[0].annotates, "$t");
+    }
+
+    #[test]
+    fn a_reaction_on_a_different_event_is_not_returned_as_one_on_this_one() {
+        // Found by a cross-engine review, and it is the finding that matters
+        // most for a caller treating a thumbs-up as authorisation: the
+        // response is fetched *by* event id and was checked against it
+        // nowhere. A homeserver answering with an annotation on another event
+        // had its key read as a reaction to the event asked about.
+        let (out, unreadable) = reactions_from_chunk(
+            vec![reaction_event(
+                "$r",
+                "@authoriser:example.com",
+                7,
+                &annotation("$different", "\u{1F44D}"),
+            )],
+            "$wanted",
+        );
+        assert!(out.is_empty(), "a reaction on another event was returned");
+        assert_eq!(
+            unreadable, 1,
+            "it was dropped silently rather than counted as something we declined to read"
+        );
+    }
+
+    #[test]
+    fn an_annotation_with_no_key_is_unreadable_rather_than_absent() {
+        // What a redacted annotation looks like if a homeserver returns one:
+        // redaction strips `content`, so the key is gone. Reporting it with an
+        // empty key would let a withdrawn reaction read as a present one, and
+        // dropping it silently would make "we could not tell" arrive as
+        // "nobody reacted".
+        let redacted = serde_json::json!({
+            "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t" },
+        });
+        let (out, unreadable) = reactions_from_chunk(
+            vec![reaction_event("$r", "@a:example.com", 7, &redacted)],
+            "$t",
+        );
+        assert!(out.is_empty());
+        assert_eq!(unreadable, 1);
+    }
+
+    #[test]
+    fn an_undecryptable_entry_is_unreadable_rather_than_absent() {
+        // Also from the review, and it contradicted this tool's own
+        // documented contract: a chunk holding only an entry we cannot
+        // decrypt returned `reactions: []`, which a caller polling for an
+        // answer reads as "nobody has reacted yet" and keeps waiting on
+        // forever, or worse, concludes from.
+        let mut undecryptable =
+            reaction_event("$r", "@a:example.com", 7, &annotation("$t", "\u{1F44D}"));
+        undecryptable.status = "unable_to_decrypt";
+        undecryptable.event = None;
+        let (out, unreadable) = reactions_from_chunk(vec![undecryptable], "$t");
+        assert!(out.is_empty());
+        assert_eq!(unreadable, 1, "an undecryptable entry vanished");
+    }
+
+    #[test]
+    fn a_non_annotation_carrying_a_key_is_not_a_reaction() {
+        // The `rel_type` check is only pinned by a fixture a sender could
+        // actually build. Every other non-annotation shape is refused by the
+        // missing `key`, so deleting the `rel_type` check left the suite
+        // green — the check was load-bearing and nothing measured it.
+        // `m.relates_to` is sender-controlled and takes arbitrary fields, so
+        // a thread relation with a `key` on it is one message to write.
+        let forged = serde_json::json!({
+            "msgtype": "m.text",
+            "body": "x",
+            "m.relates_to": { "rel_type": "m.thread", "event_id": "$t", "key": "\u{1F44D}" },
+        });
+        let (out, unreadable) = reactions_from_chunk(
+            vec![reaction_event("$r", "@a:example.com", 7, &forged)],
+            "$t",
+        );
+        assert!(
+            out.is_empty(),
+            "a thread reply with a key on it was read as a thumbs-up"
+        );
+        assert_eq!(
+            unreadable, 0,
+            "a thread reply is not unreadable, it is not a reaction"
+        );
+    }
+
+    #[test]
+    fn only_annotations_are_reactions() {
+        // The control set. A thread reply, a replacement and a plain message
+        // all reach a `/relations` chunk in some shape, and none is a
+        // reaction. None is unreadable either: nothing is being hidden, they
+        // are simply other things.
+        for content in [
+            serde_json::json!({
+                "msgtype": "m.text", "body": "x",
+                "m.relates_to": { "rel_type": "m.thread", "event_id": "$t" },
+            }),
+            serde_json::json!({
+                "msgtype": "m.text", "body": "* x",
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$t" },
+            }),
+            serde_json::json!({ "msgtype": "m.text", "body": "x" }),
+        ] {
+            let (out, unreadable) = reactions_from_chunk(
+                vec![reaction_event("$r", "@a:example.com", 7, &content)],
+                "$t",
+            );
+            assert!(out.is_empty());
+            assert_eq!(unreadable, 0);
+        }
+        // And the control for the control: a real annotation in the same
+        // shape is still returned, so the assertions above are not passing
+        // against a decoder that returns nothing.
+        let (out, _) = reactions_from_chunk(
+            vec![reaction_event(
+                "$r",
+                "@a:example.com",
+                7,
+                &annotation("$t", "\u{1F44D}"),
+            )],
+            "$t",
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn a_mixed_chunk_keeps_every_reaction_and_nothing_else() {
+        let (out, unreadable) = reactions_from_chunk(
+            vec![
+                reaction_event("$r1", "@a:example.com", 1, &annotation("$t", "\u{1F44D}")),
+                reaction_event(
+                    "$m",
+                    "@b:example.com",
+                    2,
+                    &serde_json::json!({ "msgtype": "m.text", "body": "x" }),
+                ),
+                reaction_event("$r2", "@c:example.com", 3, &annotation("$t", "\u{1F44E}")),
+            ],
+            "$t",
+        );
+        assert_eq!(unreadable, 0);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event_id.as_deref(), Some("$r1"));
+        assert_eq!(out[1].event_id.as_deref(), Some("$r2"));
     }
 
     #[test]

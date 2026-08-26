@@ -151,7 +151,7 @@ fn wrap_body(
 ///
 /// Escapes are lossless: each replaced sequence is rendered as its
 /// HTML/SGML entity form so the original bytes can be reconstructed.
-fn escape_injection_markers(body: &str) -> String {
+pub fn escape_injection_markers(body: &str) -> String {
     let mut s = body.to_owned();
 
     // Wrap-related sequences first so the rest of the escaping cannot
@@ -224,7 +224,7 @@ pub fn attr_escape(s: &str) -> String {
 /// is still returned, just with a `suspicious: true` marker so the
 /// caller knows to be extra wary. Lists are deliberately narrow to keep
 /// false positives low; expand cautiously as new attack shapes surface.
-fn is_suspicious(body: &str) -> bool {
+pub fn is_suspicious(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
 
     if INSTRUCTION_OVERRIDE_PHRASES
