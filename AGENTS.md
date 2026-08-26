@@ -137,3 +137,17 @@
   "approve this tool call", approval is available to whoever is standing in
   the room. The allowlist gate belongs in the read path and in the push, not
   in the consumer, or the next consumer omits it. See #124.
+- A relation-carrying event delivered by its **fallback body** reads as
+  ordinary input, because the fallback is designed to be indistinguishable
+  from one. An `m.replace` is an `m.room.message` whose `content.body` is
+  `* <the correction>`, so before #125 a corrected message reached a session
+  as a second, near-identical instruction: nothing absent, nothing malformed,
+  no error anywhere, and a reader that acts twice on something its sender sent
+  once. The `* ` fallback exists for clients that cannot render an edit and a
+  session is not one. Deliver `m.new_content` and mark the event with the id
+  it replaces, on both the live and the replay path, and have replay send only
+  the newest version — the mark is what lets a session that already acted on
+  the original say which of its instructions was withdrawn.
+
+  The same shape is waiting in every other relation: whatever the channel
+  drops is invisible rather than degraded, so nothing looks wrong. #124.
