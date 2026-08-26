@@ -243,3 +243,13 @@
   `replay_deliverable` out of `replay_room` and `live_delivery` out of
   `push_message`; when a mutation stays green, ask what the function needs in
   order to run before assuming the test was weak.
+- **Two correct features compose into a wrong one when they disagree about
+  which field *is* the message.** `carried_of` classifies a replacement by
+  `m.new_content`; `quotable_body` took `content.body`. Each was right on its
+  own and together they quoted the `* `-prefixed fallback instead of the
+  correction, measured the injection heuristic on the fallback so a hostile
+  correction was quoted unflagged, and withheld an ordinary correction whose
+  fallback happened to match the verdict pattern. Pick the body once, through
+  `replay_body_source`, and run every later check against that. Neither
+  feature's own tests could see this; it took a review scoped to the commit
+  that introduced the second one.
