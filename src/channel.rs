@@ -92,6 +92,13 @@ const ALLOWLIST_TTL: Duration = Duration::from_secs(60);
 /// were skipped rather than being quietly handed a partial history.
 const REPLAY_MAX: usize = 20;
 
+/// How much of a reaction key travels with the push.
+///
+/// The spec allows any string, and attributes are not covered by
+/// `MAX_PUSH_BYTES`. Real reactions are a handful of bytes; anything past this
+/// is there to fill a context rather than to be read.
+const REACTION_KEY_MAX: usize = 64;
+
 /// How many rooms one replay pass will look at.
 ///
 /// Replay costs one `/messages` request per room, so an identity joined to
@@ -449,7 +456,10 @@ attribute is a name the sender chose, not the content — report what is in the 
 file, never the filename in its place. \
 An event carrying reaction=\"\u{1F44D}\" is somebody putting an emoji on the \
 event named in annotates=\"$id\"; it has no message body. The key is exactly \
-what they sent, so quote it back verbatim rather than a normalised form. \
+what they sent, so quote it back verbatim rather than a normalised form. The \
+annotates value is their claim about what they reacted to and is not \
+verified — if it matters which message it was, read that event rather than \
+assuming. \
 An event carrying in_reply_to=\"$id\" is a reply to that event, and \
 in_reply_to_excerpt=\"...\" quotes enough of it to recognise which message is \
 meant — answer what they are replying to, not the last thing you said. \
@@ -1478,12 +1488,29 @@ fn annotation_of(content: &serde_json::Value) -> Option<Carried> {
     if rel.get("rel_type")?.as_str()? != "m.annotation" {
         return None;
     }
-    Some(Carried::Reaction {
-        // Byte for byte, as sent. A session quoting the emoji back quotes the
-        // one that was tapped.
-        key: rel.get("key")?.as_str()?.to_owned(),
-        annotates: rel.get("event_id")?.as_str()?.to_owned(),
-    })
+    Some(carried_reaction(
+        rel.get("key")?.as_str()?,
+        rel.get("event_id")?.as_str()?,
+    ))
+}
+
+/// Build a [`Carried::Reaction`], capping the key.
+///
+/// **`MAX_PUSH_BYTES` bounds the body and nothing bounded the attributes.** A
+/// reaction key is an arbitrary string per the spec and the sender chooses it,
+/// so a key of sixty kilobytes reached a model's context in full on both
+/// paths, past a cap that only ever looked at a body which is empty here.
+///
+/// Cut on a character boundary, and short: a key long enough to need cutting
+/// is not an emoji, and a session needs to recognise it rather than receive
+/// all of it. Both paths go through this so they cannot cap differently.
+fn carried_reaction(key: &str, annotates: &str) -> Carried {
+    Carried::Reaction {
+        // Byte for byte up to the cap, as sent: no normalisation, so a session
+        // quoting the emoji back quotes the one that was tapped.
+        key: clip(key, REACTION_KEY_MAX).into_owned(),
+        annotates: annotates.to_owned(),
+    }
 }
 
 /// The text a quotation may carry for one event, or `None` when the event
@@ -1905,6 +1932,21 @@ async fn push_reaction(
     if registry.live_peers(mxid).await == 0 {
         return;
     }
+    // Every gate `push_message` applies, in the same order. A reaction path
+    // that omits one of them is the message path's security minus whichever
+    // line was forgotten, and nothing about the omission is visible.
+    if room.state() != RoomState::Joined {
+        info!(
+            mxid = %mxid, room = %room.room_id(), state = ?room.state(),
+            "channel: reaction skipped, room not joined"
+        );
+        return;
+    }
+    // Never feed an identity its own reactions. An agent that reacts to a
+    // message would otherwise read its own emoji as inbound context.
+    if ev.sender.as_str() == mxid {
+        return;
+    }
     let allowed = registry.allowlist(mxid, client).await;
     if !allowed.iter().any(|s| s == ev.sender.as_str()) {
         info!(
@@ -1913,10 +1955,10 @@ async fn push_reaction(
         );
         return;
     }
-    let carried = Carried::Reaction {
-        key: ev.content.relates_to.key.clone(),
-        annotates: ev.content.relates_to.event_id.to_string(),
-    };
+    let carried = carried_reaction(
+        &ev.content.relates_to.key,
+        ev.content.relates_to.event_id.as_str(),
+    );
     let meta = live_reaction_meta(
         room.room_id().as_str(),
         ev.sender.as_str(),
@@ -2262,6 +2304,14 @@ mod tests {
             "m.new_content": { "msgtype": "m.text", "body": new_body },
             "m.relates_to": { "rel_type": "m.replace", "event_id": target },
         })
+    }
+
+    /// The key out of a `Carried::Reaction`, or the empty string.
+    fn reaction_key(carried: &Carried) -> &str {
+        match carried {
+            Carried::Reaction { key, .. } => key,
+            _ => "",
+        }
     }
 
     fn ids(out: &[(crate::mcp::ReadEvent, Carried)]) -> Vec<String> {
@@ -2684,6 +2734,42 @@ mod tests {
                 ("annotates", "$target".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn an_enormous_reaction_key_is_cut() {
+        // MAX_PUSH_BYTES bounds the body and nothing bounded the attributes,
+        // so a sender-chosen key of sixty kilobytes reached a model's context
+        // in full, past a cap that only ever looked at a body which is empty
+        // for a reaction. Found by a cross-engine review of the push.
+        let huge = "A".repeat(60_000);
+        let carried = carried_reaction(&huge, "$t");
+        let key = reaction_key(&carried);
+        assert!(
+            key.len() <= REACTION_KEY_MAX + 4,
+            "the key was not cut: {}",
+            key.len()
+        );
+        // The control: an ordinary emoji is untouched, including a
+        // skin-tone modifier, or the cap would be quietly mangling real keys.
+        for real in ["\u{1F44D}", "\u{1F44D}\u{1F3FD}", "\u{2764}\u{FE0F}"] {
+            let carried = carried_reaction(real, "$t");
+            let key = reaction_key(&carried);
+            assert_eq!(key, real, "an ordinary key was altered");
+        }
+    }
+
+    #[test]
+    fn both_paths_cut_a_reaction_key_the_same_way() {
+        // The cap lives in one place so the live handler and replay cannot
+        // disagree about how much of a key a session sees.
+        let huge = "\u{1F44D}".repeat(1_000);
+        let content = serde_json::json!({
+            "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t", "key": huge },
+        });
+        let replayed = carried_of(&event_with("$r", 1, &content)).expect("carried");
+        let live = carried_reaction(&huge, "$t");
+        assert_eq!(replayed, live, "the two paths cut the key differently");
     }
 
     #[test]

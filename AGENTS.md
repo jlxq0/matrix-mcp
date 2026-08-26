@@ -261,3 +261,18 @@
   reason, and the test that matters compares the two paths' spelling of the
   same attribute rather than either one alone. Three separate faults in this
   file have been two paths disagreeing about one event.
+- **A cap on the body is not a cap on the attributes.** `MAX_PUSH_BYTES` and
+  `cap_wrapped` bound what a channel event says; they do not touch the meta,
+  and `build_params` escapes meta values without bounding them. A reaction key
+  is an arbitrary string the sender chooses, so a sixty-kilobyte key reached a
+  model's context in full on both paths, past a cap that only ever looked at a
+  body which is empty for a reaction. Anything sender-controlled that lands in
+  attribute position needs its own limit, applied in one place so the paths
+  cannot cap differently.
+- **A new push path must apply every gate the existing one applies, in the
+  same order, and the omission is invisible.** `push_reaction` shipped without
+  the `RoomState::Joined` check and without the self-sender suppression that
+  `push_message` has, so a reaction in a room this identity had left would
+  have been delivered and an agent could have read its own emoji back as
+  inbound context. Nothing about a missing guard shows up in a diff of the new
+  function; read the old one beside it.
