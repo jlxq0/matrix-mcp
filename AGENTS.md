@@ -175,3 +175,26 @@
   disagreeing about one event: the #107 shape, for the third time in this
   file. When adding a field to one path, ask what the other path reads instead
   of it.
+- **A quotation is untrusted content arriving by a second route, so it must be
+  escaped by the same functions as the body it quotes**, not by an escaper
+  written beside it. `quote_excerpt` calls `escape_injection_markers` and
+  `is_suspicious` rather than reimplementing them, and the test compares its
+  output against what `content_sandbox::evaluate` produces for the same input,
+  so the two cannot drift. A hand-written expected string would agree with
+  whichever implementation it was copied from.
+- **A lookup keyed on something the sender controls needs a collision policy,
+  and "the map keeps one" is not one.** Two events claiming one event id made
+  a `HashMap` answer for the wrong one, so a reply could quote one message's
+  words under another's name. Neither is quotable now. The same reasoning
+  covers a response fetched *by* id: compare what came back against what was
+  asked for, because keeping the requested id as the label while taking the
+  sender and the body from the response attributes words to a message that
+  never contained them.
+- **Trust does not follow the content, it follows the route it came in by.**
+  The sender allowlist gates who may push into a session; a reply quoting
+  somebody else carries their words in regardless, since the batch a quotation
+  is drawn from is fetched before any allowlist filter. Refusing to quote
+  would make replies to our own messages unresolvable, which is the case the
+  feature exists for, so the excerpt travels and says who wrote it:
+  `in_reply_to_untrusted_sender`. Any new inbound surface has this question
+  and it does not answer itself.
