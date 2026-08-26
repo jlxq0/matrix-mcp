@@ -166,3 +166,12 @@
   correction disappears; asking "is it the newest edit?" first keeps exactly
   one version. Malformed relations are the normal case for this, so decide the
   order deliberately and test the cycle.
+- **A field that only means something under a relation must be read only when
+  that relation is present**, or a sender can attach it as a decoy. Reading
+  `m.new_content` on any event carrying the key let an `m.location` — which
+  the channel does not carry — be classified from an `m.text` decoy and
+  delivered with the outer body. Replay only, because the live path reads a
+  typed `Relation` and has no such key, so it was also the two paths
+  disagreeing about one event: the #107 shape, for the third time in this
+  file. When adding a field to one path, ask what the other path reads instead
+  of it.

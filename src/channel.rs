@@ -1427,10 +1427,19 @@ fn carried_of(event: &crate::mcp::ReadEvent) -> Option<Carried> {
     // present" let `{"msgtype": 7}` through, which passes the check and then
     // fails to classify — turning a deliverable message into a dropped one.
     // Asking the classifier is the only test that cannot disagree with it.
-    outer
-        .get("m.new_content")
-        .and_then(classify_content)
-        .or_else(|| classify_content(outer))
+    // Only a replacement is classified by `m.new_content`. Reading it on any
+    // event that happens to carry the key lets a sender attach a decoy: an
+    // `m.location` the channel does not carry, with an `m.text` in
+    // `m.new_content`, classified as a message and delivered with the outer
+    // body — and delivered by replay only, since the live path has no such
+    // key to read. The two paths disagreeing about one event is the #107
+    // shape, which is the thing this file keeps being bitten by.
+    if replaces_of(event).is_some()
+        && let Some(carried) = outer.get("m.new_content").and_then(classify_content)
+    {
+        return Some(carried);
+    }
+    classify_content(outer)
 }
 
 fn classify_content(content: &serde_json::Value) -> Option<Carried> {
@@ -2003,6 +2012,32 @@ mod tests {
                  falling back to the content the old code delivered"
             );
         }
+    }
+
+    #[test]
+    fn m_new_content_on_a_non_replacement_is_a_decoy_and_is_ignored() {
+        // The mirror question to the review that found the three drops: does
+        // anything now get delivered that the old code correctly withheld.
+        // An `m.location` is not carried, so this event must not be — and
+        // reading `m.new_content` without first checking the relation
+        // classified it as a message and delivered the outer body. Replay
+        // only, since the live path has no such key to read, so it is also
+        // the two paths disagreeing about one event.
+        let decoy = serde_json::json!({
+            "msgtype": "m.location",
+            "body": "outer payload",
+            "m.new_content": { "msgtype": "m.text", "body": "decoy" },
+        });
+        assert_eq!(carried_of(&event_with("$x", 1, &decoy)), None);
+
+        // The control: with the relation present it *is* an edit, and the new
+        // content is what the session is owed.
+        let mut real = decoy;
+        real["m.relates_to"] = serde_json::json!({ "rel_type": "m.replace", "event_id": "$a" });
+        assert_eq!(
+            carried_of(&event_with("$x", 1, &real)),
+            Some(Carried::Message)
+        );
     }
 
     #[test]
