@@ -224,3 +224,22 @@
   and **report having hit the cap** — otherwise a capped page is
   indistinguishable from the end of the list, which is the same absence fault
   one layer up.
+- **A second route to the same content needs the first route's judgement, not
+  just its escaping.** Reply quotations were escaped like a body and selected
+  like nothing: `quotable_from` took `raw_body` off any event with an id and a
+  sender, so an allowlisted person replying to a permission verdict, or to an
+  event type the channel does not carry, pulled that body into the session by
+  a route the delivery path refuses. `quotable_body` now applies
+  `is_replayed_verdict` and `carried_of` exactly as delivery does, and quotes
+  a caption rather than a filename for the same reason `replay_body` does.
+  Third instance of two paths disagreeing about one event in this file, and it
+  was introduced while the rule was in a doc comment on the function above.
+- **A mutation that leaves the suite green on a path needing a live `Room` is
+  telling you the judgement is in the wrong place, not that it is safe.**
+  `resolve_reply`'s fetch fallback was unreachable, so making it quote
+  `raw_body` changed nothing anybody could see. It is `reply_ref_from` now, a
+  free function over a decoded event, which also pinned the requested-id check
+  and the undecryptable check that had no tests either. Same move as
+  `replay_deliverable` out of `replay_room` and `live_delivery` out of
+  `push_message`; when a mutation stays green, ask what the function needs in
+  order to run before assuming the test was weak.

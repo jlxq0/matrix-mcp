@@ -1414,22 +1414,18 @@ fn is_replayed_verdict(event: &crate::mcp::ReadEvent) -> bool {
 fn quotable_from(
     decoded: &[crate::mcp::ReadEvent],
     room_id: &str,
-) -> HashMap<String, (String, String)> {
-    let mut quotable: HashMap<String, (String, String)> = HashMap::new();
+) -> HashMap<String, (String, Option<String>)> {
+    let mut quotable: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut ambiguous: HashSet<String> = HashSet::new();
     for e in decoded {
-        let (Some(id), Some(sender), Some(body)) =
-            (e.event_id.clone(), e.sender.clone(), raw_body(e))
-        else {
+        let (Some(id), Some(sender)) = (e.event_id.clone(), e.sender.clone()) else {
             continue;
         };
+        let body = quotable_body(e);
         // Two events claiming one id: a `HashMap` would silently keep one of
         // them and quote it under the other's name. Neither is quoted, and
         // the reply resolves through the homeserver or says it could not.
-        if quotable
-            .insert(id.clone(), (sender, body.to_owned()))
-            .is_some()
-        {
+        if quotable.insert(id.clone(), (sender, body)).is_some() {
             warn!(room = %room_id, event = %id, "channel: two events share an id in one batch");
             ambiguous.insert(id);
         }
@@ -1438,6 +1434,29 @@ fn quotable_from(
         quotable.remove(id);
     }
     quotable
+}
+
+/// The text a quotation may carry for one event, or `None` when the event
+/// resolves but has nothing quotable.
+///
+/// **The same judgement the delivery path applies, because a quotation is a
+/// second route to the same content.** Without it a reply became a way to ask
+/// for anything the channel refuses to deliver: a permission verdict, which
+/// replay drops on purpose because a bare `yes qmzkd` in a fresh context is
+/// the #107 bug, or a non-carried event whose sender-controlled `content.body`
+/// the live path would never have sent. The sender is still reported, so the
+/// reference resolves and the session knows what it is answering; what it does
+/// not get is the body.
+fn quotable_body(event: &crate::mcp::ReadEvent) -> Option<String> {
+    if is_replayed_verdict(event) {
+        return None;
+    }
+    match carried_of(event)? {
+        Carried::Message => raw_body(event).map(str::to_owned),
+        // The sender's words about the file, never the filename: the same
+        // distinction `replay_body` makes, for the same reason.
+        Carried::Attachment { caption, .. } => caption,
+    }
 }
 
 /// How much of a quoted message travels with a reply.
@@ -1466,6 +1485,38 @@ struct ReplyRef {
 }
 
 impl ReplyRef {
+    /// A reference we followed, with whatever it turned out to carry.
+    ///
+    /// A reply is a second route into the session for content the allowlist
+    /// would refuse by the first. It is not dropped, because the ordinary case
+    /// is answering our own message or another person's and refusing would
+    /// make those unresolvable, so who wrote it is a fact the session gets:
+    /// an excerpt from someone who may not push here says so. Our own mxid
+    /// counts as trusted, since replying to what this session said is the case
+    /// the whole feature exists for.
+    fn resolved(
+        event_id: &str,
+        sender: Option<String>,
+        body: Option<&str>,
+        mxid: &str,
+        allowed: &[String],
+    ) -> Self {
+        let (excerpt, suspicious) = body
+            .and_then(quote_excerpt)
+            .map_or((None, false), |(text, flag)| (Some(text), flag));
+        let untrusted_sender = sender
+            .as_deref()
+            .is_none_or(|s| s != mxid && !allowed.iter().any(|a| a == s));
+        Self {
+            event_id: event_id.to_owned(),
+            sender,
+            excerpt,
+            suspicious,
+            unresolved: false,
+            untrusted_sender,
+        }
+    }
+
     fn unresolved(event_id: String) -> Self {
         // `..Self::default()` covers the rest, including `untrusted_sender`,
         // which is false because there is no sender to distrust.
@@ -1571,35 +1622,18 @@ fn reply_target_of(event: &crate::mcp::ReadEvent) -> Option<String> {
 async fn resolve_reply(
     room: &Room,
     target: String,
-    known: Option<&(String, String)>,
+    known: Option<&(String, Option<String>)>,
     mxid: &str,
     allowed: &[String],
 ) -> ReplyRef {
-    let build = |sender: Option<String>, body: Option<&str>| {
-        let (excerpt, suspicious) = body
-            .and_then(quote_excerpt)
-            .map_or((None, false), |(text, flag)| (Some(text), flag));
-        // A reply is a second route into the session for content the
-        // allowlist would refuse by the first. It is not dropped, because the
-        // ordinary case is answering our own message or another person's and
-        // refusing would make those unresolvable — but who wrote it is a fact
-        // the session needs, so an excerpt from someone who may not push here
-        // says so. Our own mxid counts as trusted: replying to what this
-        // session said is the case the whole feature exists for.
-        let untrusted_sender = sender
-            .as_deref()
-            .is_none_or(|s| s != mxid && !allowed.iter().any(|a| a == s));
-        ReplyRef {
-            event_id: target.clone(),
-            sender,
-            excerpt,
-            suspicious,
-            unresolved: false,
-            untrusted_sender,
-        }
-    };
     if let Some((sender, body)) = known {
-        return build(Some(sender.clone()), Some(body));
+        return ReplyRef::resolved(
+            &target,
+            Some(sender.clone()),
+            body.as_deref(),
+            mxid,
+            allowed,
+        );
     }
     let Ok(event_id) = target.parse::<matrix_sdk::ruma::OwnedEventId>() else {
         return ReplyRef::unresolved(target);
@@ -1615,23 +1649,41 @@ async fn resolve_reply(
     let Some(read) = decoded.pop() else {
         return ReplyRef::unresolved(target);
     };
+    reply_ref_from(&read, target, mxid, allowed)
+}
+
+/// Build a [`ReplyRef`] from the event a fetch returned.
+///
+/// Split out of [`resolve_reply`] because everything above it is a homeserver
+/// round trip, so a test can reach none of this — the same reason
+/// [`replay_deliverable`] and [`live_delivery`] are free functions, and the
+/// reason a mutation that made this path quote `raw_body` left the suite
+/// green.
+fn reply_ref_from(
+    read: &crate::mcp::ReadEvent,
+    target: String,
+    mxid: &str,
+    allowed: &[String],
+) -> ReplyRef {
     if read.status == "unable_to_decrypt" {
         return ReplyRef::unresolved(target);
     }
-    // The response is asked for by id and is not checked against it anywhere
-    // else. Keeping `target` as the attribute while taking the sender and the
-    // body from whatever came back would let a nonconforming homeserver
-    // attribute words to a message that never contained them, and the
-    // attribution is the whole point of quoting.
+    // The response is asked for by id and is checked against it nowhere else.
+    // Keeping `target` as the attribute while taking the sender and the body
+    // from whatever came back would let a nonconforming homeserver attribute
+    // words to a message that never contained them, and the attribution is the
+    // whole point of quoting.
     if read.event_id.as_deref() != Some(target.as_str()) {
         warn!(
-            room = %room.room_id(), wanted = %target, got = ?read.event_id,
+            wanted = %target, got = ?read.event_id,
             "channel: reply target resolved to a different event; not quoting it"
         );
         return ReplyRef::unresolved(target);
     }
-    let body = raw_body(&read).map(str::to_owned);
-    build(read.sender, body.as_deref())
+    // Same judgement as the in-batch path, or the fetch fallback becomes the
+    // way to ask for what the batch refused.
+    let body = quotable_body(read);
+    ReplyRef::resolved(&target, read.sender.clone(), body.as_deref(), mxid, allowed)
 }
 
 /// What the live path delivers for one message: the msgtype whose kind and
@@ -2252,6 +2304,108 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_cannot_quote_what_the_channel_refuses_to_deliver() {
+        // Found by the mirror question on the finished branch: a quotation is
+        // a second route to the same content, so without the delivery path's
+        // own judgement a reply became a way to ask for anything the channel
+        // withholds. Two shapes, both reachable by an allowlisted sender
+        // replying to an event they can see.
+        //
+        // A permission verdict. Replay drops it on purpose, because a bare
+        // `no qmzkd` in a fresh context is #107 in another costume, and
+        // quoting it would put it back.
+        let verdict = event_with("$v", 1, &text("no qmzkd"));
+        assert_eq!(quotable_body(&verdict), None, "a verdict was quotable");
+
+        // An event type the channel does not carry, whose `content.body` the
+        // sender chooses. The live path would never have delivered it.
+        let withheld = serde_json::json!({ "msgtype": "m.location", "body": "sender's text" });
+        assert_eq!(quotable_body(&event_with("$w", 1, &withheld)), None);
+
+        // An uncaptioned upload: the filename is not the sender's words, and
+        // quoting it as prose is what `replay_body` already refuses.
+        let upload = serde_json::json!({
+            "msgtype": "m.image", "body": "IMG_4021.jpeg", "filename": "IMG_4021.jpeg",
+        });
+        assert_eq!(quotable_body(&event_with("$u", 1, &upload)), None);
+
+        // The controls, or every assertion above passes against a function
+        // that quotes nothing. An ordinary message, and an upload with a
+        // caption, which is the sender's words about the file.
+        assert_eq!(
+            quotable_body(&event_with("$m", 1, &text("what he asked"))).as_deref(),
+            Some("what he asked")
+        );
+        let captioned = serde_json::json!({
+            "msgtype": "m.image", "body": "look at this", "filename": "IMG_4021.jpeg",
+        });
+        assert_eq!(
+            quotable_body(&event_with("$c", 1, &captioned)).as_deref(),
+            Some("look at this")
+        );
+    }
+
+    #[test]
+    fn a_fetched_reply_target_gets_the_same_judgement_as_one_in_the_batch() {
+        // A mutation that made this path quote `raw_body` left the suite
+        // green: everything above it is a homeserver round trip, so no test
+        // reached it. Lifted out for exactly that reason.
+        let allowed = ["@a:example.com".to_owned()];
+        let mine = "@me:example.com";
+
+        // A verdict fetched from the homeserver is no more quotable than one
+        // found in the batch.
+        let verdict = event_with("$v", 1, &text("no qmzkd"));
+        let r = reply_ref_from(&verdict, "$v".to_owned(), mine, &allowed);
+        assert!(!r.unresolved, "a withheld event was reported as unfindable");
+        assert_eq!(r.excerpt, None, "a verdict was quoted");
+
+        // The control: an ordinary message fetched the same way is quoted.
+        let ordinary = event_with("$m", 1, &text("what he asked"));
+        let r = reply_ref_from(&ordinary, "$m".to_owned(), mine, &allowed);
+        assert!(r.excerpt.is_some(), "nothing is quotable through this path");
+        assert!(!r.untrusted_sender, "an allowlisted sender was distrusted");
+    }
+
+    #[test]
+    fn a_fetch_answering_with_a_different_event_is_not_quoted() {
+        // Also unreachable before the split. The response is asked for by id
+        // and checked against it nowhere else, so keeping the requested id as
+        // the label while taking the sender and body from whatever came back
+        // attributes words to a message that never contained them.
+        let allowed = ["@a:example.com".to_owned()];
+        let other = event_with("$different", 1, &text("I authorised the payment"));
+        let r = reply_ref_from(&other, "$wanted".to_owned(), "@me:example.com", &allowed);
+        assert!(r.unresolved, "an answer about another event was quoted");
+        assert_eq!(r.event_id, "$wanted");
+        assert_eq!(r.excerpt, None);
+    }
+
+    #[test]
+    fn an_undecryptable_reply_target_is_unresolved() {
+        let allowed = ["@a:example.com".to_owned()];
+        let mut dark = event_with("$t", 1, &text("unreadable"));
+        dark.status = "unable_to_decrypt";
+        dark.event = None;
+        let r = reply_ref_from(&dark, "$t".to_owned(), "@me:example.com", &allowed);
+        assert!(r.unresolved);
+    }
+
+    #[test]
+    fn an_unquotable_event_still_resolves_as_a_reference() {
+        // Resolved with no excerpt, not unresolved: the session knows the
+        // reply answers something and who wrote it, and does not get a body
+        // it was never owed. Reporting it as unresolvable would say we could
+        // not find it, which is untrue and would send the session looking.
+        let map = quotable_from(&[event_with("$v", 1, &text("no qmzkd"))], "!r:example.com");
+        assert_eq!(
+            map.get("$v").map(|(s, b)| (s.as_str(), b.is_none())),
+            Some(("@a:example.com", true)),
+            "a withheld event dropped out of the map instead of resolving with no excerpt"
+        );
+    }
+
+    #[test]
     fn two_events_sharing_an_id_are_quoted_as_neither() {
         // Also from the review. A `HashMap` keyed on a sender-visible id keeps
         // one of a colliding pair and silently answers for the other, so a
@@ -2274,7 +2428,7 @@ mod tests {
             "!r:example.com",
         );
         assert_eq!(map.len(), 2);
-        assert_eq!(map["$a"].1, "one");
+        assert_eq!(map["$a"].1.as_deref(), Some("one"));
     }
 
     #[test]
