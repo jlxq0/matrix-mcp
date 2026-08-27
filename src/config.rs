@@ -109,7 +109,33 @@ const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
-const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
+/// How many proxies sit between a caller and this process, counted from the
+/// right of `X-Forwarded-For`.
+///
+/// **Two, because the measured chain is `client -> Caddy edge -> Cilium
+/// gateway (Envoy appends) -> pod`, as of 2026-08-27.** With two entries and
+/// a count of one, `parse_client_ip` selects `parts[1]`, which is what Envoy
+/// appended: the edge's address as the gateway saw it, recorded as the
+/// caller's for every authenticated request.
+///
+/// **This number is only correct while the Caddy edge *replaces* the header
+/// rather than appending to it.** `oddie-apps/edge-config#40` at `880ea46`
+/// asserts that behaviour with 93 tests; the two have to be re-derived
+/// together and nothing outside this comment says so.
+///
+/// **Too high does not fail safe.** Behind a single *appending* proxy, a
+/// caller sending its own header makes the chain two long, the `len < hops`
+/// guard never fires, and a count of two returns the caller's own string.
+///
+/// The residual, measured rather than assumed: a caller reaching the Cilium
+/// gateway directly has a real depth of one, so its own header becomes the
+/// leftmost of two and a count of two selects it. That needs a stolen bearer
+/// **and** code running inside the cluster, because `MetalLB` advertises the
+/// `fondue` pool over BGP rather than L2, so the gateway addresses time out
+/// from the LAN and answer 401 only from inside. If the gateway were ever
+/// reachable, two would be *worse* than one: one selects an infrastructure
+/// address and two selects whatever the caller typed.
+const DEFAULT_TRUSTED_PROXY_HOPS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -563,6 +589,67 @@ mod tests {
         assert_eq!(cfg.resource_url, "https://example.test");
         assert_eq!(cfg.authorization_server, "https://auth.example.test");
         assert_eq!(cfg.homeserver_url, "https://matrix.example.test");
+    }
+
+    #[test]
+    fn the_default_hop_count_picks_the_caller_out_of_the_measured_chain() {
+        // Through `Config::new` with no hop count passed, because every
+        // existing `parse_client_ip` test supplies one as an argument and is
+        // therefore green at any default. Reverting the constant left those
+        // tests passing in three sibling repositories.
+        //
+        // The measured chain is client -> Caddy edge -> Cilium gateway, and
+        // Envoy at the gateway appends what it saw, so two entries arrive:
+        // the caller, then the edge.
+        let cfg = Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            "https://matrix.example.test",
+            "example.test",
+            bind(),
+        )
+        .unwrap();
+        let chain = "203.0.113.5, 10.0.0.1";
+
+        // The consequence, not the number. `assert_eq!(hops, 2)` restates the
+        // constant and cannot fail for a reason worth knowing.
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some(chain), cfg.trusted_proxy_hops),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                203, 0, 113, 5
+            ))),
+            "the recorded address is the edge's, not the caller's"
+        );
+        // At one it returns the edge; that is the defect, spelled out so the
+        // assertion above is read as a choice between two live answers.
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some(chain), 1),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)))
+        );
+        // At three the `len < hops` guard fires and nothing is recorded.
+        assert_eq!(crate::last_used::parse_client_ip(Some(chain), 3), None);
+    }
+
+    #[test]
+    fn a_single_entry_chain_records_nothing_under_the_default() {
+        // A caller reaching the gateway directly has a real depth of one, so
+        // its own header would be the only entry. Under the default the guard
+        // fires rather than selecting it, which is the case that decides
+        // whether too high fails safe: here it does, and behind an appending
+        // proxy it would not, which is why the constant's comment carries the
+        // topology it depends on.
+        let cfg = Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            "https://matrix.example.test",
+            "example.test",
+            bind(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some("203.0.113.5"), cfg.trusted_proxy_hops),
+            None
+        );
     }
 
     #[test]

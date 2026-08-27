@@ -78,13 +78,16 @@ pub async fn bearer_auth(
             // client and is therefore spoofable by an attacker holding a
             // stolen bearer; never use it as an audit signal.
             if !is_introspect_path {
-                let client_ip = last_used::parse_client_ip(
-                    request
-                        .headers()
-                        .get("x-forwarded-for")
-                        .and_then(|v| v.to_str().ok()),
-                    state.config.trusted_proxy_hops,
-                );
+                let xff = request
+                    .headers()
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok());
+                // How many proxies actually appeared, beside how many we
+                // trust. The hop count is a claim about the topology that
+                // nothing in this process can check; this is what makes it
+                // falsifiable from outside.
+                last_used::observe_ingress_chain(xff, state.config.trusted_proxy_hops);
+                let client_ip = last_used::parse_client_ip(xff, state.config.trusted_proxy_hops);
                 state.last_used.record(&token_hash, client_ip);
             }
             // Stash both the identity and the raw OAuth token on the request
