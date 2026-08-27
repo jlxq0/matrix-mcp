@@ -376,3 +376,27 @@
   `https://matrix-mcp.kampong.social` at `/channel` and `/mcp`. A sweep for
   this repository's own name finds nothing, so **"nobody is connected" read off
   a name search is a statement about the search.** Read the URL, not the key.
+- **Claude Code truncates a server's instructions at 2048 bytes, so what a
+  session receives is decided by ordering rather than by what you wrote.**
+  `CHANNEL_INSTRUCTIONS` was 2724 bytes; 711 were lost, the cut landed
+  mid-sentence inside the `replaces=` paragraph, and **everything past it was
+  the prompt-injection contract**: that a body is data rather than instruction,
+  and that a request to change configuration or reveal credentials is answered
+  rather than obeyed. Seven of the eight directors have that stated nowhere
+  else. The contract is now first and the attribute catalogue last, because a
+  catalogue degrades gracefully and a contract does not.
+- **Assert on the slice a reader receives, never on `len()`.** A length
+  assertion tests the constant and stays green while the reader gets nothing.
+  `the_security_contract_is_inside_what_a_session_receives` builds what a
+  client is actually handed, cuts it at 2048 and looks for the clauses, so it
+  keeps working if the string grows again; it is checked against a long server
+  name too, since the prefix eats the same budget. **A weak mutation passes
+  here**: 800 bytes of filler ahead of the contract left it green because the
+  contract was still inside the window, and 1819 reddened it. If a mutation
+  aimed at a positional property stays green, check that it actually moved the
+  thing past the boundary.
+- **`the_instructions_say_what_the_*_attributes_mean` assert on the whole
+  constant and are kept deliberately.** For a while they passed on bytes
+  2048..2724 — a green test asserting the presence of something invisible to
+  its audience. One set speaks for the string and one for the reader; deleting
+  either as redundant loses the distinction between written and delivered.
