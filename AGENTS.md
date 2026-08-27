@@ -329,3 +329,21 @@
   `assert_eq!(hops, 2)` restates the constant and cannot fail for a reason
   worth knowing. Mutate in both directions: 1 and 3 must each go red, and here
   they redden two tests and one respectively.
+- **A counter that reports on a parser must split its input the same way, or
+  it agrees with the configuration exactly when the parser has gone wrong.**
+  `observe_ingress_chain` filtered empty `X-Forwarded-For` entries and
+  `parse_client_ip` did not, so a trailing comma made the log line say
+  `xff_entries=2 trusted_proxy_hops=2` while the parser counted three and
+  recorded the edge as the caller. One `xff_entries` helper now serves both.
+  Found by cross-engine review; the suite was green.
+- **A function whose only observable is a log line cannot be tested, so the
+  judgement inside it has to come out.** A mutation making the counter split
+  differently left the suite green until `ingress_chain_len` had a name a test
+  could call. Fourth instance in this repository of a mutation surviving
+  because the thing it broke was unreachable rather than because the code was
+  right.
+- **Backtick every CamelCase name from another system in a doc comment.**
+  `clippy::doc_markdown` rejects bare `MetalLB`, `HTTPRoute`, `BGPAdvertisement`
+  and the like with "item in documentation is missing backticks", and a
+  comments-only change is exactly where those names appear, so run the full
+  gate on a docs-only diff rather than only the suite.

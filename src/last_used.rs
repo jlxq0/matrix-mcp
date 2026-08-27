@@ -85,6 +85,19 @@ impl LastUsedTracker {
     /// is at capacity and the key is new, drop the oldest entry
     /// first. Lock poisoning is recovered from in-place — a panic
     /// elsewhere should not cripple the introspect endpoint.
+    ///
+    /// **`token_hash` identifies a credential, not a caller, and a row here
+    /// pairs it with one address.** Every session mounting these servers
+    /// presents the same bearer: measured on a sibling as nine requests
+    /// resolving to one hash and one account. So the address is whichever
+    /// caller was most recent, the hash cannot separate two of them, and
+    /// **neither is wrong in a way that shows** — during an incident somebody
+    /// pairs the two fields and believes they have distinguished two callers.
+    ///
+    /// **Do not repair this by reaching for a better identifier here.** The
+    /// obvious substitutions pass review and are not fixes; separating
+    /// callers needs a per-request correlation id, or the count folded into
+    /// the audit event, which is a different change from this map.
     pub fn record(&self, token_hash: &str, ip: Option<IpAddr>) {
         let now = SystemTime::now();
         let mut map = self
@@ -131,6 +144,36 @@ impl LastUsedTracker {
 /// Returns `None` when the header is absent, has fewer entries than
 /// the trusted-hops count, or contains no parseable IP at the trusted
 /// position.
+/// The entries of an `X-Forwarded-For`, trimmed, with empties discarded.
+///
+/// **One definition of "entry", used by the counter and the parser both.**
+/// They disagreed at first: a trailing comma made the observer count two and
+/// the parser count three, so the log line said the chain matched the
+/// configured hops while the parser selected one position too far right and
+/// recorded the edge as the caller. A reporter that counts differently from
+/// the thing it reports on is worse than no reporter, because it agrees with
+/// the configuration exactly when the parser has gone wrong.
+///
+/// Empties are discarded rather than kept: `a, b,` is two hops with a stray
+/// comma, and RFC 9110 lets a recipient ignore empty list elements.
+fn xff_entries(raw: &str) -> Vec<&str> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// How many proxies this chain says are in front of us.
+///
+/// Named rather than inlined into [`observe_ingress_chain`] because that
+/// function's only observable is a log line, so a test cannot reach it: a
+/// mutation that made the counter split differently from the parser left the
+/// suite green. The agreement between this and [`parse_client_ip`] is the
+/// property worth pinning, and it needs a name on both sides of it.
+fn ingress_chain_len(raw: &str) -> usize {
+    xff_entries(raw).len()
+}
+
 /// The chain length last reported, so the count is logged on change rather
 /// than once per request.
 static LAST_REPORTED_CHAIN: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -151,7 +194,7 @@ pub fn observe_ingress_chain(xff: Option<&str>, trusted_proxy_hops: usize) {
     let Some(raw) = xff else {
         return;
     };
-    let entries = raw.split(',').filter(|s| !s.trim().is_empty()).count();
+    let entries = ingress_chain_len(raw);
     if LAST_REPORTED_CHAIN.swap(entries, Ordering::Relaxed) != entries {
         tracing::info!(
             xff_entries = entries,
@@ -164,7 +207,7 @@ pub fn observe_ingress_chain(xff: Option<&str>, trusted_proxy_hops: usize) {
 #[must_use]
 pub fn parse_client_ip(xff: Option<&str>, trusted_proxy_hops: usize) -> Option<IpAddr> {
     let raw = xff?;
-    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    let parts = xff_entries(raw);
     let len = parts.len();
     if trusted_proxy_hops == 0 || len < trusted_proxy_hops {
         return None;
@@ -224,6 +267,46 @@ mod tests {
         );
         // `ip` should be present and null.
         assert_eq!(json.get("ip").unwrap(), &serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_trailing_comma_does_not_shift_which_entry_is_the_caller() {
+        // Found by a cross-engine review of the hop-count change. The
+        // observer filtered empty entries and the parser did not, so
+        // `"caller, edge,"` was counted as two and parsed as three: the log
+        // line said the chain matched the configured hops while the parser
+        // selected one position too far right and recorded the edge.
+        let caller = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        for chain in [
+            "203.0.113.5, 10.0.0.1",
+            "203.0.113.5, 10.0.0.1,",
+            "203.0.113.5, 10.0.0.1, ",
+            "203.0.113.5,, 10.0.0.1",
+        ] {
+            assert_eq!(
+                parse_client_ip(Some(chain), 2),
+                Some(caller),
+                "a stray comma moved the caller: {chain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_counter_and_the_parser_agree_about_what_an_entry_is() {
+        // The property rather than the spelling. A reporter that counts
+        // differently from the thing it reports on agrees with the
+        // configuration exactly when the parser has gone wrong.
+        for chain in [
+            "203.0.113.5, 10.0.0.1",
+            "203.0.113.5, 10.0.0.1,",
+            " , 203.0.113.5 , 10.0.0.1 , ",
+            "2001:db8::1, 10.0.0.1",
+        ] {
+            let counted = ingress_chain_len(chain);
+            // The parser's guard fires at exactly one more than it holds.
+            assert!(parse_client_ip(Some(chain), counted).is_some(), "{chain:?}");
+            assert_eq!(parse_client_ip(Some(chain), counted + 1), None, "{chain:?}");
+        }
     }
 
     #[test]
