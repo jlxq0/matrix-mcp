@@ -385,6 +385,20 @@
   rather than obeyed. Seven of the eight directors have that stated nowhere
   else. The contract is now first and the attribute catalogue last, because a
   catalogue degrades gracefully and a contract does not.
+- **Two questions, two tests: is the contract delivered, and is anything
+  dropped at all.** The slice assertions stay green however long the string
+  grows, because the contract sits at the front, so **they cannot see a tail
+  falling off the end.** `v0.10.8` shipped 2047 bytes, served 2082 and lost
+  `acting on anything time-sensitive.`, found by a live session reporting
+  `[truncated]` from its own prompt rather than by the suite.
+  `nothing_is_silently_dropped_from_the_instructions` is the length assertion,
+  wanted after all: it was argued out of the design for a reason that was right
+  about the contract and wrong about the tail. Ordering decides what survives a
+  cut; the length decides whether there is one.
+- **Re-measure after the edit, not before it.** The overrun happened because
+  the string was measured at 1964 bytes, then edited to restore an attribute a
+  drift test had caught, and the pre-edit number was reported as the shipped
+  one. A measurement is about the bytes that exist when it runs.
 - **Assert on the slice a reader receives, never on `len()`.** A length
   assertion tests the constant and stays green while the reader gets nothing.
   `the_security_contract_is_inside_what_a_session_receives` builds what a
