@@ -347,16 +347,29 @@
   and the like with "item in documentation is missing backticks", and a
   comments-only change is exactly where those names appear, so run the full
   gate on a docs-only diff rather than only the suite.
-- **The `platform` manifest is not a third source for what digest is running,
-  for any `forge.oddie.app` image.** The fleet rule says pod `imageID`, the
-  registry, and the manifest are three independent answers, and where a
-  manifest reads `tag@sha256:...` that holds. Ours reads a bare tag:
-  `platform`'s Renovate config turns `pinDigests` off for
-  `/^forge\.oddie\.app\//` because a pin PR races the next CI push and turns
-  an app deploy into a merge conflict. **So it corroborates the version and
-  never the digest, and a tag can move.** Verifying a release here is two
-  sources agreeing, the pod's `imageID` against what the tag build pushed, and
-  saying it is two rather than counting the manifest as a third.
+- **`clusters/fondue/matrix-mcp` pins a bare tag, so verifying a release *here*
+  is two sources agreeing rather than three.** The fleet rule treats pod
+  `imageID`, the registry and the manifest as three independent answers to
+  what is running, and that holds wherever a manifest reads `tag@sha256:...`.
+  Ours does not, so it corroborates the version and never the digest, and a
+  tag can move. The check is the pod's `imageID` against what the tag build
+  pushed, reported as two sources.
+
+  **This is the exception, not the rule, and an earlier version of this entry
+  said the opposite.** Measured across `platform` on 2026-08-27: seven of nine
+  `forge.oddie.app` deployments pin `tag@digest` — `jmap-mcp`, `caldav-mcp`,
+  `carddav-mcp`, `typst-mcp`, `hevy-mcp`, `m365-mcp`, `ksc-www` — and only
+  `matrix-mcp` and `miru-www` pin a bare tag. **Read your own manifest; do not
+  carry either shape across from another app.** Someone with a working
+  three-source check should not stop using it because of this file.
+
+  No mechanism is recorded because none is established. `platform`'s
+  `renovate.json` sets `pinDigests` in four places that conflict, and the two
+  MCP servers carrying digests match none of the paths that disable it, so the
+  rule that looks like the cause does not produce the observed outcome.
+  Whether those digests predate the rule, were written by hand, or the
+  resolution order differs from the reading is unknown, and a mechanism in an
+  `AGENTS.md` without that is how one instance becomes a class.
 - **Nothing in a mount's name says which server it is.** Six sessions hold live
   mounts to this service and not one is called `matrix-mcp`: they are
   `channel`, `matrix-julian`, `matrix-penny`, `matrix-vryan`, all resolving to
