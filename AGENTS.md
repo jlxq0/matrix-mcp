@@ -276,3 +276,30 @@
   have been delivered and an agent could have read its own emoji back as
   inbound context. Nothing about a missing guard shows up in a diff of the new
   function; read the old one beside it.
+- **`main` is protected and requires `CI / cargo*`, deliberately not
+  `CI / docker`.** The glob covers both event suffixes, since a branch push
+  posts `CI / cargo (push)` and a pull-request head posts
+  `CI / cargo (pull_request)`.
+
+  `docker` is excluded because a skipped job still posts a status, and in this
+  repository it posts **two different wrong answers** depending on why it
+  skipped. Measured here, not inferred:
+
+      c17aa805   cargo failed, docker skipped by `needs:`   docker status = pending
+      a0a389d3   cargo failed, docker skipped by `needs:`   docker status = success
+      3409c72    docker skipped by `if: != pull_request`    docker status = success
+
+  So requiring it builds a gate that is **satisfied by a commit whose `cargo`
+  failed and where nothing was built**, and that on other commits never
+  resolves at all. `cargo` is the job that does the work on a pull request;
+  `docker` cannot even run on one (`.forgejo/workflows/ci.yml`, `if:
+  github.event_name != 'pull_request'`), so its green there is always a skip.
+
+  **Do not add `CI / docker` to the required contexts.** The rule shows what is
+  required and nothing in it says why this is absent, which is how it comes
+  back.
+- **`mergeable: true` from the pull-request API does not account for the status
+  gate.** PR #94 read `mergeable=true` with `CI / cargo (pull_request)=failure`
+  on its head at the moment `main` was armed. Read the head commit's statuses
+  rather than the PR's own field before concluding that a change is ready, and
+  before concluding that arming a rule stranded nothing.
