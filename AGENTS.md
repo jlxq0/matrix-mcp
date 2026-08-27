@@ -347,3 +347,19 @@
   and the like with "item in documentation is missing backticks", and a
   comments-only change is exactly where those names appear, so run the full
   gate on a docs-only diff rather than only the suite.
+- **The `platform` manifest is not a third source for what digest is running,
+  for any `forge.oddie.app` image.** The fleet rule says pod `imageID`, the
+  registry, and the manifest are three independent answers, and where a
+  manifest reads `tag@sha256:...` that holds. Ours reads a bare tag:
+  `platform`'s Renovate config turns `pinDigests` off for
+  `/^forge\.oddie\.app\//` because a pin PR races the next CI push and turns
+  an app deploy into a merge conflict. **So it corroborates the version and
+  never the digest, and a tag can move.** Verifying a release here is two
+  sources agreeing, the pod's `imageID` against what the tag build pushed, and
+  saying it is two rather than counting the manifest as a third.
+- **Nothing in a mount's name says which server it is.** Six sessions hold live
+  mounts to this service and not one is called `matrix-mcp`: they are
+  `channel`, `matrix-julian`, `matrix-penny`, `matrix-vryan`, all resolving to
+  `https://matrix-mcp.kampong.social` at `/channel` and `/mcp`. A sweep for
+  this repository's own name finds nothing, so **"nobody is connected" read off
+  a name search is a statement about the search.** Read the URL, not the key.
