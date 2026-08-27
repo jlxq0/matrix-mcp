@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -130,6 +131,36 @@ impl LastUsedTracker {
 /// Returns `None` when the header is absent, has fewer entries than
 /// the trusted-hops count, or contains no parseable IP at the trusted
 /// position.
+/// The chain length last reported, so the count is logged on change rather
+/// than once per request.
+static LAST_REPORTED_CHAIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Log how many `X-Forwarded-For` entries arrived, beside how many this
+/// process trusts.
+///
+/// **The count, never the entries.** Those are addresses and one of them is a
+/// caller's; a log line is the wrong place for either.
+///
+/// The number of hops to trust is a claim about the topology in front of this
+/// pod, and nothing in the process can check it. This line is what makes the
+/// claim falsifiable from outside: a chain length that does not match the
+/// configured count means the deployment moved and the constant did not.
+/// Reported on change rather than per request, so a topology change is one
+/// line and steady state is silent after the first.
+pub fn observe_ingress_chain(xff: Option<&str>, trusted_proxy_hops: usize) {
+    let Some(raw) = xff else {
+        return;
+    };
+    let entries = raw.split(',').filter(|s| !s.trim().is_empty()).count();
+    if LAST_REPORTED_CHAIN.swap(entries, Ordering::Relaxed) != entries {
+        tracing::info!(
+            xff_entries = entries,
+            trusted_proxy_hops,
+            "ingress chain length"
+        );
+    }
+}
+
 #[must_use]
 pub fn parse_client_ip(xff: Option<&str>, trusted_proxy_hops: usize) -> Option<IpAddr> {
     let raw = xff?;

@@ -303,3 +303,29 @@
   on its head at the moment `main` was armed. Read the head commit's statuses
   rather than the PR's own field before concluding that a change is ready, and
   before concluding that arming a rule stranded nothing.
+- **`DEFAULT_TRUSTED_PROXY_HOPS` is 2, and it is a claim about the topology
+  that nothing in this process can check.** The measured chain is
+  `client -> Caddy edge -> Cilium gateway (Envoy appends) -> pod`, so two
+  entries arrive and `parse_client_ip` counts in from the right. At 1 it
+  selected the edge and recorded that as the caller's address on every
+  authenticated request.
+
+  **The number is correct only while the Caddy edge replaces the header rather
+  than appending.** `oddie-apps/edge-config#40` at `880ea46` asserts that with
+  93 tests; the two values have to be re-derived together and nothing outside
+  these comments says so. **Too high does not fail safe**: behind a single
+  *appending* proxy a caller's own header makes the chain two long, the
+  `len < hops` guard never fires, and 2 returns whatever the caller typed.
+
+  `observe_ingress_chain` logs `xff_entries` beside `trusted_proxy_hops`, on
+  change rather than per request, which is what makes the claim falsifiable
+  from outside. **The count, never the entries**: those are addresses and one
+  of them is a caller's.
+- **A test that passes a constant's value in as an argument is green at any
+  value of that constant.** Every `parse_client_ip` test supplied its own hop
+  count, so reverting the default broke nothing, in this repository and in
+  three siblings. Construct through `Config::new` and assert the
+  **consequence** — which address comes back — rather than the number, since
+  `assert_eq!(hops, 2)` restates the constant and cannot fail for a reason
+  worth knowing. Mutate in both directions: 1 and 3 must each go red, and here
+  they redden two tests and one respectively.
