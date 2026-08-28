@@ -734,16 +734,61 @@ pub async fn recover(
                     ..SetupExtras::default()
                 },
             );
-            error_page(
-                StatusCode::BAD_REQUEST,
-                &format!(
-                    "Couldn't import the cross-signing keys: {e}. \
-                     Double-check the recovery key you pasted (the same string Element X \
-                     showed you when you first enabled cross-signing) and try again."
-                ),
-            )
+            let (status, message) = recover_failure_page(&e.to_string());
+            error_page(status, &message)
         }
     }
+}
+
+/// How a failed recovery import should be reported.
+///
+/// **The old handler attributed every failure to the recovery key**, so a dead
+/// access token was rendered as "double-check the key you pasted" and the
+/// operator re-entered a correct key twice at an airport. A recovery key is
+/// used client-side against Secret Storage and never reaches the homeserver as
+/// a token, so `M_UNKNOWN_TOKEN` cannot possibly be caused by one.
+///
+/// An error handler that blames the last thing the user typed is a check that
+/// cannot observe its subject, and it fails in the direction that costs them
+/// time and tells them nothing.
+///
+/// Only one class is claimed with confidence. Everything else says so rather
+/// than guessing, which is worth more than a plausible attribution: a wrong
+/// guess sends someone to fix a thing that is not broken.
+fn recover_failure_page(error: &str) -> (StatusCode, String) {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("m_unknown_token") || lower.contains("token is not active") {
+        // The dead token is **not** this browser session's. `/setup/recover`
+        // deliberately reuses the cached matrix-sdk client, which holds the
+        // bearer from claude.ai's tool calls; see the comment above the
+        // `get_if_cached` call for why it must not route its own token in.
+        // So the thing that expired is that bearer, and the browser session
+        // may still be perfectly valid, which is why re-signing-in here is
+        // offered as the second step rather than the first.
+        return (
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "The Matrix session this deployment holds has expired, so the keys could \
+                 not be imported. This is not about the recovery key you pasted: that key \
+                 is used here in the browser and never sent to the server as a token. \
+                 Make one tool call from the client that mounts this server, which \
+                 refreshes the session, then try again. If that does not help, sign in \
+                 again from /setup. The server said: {error}"
+            ),
+        );
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        format!(
+            "Couldn't import the cross-signing keys, and this page cannot tell you why. \
+             The server said: {error}. Two things it could be, and nothing here \
+             distinguishes them: the recovery key may not match the one Element X showed \
+             you when you first enabled cross-signing, or the import may have failed for \
+             a reason that has nothing to do with the key. Check the key first because it \
+             is the cheaper of the two, and if it is right, this is a defect worth \
+             reporting with the message above."
+        ),
+    )
 }
 
 // ---------- helpers ----------
@@ -1066,6 +1111,67 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn a_dead_token_is_not_reported_as_a_bad_recovery_key() {
+        // The verbatim message he was shown, twice, at an airport. A recovery
+        // key is used client-side against Secret Storage and never reaches
+        // the homeserver as a token, so this error cannot be caused by one.
+        let (status, msg) = recover_failure_page(
+            "the server returned an error: [401 / M_UNKNOWN_TOKEN] Token is not active",
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "still a 400 client error");
+        assert!(
+            !msg.to_ascii_lowercase().contains("double-check"),
+            "it still tells him to re-enter a key that was correct: {msg}"
+        );
+        assert!(
+            msg.contains("expired"),
+            "it does not say the session expired: {msg}"
+        );
+        assert!(
+            msg.contains("never sent to the server as a token"),
+            "it does not say why the key cannot be the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_lowercase_form_is_classified_too() {
+        // Synapse and matrix-sdk render this string more than one way, and a
+        // classifier that matches only the shouty form sends the same person
+        // back to the same wrong instruction.
+        for form in [
+            "[401 / M_UNKNOWN_TOKEN] Token is not active",
+            "m_unknown_token",
+            "http 401: token is not active",
+        ] {
+            let (status, _) = recover_failure_page(form);
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "not classified: {form}");
+        }
+    }
+
+    #[test]
+    fn anything_unclassified_says_so_rather_than_blaming_the_last_input() {
+        // The control, and the point of the change. An unrelated failure must
+        // not be attributed to the key either, because a confident wrong
+        // attribution sends someone to fix a thing that is not broken.
+        let (status, msg) = recover_failure_page("secret storage: MAC check failed");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            msg.contains("cannot tell you why"),
+            "it claims to know which of two causes it is: {msg}"
+        );
+        assert!(
+            msg.contains("MAC check failed"),
+            "the server's own words are dropped: {msg}"
+        );
+        // It may still suggest checking the key, as the cheaper of two, but
+        // must not assert that the key is the cause.
+        assert!(
+            !msg.contains("Double-check the recovery key you pasted"),
+            "the old blaming sentence survived: {msg}"
+        );
+    }
+
     use super::*;
 
     #[test]

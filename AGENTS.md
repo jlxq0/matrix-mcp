@@ -414,3 +414,22 @@
   2048..2724 — a green test asserting the presence of something invisible to
   its audience. One set speaks for the string and one for the reader; deleting
   either as redundant loses the distinction between written and delivered.
+- **An error handler that attributes a failure to the last thing the user
+  typed is a check that cannot observe its subject.** `/setup/recover` reported
+  every failure as "double-check the recovery key you pasted", so a
+  `401 M_UNKNOWN_TOKEN` sent the operator to re-enter a key that was correct,
+  twice. A recovery key is used client-side against Secret Storage and **never
+  reaches the homeserver as a token**, so that error cannot be caused by one.
+  Classify what you can justify, say so for everything else, and never assert a
+  cause you have not distinguished: a confident wrong attribution sends someone
+  to fix a thing that is not broken.
+- **The token that dies during `/setup/recover` is not the browser session's.**
+  `recover` deliberately reuses the cached matrix-sdk client, which holds the
+  bearer from the MCP client's tool calls rather than `/setup`'s own OAuth
+  token, because routing its own token in panics matrix-sdk 0.17 with
+  `AlreadyInitializedError`. So a 401 there means **that** bearer expired while
+  the browser session was still valid, which is why the message offers a tool
+  call before a re-sign-in. `expires_in` is parsed from the token response at
+  `setup.rs` and used nowhere, and the setup path has no equivalent of
+  `react_to_auth_expiry`, which is how the MCP path notices the same condition
+  and rebuilds the client.
