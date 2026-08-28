@@ -395,6 +395,18 @@ pub async fn form(State(state): State<SetupState>, jar: CookieJar) -> Response {
     let Some(session) = current_session(&state, &jar).await else {
         return Redirect::to("/setup").into_response();
     };
+    // Refuse **before** the key form rather than after the paste. Finding out
+    // that the session is dead while the key is still in the clipboard is the
+    // difference between a fix and a better error message.
+    let cached = state.clients.get_if_cached(&session.mxid).await;
+    let live = match &cached {
+        Some(client) => cached_bearer_is_live(client).await,
+        None => false,
+    };
+    if setup_gate(cached.is_some(), live) == SetupGate::BearerDead {
+        warn!(mxid = %session.mxid, "setup: refusing the key form, cached bearer is dead");
+        return error_page(StatusCode::PRECONDITION_REQUIRED, CONNECTOR_BEARER_DEAD);
+    }
     Html(form_html(&session.mxid, &session.csrf_token)).into_response()
 }
 
@@ -529,6 +541,26 @@ pub async fn recover(
              tool in claude.ai and try /setup again.",
         );
     };
+
+    // **Liveness, not presence.** `contains` above is true for a client whose
+    // bearer Synapse has already revoked, and that is the state he was in:
+    // the gate passed, the key form was shown, the import 401'd, and the page
+    // blamed the key. The form is gated on this too, so reaching it here means
+    // the session died in between; asking again costs one `whoami` and is the
+    // difference between naming the cause and blaming the last thing typed.
+    if setup_gate(true, cached_bearer_is_live(&client).await) == SetupGate::BearerDead {
+        span.record("outcome", "bearer_dead");
+        audit::setup_event(
+            "setup_recover",
+            Some(&session.mxid),
+            outcome::ERROR,
+            SetupExtras {
+                error_class: Some("bearer_dead"),
+                ..SetupExtras::default()
+            },
+        );
+        return error_page(StatusCode::PRECONDITION_REQUIRED, CONNECTOR_BEARER_DEAD);
+    }
 
     match client.encryption().recovery().recover(&key).await {
         Ok(()) => {
@@ -789,6 +821,81 @@ fn recover_failure_page(error: &str) -> (StatusCode, String) {
              reporting with the message above."
         ),
     )
+}
+
+/// The instruction a dead connector bearer needs, in one place.
+///
+/// It was already written into the absent-client branch of the precondition
+/// and shown only there, so somebody arriving with a **stale** client got
+/// nothing about it and was told to re-check their recovery key instead. The
+/// right answer displayed only where the person who needs it cannot be.
+const CONNECTOR_BEARER_DEAD: &str = concat!(
+    "matrix-mcp's Matrix session is no longer accepted by the homeserver, so there is ",
+    "nothing here that could import your keys. This is not about the recovery key: it ",
+    "is never sent to the server. ",
+    "One action fixes it, once: in claude.ai go to Settings, then Connectors, remove ",
+    "the claude.ai Matrix connector and add it again, then run any matrix-mcp tool ",
+    "(asking Claude for list_joined_rooms is enough) and come back here. ",
+    "Why only you can do that: the import needs a device-scoped session, and the only ",
+    "thing that issues one is claude.ai's own grant. This server cannot mint or refresh ",
+    "it on your behalf, which is why it asks rather than retrying. The typical cause is ",
+    "signing the matrix-mcp device out from Element, which revokes that bearer while ",
+    "everything here still looks healthy."
+);
+
+/// What `/setup` should do about the client it found.
+///
+/// A free function because both call sites need a live `matrix_sdk::Client`
+/// and a `SetupState`, so a test can reach neither: mutations disabling either
+/// gate left the suite green. The decision is the part worth pinning; the
+/// `whoami` that feeds it is one SDK call with no branch of its own.
+#[derive(Debug, PartialEq, Eq)]
+enum SetupGate {
+    /// A cached client whose bearer the homeserver still accepts.
+    Proceed,
+    /// No client cached at all. Nothing to attach keys to.
+    NoClient,
+    /// A client is cached and its bearer is dead. **`contains` is true here**,
+    /// which is why presence was the wrong question: this state passed the old
+    /// gate, the key form was shown, and the import failed with a 401 the page
+    /// blamed on the key.
+    BearerDead,
+}
+
+const fn setup_gate(cached: bool, bearer_live: bool) -> SetupGate {
+    match (cached, bearer_live) {
+        (false, _) => SetupGate::NoClient,
+        (true, false) => SetupGate::BearerDead,
+        (true, true) => SetupGate::Proceed,
+    }
+}
+
+/// Whether the cached client's bearer is still accepted by the homeserver.
+///
+/// **The precondition used to ask whether the cache had an entry, which is a
+/// different question.** `contains` is true for a client whose bearer Synapse
+/// has already revoked, so a dead session passed the gate, the operator was
+/// asked for a recovery key, and the import then failed with a 401 that the
+/// page blamed on the key. He pasted a correct key three times, twice in an
+/// airport.
+///
+/// `whoami` is the cheapest authenticated call there is: no arguments, no
+/// side-effects, and it answers exactly the question the gate is asking.
+///
+/// **The server cannot repair this itself, and that is not an omission.**
+/// Rebuilding the client needs a device-bound bearer, and the only thing that
+/// issues one is claude.ai's own OAuth grant; `/setup`'s token is unbound and
+/// routing it in panics matrix-sdk 0.17 with `AlreadyInitializedError`. So a
+/// retry here cannot succeed however many times it runs, and the honest
+/// design is to detect early and ask for the one action that works.
+async fn cached_bearer_is_live(client: &matrix_sdk::Client) -> bool {
+    match client.whoami().await {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(error = %e, "setup: the cached client's bearer is not accepted");
+            false
+        }
+    }
 }
 
 // ---------- helpers ----------
@@ -1111,6 +1218,43 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn a_cached_client_with_a_dead_bearer_is_refused_not_proceeded() {
+        // The whole defect in one table. `contains` was the old gate and it is
+        // the first column: true for a dead session, which is why presence was
+        // the wrong question and a correct key was blamed three times.
+        assert_eq!(setup_gate(true, true), SetupGate::Proceed);
+        assert_eq!(setup_gate(true, false), SetupGate::BearerDead);
+        assert_eq!(setup_gate(false, false), SetupGate::NoClient);
+        // A liveness answer about a client that does not exist decides
+        // nothing; the absence wins, or a probe failure on nothing would send
+        // someone to re-add a connector they have not yet used.
+        assert_eq!(setup_gate(false, true), SetupGate::NoClient);
+    }
+
+    #[test]
+    fn the_dead_bearer_page_names_the_one_action_and_not_the_key() {
+        // The instruction existed for eighteen months on the branch where no
+        // client is cached at all, and was shown to nobody who arrived with a
+        // stale one. It now has a single home that both branches use.
+        let m = CONNECTOR_BEARER_DEAD;
+        assert!(m.contains("Connectors"), "the one action is not named: {m}");
+        assert!(
+            m.contains("not about the recovery key"),
+            "it does not rule out the thing he was told to re-check: {m}"
+        );
+        assert!(
+            m.contains("cannot mint or refresh"),
+            "it does not say why the server will not just retry: {m}"
+        );
+        // And it must not tell him to try the same screen again, which is the
+        // instruction that cost him three attempts.
+        assert!(
+            !m.to_ascii_lowercase().contains("try again"),
+            "it still sends him back to the same screen: {m}"
+        );
+    }
+
     #[test]
     fn a_dead_token_is_not_reported_as_a_bad_recovery_key() {
         // The verbatim message he was shown, twice, at an airport. A recovery

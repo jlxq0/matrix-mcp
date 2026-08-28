@@ -433,3 +433,24 @@
   `setup.rs` and used nowhere, and the setup path has no equivalent of
   `react_to_auth_expiry`, which is how the MCP path notices the same condition
   and rebuilds the client.
+- **`/setup`'s precondition asked whether the client cache had an entry, not
+  whether its bearer was alive, and those are different questions.**
+  `MatrixClientCache::contains` is true for a client whose bearer Synapse has
+  already revoked, so a dead session passed the gate, the operator was asked
+  for a recovery key, and the import then failed with a `401 M_UNKNOWN_TOKEN`
+  the page blamed on the key. He pasted a correct key three times, twice at an
+  airport, and an incognito browser changed nothing because **the import never
+  uses the token a `/setup` sign-in issues** — it reuses claude.ai's
+  device-bound connector bearer, deliberately, since routing `/setup`'s unbound
+  token in panics matrix-sdk 0.17 with `AlreadyInitializedError`.
+- **A right answer displayed only on the branch the affected person cannot
+  reach is the same as not having it.** The absent-client error already named
+  the revoked connector bearer and the exact remedy, and had for eighteen
+  months; the stale-client path said nothing and blamed the key.
+  `CONNECTOR_BEARER_DEAD` is one constant both branches use, and the gate now
+  refuses **before** the key form so the cause is named while the key is still
+  in the clipboard.
+- **The server cannot self-heal a dead connector bearer, and that sentence
+  belongs in the code.** Rebuilding the client needs a device-bound session and
+  only claude.ai's own grant issues one, so a retry cannot succeed however many
+  times it runs. Without the comment the next reader's instinct is to add one.
