@@ -48,7 +48,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use hkdf::Hkdf;
@@ -392,17 +392,29 @@ impl MatrixClientCache {
                     "device keys absent from the homeserver's /keys/query response"
                 );
                 if retry {
-                    // Second pass after wipe+rebuild and Synapse still
-                    // doesn't have our keys. Surface the failure rather
-                    // than recurse — something more fundamental is
-                    // wrong (auth bound to the wrong device, MAS clock
-                    // skew, /keys/upload returning 200 but Synapse
-                    // dropping the device, etc.) and looping would
-                    // pound the homeserver.
-                    return Err(anyhow!(
-                        "self-heal failed: device keys still not published after rebuild for {}",
-                        identity.mxid
-                    ));
+                    // Second pass, after a wipe, a rebuild **and** a bounded
+                    // wait for publication. Reaching here means the ceiling
+                    // was hit, so the honest report is that we stopped
+                    // asking, not that the keys will never arrive.
+                    //
+                    // Returning the client rather than erroring, on purpose.
+                    // The first version raised here and `verify_status`
+                    // started failing where it had previously answered, which
+                    // turned an unknown into an outage. `keys_verified` stays
+                    // false, so the next call re-checks and a late publish is
+                    // picked up without another wipe.
+                    warn!(
+                        mxid = %identity.mxid,
+                        device_id = ?cached.client.device_id(),
+                        ceiling_secs = PUBLISH_CEILING.as_secs(),
+                        "waited for device keys to publish after the rebuild and gave up at the \
+                         ceiling. This says the wait expired, NOT that the keys are unpublished: \
+                         the next call will look again"
+                    );
+                    crate::metrics::SELF_HEAL_COUNTER
+                        .with_label_values(&["publish_wait_expired"])
+                        .inc();
+                    return Ok(cached.client.clone());
                 }
                 // **At most one heal per identity per process.** A second
                 // demand is a report rather than a second wipe: an
@@ -461,7 +473,58 @@ impl MatrixClientCache {
                 // Recurse exactly once. Box::pin because an `async fn`
                 // can't recurse directly — the returned future would
                 // have infinite size.
-                Box::pin(self.for_user_inner(identity, access_token, true)).await
+                let rebuilt = Box::pin(self.for_user_inner(identity, access_token, true)).await?;
+
+                // **Wait for the publish rather than assuming it.** The
+                // rebuilt client uploads its new device keys from the
+                // background sync loop, not from `for_user`, so checking
+                // immediately measures nothing: the first version of this
+                // re-checked 531 ms after the wipe and reported its own
+                // impatience as "device keys still not published after
+                // rebuild". The device had in fact published, and a call
+                // hours later answered normally.
+                //
+                // Polling the observable rather than sleeping once: the
+                // original fault was a single check at a single moment, and a
+                // fixed sleep is that fault with a larger constant.
+                let mxid = identity.mxid.clone();
+                let waited = wait_for_publish(
+                    || verify_device_keys_published(&rebuilt, &mxid),
+                    PUBLISH_CEILING,
+                    PUBLISH_POLL_INTERVAL,
+                )
+                .await;
+                match waited {
+                    PublishWait::Published => {
+                        info!(
+                            mxid = %identity.mxid,
+                            "device keys published after the rebuild; self-heal complete"
+                        );
+                        crate::metrics::SELF_HEAL_COUNTER
+                            .with_label_values(&["published_after_rebuild"])
+                            .inc();
+                    }
+                    PublishWait::Expired => {
+                        warn!(
+                            mxid = %identity.mxid,
+                            ceiling_secs = PUBLISH_CEILING.as_secs(),
+                            "stopped waiting for device keys to publish after the rebuild. The \
+                             wait expired; this is not a statement that they are unpublished, \
+                             and the next call will look again"
+                        );
+                        crate::metrics::SELF_HEAL_COUNTER
+                            .with_label_values(&["publish_wait_expired"])
+                            .inc();
+                    }
+                    PublishWait::CheckFailed => {
+                        warn!(
+                            mxid = %identity.mxid,
+                            "the publication check failed while waiting after the rebuild; \
+                             leaving keys_verified false so the next call re-checks"
+                        );
+                    }
+                }
+                Ok(rebuilt)
             }
             Err(e) => {
                 // Network blip / olm machine not ready / Synapse 5xx.
@@ -798,6 +861,81 @@ fn is_permanent_auth_failure(msg: &str) -> bool {
     msg.contains("M_UNKNOWN_TOKEN") || msg.contains("Token is not active")
 }
 
+/// How long a rebuilt client is given to publish its device keys.
+///
+/// **Chosen, not derived, and the distinction matters.** The two numbers I
+/// have bound it from opposite sides and neither is the publish latency: 531
+/// ms is known too short, because that is what the first version waited and it
+/// reported a failure that later turned out to have published; and a healthy
+/// client on this deployment took 1.19 s from build to first tool call with no
+/// key publication in that path at all. The actual latency has not been
+/// measured, because measuring it means wiping a live store.
+///
+/// So this is a ceiling picked to be comfortably past a homeserver round trip
+/// on a healthy link, not a value read off anything. If it is ever hit, the
+/// log says the **wait** expired rather than that keys are unpublished, and
+/// the number is then the thing to revisit.
+const PUBLISH_CEILING: Duration = Duration::from_secs(20);
+
+/// How often the wait re-asks.
+///
+/// The fault being fixed was a single check at a single moment, so this polls
+/// the observable rather than sleeping once and looking again. A sleep of any
+/// length is the same fault with a larger constant.
+const PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What a bounded wait for publication concluded.
+///
+/// **`Expired` is deliberately not `NotPublished`.** At the ceiling we know
+/// only that we stopped asking, which is a different claim from the
+/// homeserver not having the keys, and conflating the two is the confusion
+/// that cost this repair an evening: a *never* read as a slow *not yet*, and
+/// then a slow *not yet* reported as a *never*.
+#[derive(Debug, PartialEq, Eq)]
+enum PublishWait {
+    /// The homeserver announced the device within the ceiling.
+    Published,
+    /// The ceiling was reached with the device still unannounced. **Says
+    /// nothing about whether it ever will be.**
+    Expired,
+    /// The check itself failed. Neither a yes nor a no.
+    CheckFailed,
+}
+
+/// Poll `check` until it answers true, the ceiling is reached, or it errors.
+///
+/// A free function over a closure so the loop is testable without a
+/// homeserver: the parent needs a live `Client`, and the thing worth pinning
+/// is that a late yes is still a yes and that running out of patience is
+/// reported as its own outcome.
+async fn wait_for_publish<F, Fut>(
+    mut check: F,
+    ceiling: Duration,
+    interval: Duration,
+) -> PublishWait
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let started = Instant::now();
+    loop {
+        match check().await {
+            Ok(true) => return PublishWait::Published,
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = ?e, "device-key publication check failed while waiting");
+                return PublishWait::CheckFailed;
+            }
+        }
+        // Checked after the attempt, so the ceiling bounds the waiting rather
+        // than the number of attempts: a check is always made at least once.
+        if started.elapsed() >= ceiling {
+            return PublishWait::Expired;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Whether **Synapse** holds device keys for this client's device.
 ///
 /// **This function's own doc comment used to state the mechanism wrongly, and
@@ -978,6 +1116,79 @@ fn token_hash(access_token: &str) -> [u8; 32] {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[tokio::test]
+    async fn a_late_publish_is_still_a_publish() {
+        // The whole defect in one test. The first version checked once, 531 ms
+        // after the wipe, and reported "device keys still not published after
+        // rebuild" for a device that had in fact published: a call hours later
+        // answered normally. A yes that arrives on the third look is a yes.
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = attempts.clone();
+        let out = wait_for_publish(
+            || {
+                let n = a.fetch_add(1, Ordering::Relaxed);
+                async move { Ok(n >= 2) }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(out, PublishWait::Published);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            3,
+            "it stopped asking before the answer changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_out_of_patience_is_its_own_outcome() {
+        // `Expired` is deliberately not `NotPublished`. At the ceiling we know
+        // only that we stopped asking, and reporting that as "the keys are not
+        // published" is the confusion that cost this repair an evening.
+        let out = wait_for_publish(
+            || async { Ok(false) },
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(out, PublishWait::Expired);
+        assert_ne!(out, PublishWait::Published);
+    }
+
+    #[tokio::test]
+    async fn the_observable_is_checked_at_least_once_even_at_a_zero_ceiling() {
+        // The ceiling bounds the waiting, not the number of attempts. A zero
+        // ceiling must still ask once, or a fast publish would be reported as
+        // expired without anybody having looked.
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = attempts.clone();
+        let out = wait_for_publish(
+            || {
+                a.fetch_add(1, Ordering::Relaxed);
+                async { Ok(true) }
+            },
+            Duration::ZERO,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(out, PublishWait::Published);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_check_is_neither_a_yes_nor_a_no() {
+        // A network failure during the wait must not be counted as "not
+        // published", which would send a healthy device round the heal again.
+        let out = wait_for_publish(
+            || async { Err(anyhow!("network")) },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(out, PublishWait::CheckFailed);
+    }
+
     #[test]
     fn a_keys_query_that_omits_the_device_reads_as_not_published() {
         use matrix_sdk::ruma::api::client::keys::get_keys::v3::Response;
