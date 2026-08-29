@@ -78,6 +78,13 @@ impl AudField {
             Self::Multi(xs) => xs.iter().any(|s| s == expected),
         }
     }
+
+    /// True when the token's `aud` includes *any* of the acceptable resource
+    /// identifiers for this server. See [`MasIntrospectionClient::new`] for
+    /// why there is more than one.
+    pub fn matches_any(&self, expected: &[String]) -> bool {
+        expected.iter().any(|e| self.matches(e))
+    }
 }
 
 /// What our auth layer hands to the rest of the application after a
@@ -107,7 +114,7 @@ pub struct AuthenticatedIdentity {
 
 #[derive(Debug, Error)]
 pub enum IntrospectionError {
-    #[error("audience mismatch: token aud does not include {expected}")]
+    #[error("audience mismatch: token aud does not include any of [{expected}]")]
     AudienceMismatch { expected: String },
     #[error("MAS HTTP error: {0}")]
     Http(#[from] reqwest::Error),
@@ -119,7 +126,9 @@ pub enum IntrospectionError {
 pub struct MasIntrospectionClient {
     http: reqwest::Client,
     introspection_url: String,
-    expected_audience: String,
+    /// Every resource identifier we are willing to see in a token's `aud`.
+    /// Built from the configured resource URL — see [`Self::new`].
+    expected_audiences: Vec<String>,
     client_id: String,
     client_secret: String,
     /// Matrix server name used to construct the MXID from MAS's
@@ -139,9 +148,25 @@ impl MasIntrospectionClient {
     /// Build a client. The introspection URL is derived from the
     /// authorization-server URL plus `/oauth2/introspect`, which is the path
     /// MAS exposes (and the RFC 7662 convention).
+    ///
+    /// `resource_url` is our public origin. Two audience values are accepted
+    /// against it, and both are legitimate:
+    ///
+    /// * `{origin}/mcp` — the canonical resource identifier we publish in the
+    ///   RFC 9728 document. The MCP authorization spec requires clients to send
+    ///   that exact string as the RFC 8707 `resource` parameter, so a
+    ///   conformant client's token audiences `/mcp`. Rejecting it would 401
+    ///   (previously: 500) every spec-conformant client.
+    /// * `{origin}` — the bare origin, which is what a client that copied the
+    ///   `resource` from an older metadata document (or from the connector URL
+    ///   minus the path) will produce.
+    ///
+    /// Both name this server and nothing else, so accepting either does not
+    /// widen the audience check: a token minted for a different resource still
+    /// fails.
     pub fn new(
         authorization_server: &str,
-        expected_audience: String,
+        resource_url: String,
         client_id: String,
         client_secret: String,
         server_name: String,
@@ -152,10 +177,14 @@ impl MasIntrospectionClient {
             .user_agent(concat!("matrix-mcp/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("build reqwest client")?;
+        let expected_audiences = vec![
+            crate::oauth_metadata::mcp_resource(&resource_url),
+            resource_url,
+        ];
         Ok(Self {
             http,
             introspection_url,
-            expected_audience,
+            expected_audiences,
             client_id,
             client_secret,
             server_name,
@@ -246,9 +275,10 @@ impl MasIntrospectionClient {
         //   here, so the matrix-mcp tools that proxy to Synapse can't
         //   be abused by a scope-less token.
         if let Some(aud) = &body.aud {
-            if !aud.matches(&self.expected_audience) {
+            if !aud.matches_any(&self.expected_audiences) {
+                span.record("outcome", "audience_mismatch");
                 return Err(IntrospectionError::AudienceMismatch {
-                    expected: self.expected_audience.clone(),
+                    expected: self.expected_audiences.join(", "),
                 });
             }
         } else {
@@ -551,6 +581,31 @@ mod tests {
         let client = client_against(&mock.uri());
         let err = client.introspect("abc").await.unwrap_err();
         assert!(matches!(err, IntrospectionError::AudienceMismatch { .. }));
+    }
+
+    /// The RFC 9728 document advertises `{origin}/mcp` as the resource
+    /// identifier, and the MCP authorization spec requires clients to send
+    /// exactly that as the RFC 8707 `resource` parameter. A token minted for
+    /// it MUST authenticate — before this, it failed the audience check and
+    /// surfaced as a 500.
+    #[tokio::test]
+    async fn canonical_mcp_path_audience_is_accepted() {
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(active_response_body("https://matrix-mcp.example.test/mcp")),
+            )
+            .mount(&mock)
+            .await;
+        let client = client_against(&mock.uri());
+        let identity = client
+            .introspect("abc")
+            .await
+            .unwrap()
+            .expect("token audienced at the canonical /mcp resource must authenticate");
+        assert_eq!(identity.mxid, "@alice:example.com");
     }
 
     #[tokio::test]

@@ -47,7 +47,7 @@ Do not lose it – losing the pepper destroys all user key stores.
 # docker-compose.yml
 services:
   matrix-mcp:
-    image: ghcr.io/jlxq0/matrix-mcp:v0.1.0
+    image: forge.oddie.app/jlxq0/matrix-mcp:v0.6.0
     ports:
       - "3000:3000"
     volumes:
@@ -136,7 +136,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: app
-          image: ghcr.io/jlxq0/matrix-mcp:v0.1.0
+          image: forge.oddie.app/jlxq0/matrix-mcp:v0.6.0
           ports:
             - containerPort: 3000
           securityContext:

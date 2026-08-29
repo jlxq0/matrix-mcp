@@ -41,7 +41,7 @@ const ENV_POD_IP: &str = "POD_IP";
 /// OAuth client id we authenticate with against MAS's introspection endpoint.
 /// Issued out-of-band (pre-registered or via `DCR`).
 const ENV_INTROSPECTION_CLIENT_ID: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_ID";
-/// OAuth client secret paired with the id above. Loaded from 1Password via
+/// OAuth client secret paired with the id above. Supplied by the operator via
 /// `ExternalSecret` in production.
 const ENV_INTROSPECTION_CLIENT_SECRET: &str = "MATRIX_MCP_INTROSPECTION_CLIENT_SECRET";
 /// Public URL of the Matrix homeserver this MCP server talks to. We
@@ -61,7 +61,7 @@ const ENV_SERVER_NAME: &str = "MATRIX_MCP_SERVER_NAME";
 /// subject + device id) gets a subdirectory named `sha256(owner_key)[..32]`.
 const ENV_STORE_DIR: &str = "MATRIX_MCP_STORE_DIR";
 /// Pepper used to derive per-user store-cipher keys via
-/// `HKDF-SHA256(salt=mxid, ikm=pepper)`. Stored in 1Password, loaded as
+/// `HKDF-SHA256(salt=mxid, ikm=pepper)`. Held in your secret manager, loaded as
 /// a Kubernetes Secret. Compromise of this single value compromises
 /// every user's on-disk crypto store, so it's the Option-A passphrase
 /// model's whole trust anchor — handled with care.
@@ -85,12 +85,57 @@ pub const ENV_UPLOAD_MAX_BYTES: &str = "MATRIX_MCP_UPLOAD_MAX_BYTES";
 /// out of `X-Forwarded-For`. Default 1 (assumes Traefik in front in
 /// production).
 const ENV_TRUSTED_PROXY_HOPS: &str = "MATRIX_MCP_TRUSTED_PROXY_HOPS";
+/// Comma-separated list of browser origins allowed to talk to `/mcp`
+/// (`Origin` header validation, MCP Streamable HTTP §"Security & Endpoint").
+///
+/// Empty (the default) disables `Origin` checking. That is deliberate: the
+/// DNS-rebinding attack the rule targets is against servers bound to
+/// localhost, and every non-browser MCP client (Claude Desktop, VS Code,
+/// Cursor, CLI tools) either omits `Origin` or sends an app-private value that
+/// no allow-list can enumerate ahead of time — so a default allow-list would
+/// break those clients rather than protect this deployment. Set it when the
+/// only clients are browser-based, e.g.
+/// `MATRIX_MCP_ALLOWED_ORIGINS=https://claude.ai`.
+const ENV_ALLOWED_ORIGINS: &str = "MATRIX_MCP_ALLOWED_ORIGINS";
+/// Base URL of an OpenAI-compatible TTS endpoint (Chatterbox /
+/// `POST /v1/audio/speech`). Optional — if unset, the
+/// `send_tts_voice_message` tool returns `invalid_params`.
+const ENV_TTS_BASE_URL: &str = "MATRIX_MCP_TTS_BASE_URL";
+/// Bearer token sent to the TTS endpoint above. Must be set if (and
+/// only if) `MATRIX_MCP_TTS_BASE_URL` is set.
+const ENV_TTS_BEARER_TOKEN: &str = "MATRIX_MCP_TTS_BEARER_TOKEN";
 
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
-const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
+/// How many proxies sit between a caller and this process, counted from the
+/// right of `X-Forwarded-For`.
+///
+/// **Two, because the measured chain is `client -> Caddy edge -> Cilium
+/// gateway (Envoy appends) -> pod`, as of 2026-08-27.** With two entries and
+/// a count of one, `parse_client_ip` selects `parts[1]`, which is what Envoy
+/// appended: the edge's address as the gateway saw it, recorded as the
+/// caller's for every authenticated request.
+///
+/// **This number is only correct while the Caddy edge *replaces* the header
+/// rather than appending to it.** `oddie-apps/edge-config#40` at `880ea46`
+/// asserts that behaviour with 93 tests; the two have to be re-derived
+/// together and nothing outside this comment says so.
+///
+/// **Too high does not fail safe.** Behind a single *appending* proxy, a
+/// caller sending its own header makes the chain two long, the `len < hops`
+/// guard never fires, and a count of two returns the caller's own string.
+///
+/// The residual, measured rather than assumed: a caller reaching the Cilium
+/// gateway directly has a real depth of one, so its own header becomes the
+/// leftmost of two and a count of two selects it. That needs a stolen bearer
+/// **and** code running inside the cluster, because `MetalLB` advertises the
+/// `fondue` pool over BGP rather than L2, so the gateway addresses time out
+/// from the LAN and answer 401 only from inside. If the gateway were ever
+/// reachable, two would be *worse* than one: one selects an infrastructure
+/// address and two selects whatever the caller typed.
+const DEFAULT_TRUSTED_PROXY_HOPS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -146,6 +191,32 @@ pub struct Config {
     /// Advertised in the protected-resource metadata as the
     /// device-binding OAuth scope claude.ai requests.
     pub device_id: String,
+    /// Browser origins accepted on `/mcp`. Empty disables `Origin`
+    /// validation (rmcp still validates `Host` against `allowed_hosts`).
+    /// See [`ENV_ALLOWED_ORIGINS`].
+    pub allowed_origins: Vec<String>,
+    /// Optional TTS endpoint config. When `Some`, `send_tts_voice_message`
+    /// posts text to `{base_url}/audio/speech` and forwards the
+    /// returned audio as a Matrix voice message. When `None`, the
+    /// tool returns `invalid_params`.
+    pub tts: Option<TtsConfig>,
+}
+
+#[derive(Clone)]
+pub struct TtsConfig {
+    /// e.g. `https://tts.oddie.media/v1`. Trailing slash stripped.
+    pub base_url: String,
+    /// Bearer token. Logged as `<redacted>`.
+    pub bearer_token: String,
+}
+
+impl std::fmt::Debug for TtsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TtsConfig")
+            .field("base_url", &self.base_url)
+            .field("bearer_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -199,7 +270,16 @@ impl Config {
         bind_addr: SocketAddr,
     ) -> Result<Self> {
         let resource_url = strip_trailing_slash(resource_url.into());
-        let authorization_server = strip_trailing_slash(authorization_server.into());
+        // NOT slash-stripped: this value is an OAuth *issuer identifier*, not
+        // a base URL. RFC 8414 §3.3 (and the MCP authorization spec, which
+        // cites it) has clients compare the `issuer` in the fetched metadata
+        // against this string exactly — `https://as.example/` and
+        // `https://as.example` are different identifiers, and a strict client
+        // MUST refuse the metadata on a mismatch. MAS publishes its issuer
+        // with a trailing slash, so configure it with one. Use
+        // [`Self::authorization_server_base`] when concatenating endpoint
+        // paths.
+        let authorization_server = authorization_server.into().trim().to_owned();
         let homeserver_url = strip_trailing_slash(homeserver_url.into());
         let server_name = server_name.into();
         if server_name.is_empty() {
@@ -232,7 +312,18 @@ impl Config {
             // it obvious in any accidental dump that resolution hasn't
             // run yet.
             device_id: "UNRESOLVED".to_owned(),
+            allowed_origins: Vec::new(),
+            tts: None,
         })
+    }
+
+    /// The authorization server URL with any trailing slash removed, for
+    /// building endpoint URLs (`{base}/oauth2/token`). Never advertise this
+    /// form — [`Self::authorization_server`] is the identifier clients compare
+    /// against the AS metadata document.
+    #[must_use]
+    pub fn authorization_server_base(&self) -> &str {
+        self.authorization_server.trim_end_matches('/')
     }
 
     /// Builder-style: attach introspection credentials.
@@ -248,6 +339,15 @@ impl Config {
     #[must_use]
     pub fn with_store(mut self, store: StoreConfig) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Builder-style: attach TTS endpoint config. Unset on boot if
+    /// the operator hasn't set both `MATRIX_MCP_TTS_BASE_URL` and
+    /// `MATRIX_MCP_TTS_BEARER_TOKEN`.
+    #[must_use]
+    pub fn with_tts(mut self, tts: TtsConfig) -> Self {
+        self.tts = Some(tts);
         self
     }
 
@@ -306,6 +406,10 @@ impl Config {
         cfg.upload_max_bytes = parse_upload_max_bytes()?;
         cfg.trusted_proxy_hops = parse_trusted_proxy_hops()?;
         cfg.device_id = device_id;
+        cfg.allowed_origins = parse_allowed_origins(std::env::var(ENV_ALLOWED_ORIGINS).ok());
+        if let Some(tts) = parse_tts_config()? {
+            cfg = cfg.with_tts(tts);
+        }
         Ok(cfg
             .with_introspection(IntrospectionCredentials {
                 client_id,
@@ -315,6 +419,65 @@ impl Config {
                 root: store_root,
                 pepper,
             }))
+    }
+}
+
+/// Split `MATRIX_MCP_ALLOWED_ORIGINS` on commas, trimming whitespace and
+/// dropping empties. Entries are passed to rmcp verbatim; it compares them per
+/// RFC 6454 `(scheme, host, port)`, so each must carry a scheme
+/// (`https://claude.ai`, not `claude.ai`). `"null"` matches a browser's
+/// `Origin: null`.
+fn parse_allowed_origins(raw: Option<String>) -> Vec<String> {
+    raw.map(|v| {
+        v.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// `(MATRIX_MCP_TTS_BASE_URL, MATRIX_MCP_TTS_BEARER_TOKEN)` should
+/// either both be set or both be unset. A partial configuration is
+/// almost certainly an ESO race during a rollout (one env var
+/// landed before the other) — we log a warning and treat TTS as
+/// disabled instead of crashlooping the pod, so the rest of the
+/// server stays available while the secret catches up.
+fn parse_tts_config() -> Result<Option<TtsConfig>> {
+    let url = std::env::var(ENV_TTS_BASE_URL).ok();
+    let token = std::env::var(ENV_TTS_BEARER_TOKEN).ok();
+    match (url, token) {
+        (None, None) => Ok(None),
+        (Some(url), Some(token)) if !token.is_empty() => {
+            let base_url = strip_trailing_slash(url);
+            validate_url(&base_url, ENV_TTS_BASE_URL)?;
+            Ok(Some(TtsConfig {
+                base_url,
+                bearer_token: token,
+            }))
+        }
+        (Some(_), Some(_)) => {
+            tracing::warn!(
+                "{ENV_TTS_BEARER_TOKEN} is set but empty — disabling TTS \
+                 (send_tts_voice_message will return invalid_params)"
+            );
+            Ok(None)
+        }
+        (Some(_), None) => {
+            tracing::warn!(
+                "{ENV_TTS_BASE_URL} is set but {ENV_TTS_BEARER_TOKEN} is not — \
+                 disabling TTS (send_tts_voice_message will return invalid_params)"
+            );
+            Ok(None)
+        }
+        (None, Some(_)) => {
+            tracing::warn!(
+                "{ENV_TTS_BEARER_TOKEN} is set but {ENV_TTS_BASE_URL} is not — \
+                 disabling TTS (send_tts_voice_message will return invalid_params)"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -429,18 +592,95 @@ mod tests {
     }
 
     #[test]
+    fn the_default_hop_count_picks_the_caller_out_of_the_measured_chain() {
+        // Through `Config::new` with no hop count passed, because every
+        // existing `parse_client_ip` test supplies one as an argument and is
+        // therefore green at any default. Reverting the constant left those
+        // tests passing in three sibling repositories.
+        //
+        // The measured chain is client -> Caddy edge -> Cilium gateway, and
+        // Envoy at the gateway appends what it saw, so two entries arrive:
+        // the caller, then the edge.
+        let cfg = Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            "https://matrix.example.test",
+            "example.test",
+            bind(),
+        )
+        .unwrap();
+        let chain = "203.0.113.5, 10.0.0.1";
+
+        // The consequence, not the number. `assert_eq!(hops, 2)` restates the
+        // constant and cannot fail for a reason worth knowing.
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some(chain), cfg.trusted_proxy_hops),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                203, 0, 113, 5
+            ))),
+            "the recorded address is the edge's, not the caller's"
+        );
+        // At one it returns the edge; that is the defect, spelled out so the
+        // assertion above is read as a choice between two live answers.
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some(chain), 1),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)))
+        );
+        // At three the `len < hops` guard fires and nothing is recorded.
+        assert_eq!(crate::last_used::parse_client_ip(Some(chain), 3), None);
+    }
+
+    #[test]
+    fn a_single_entry_chain_records_nothing_under_the_default() {
+        // A caller reaching the gateway directly has a real depth of one, so
+        // its own header would be the only entry. Under the default the guard
+        // fires rather than selecting it, which is the case that decides
+        // whether too high fails safe: here it does, and behind an appending
+        // proxy it would not, which is why the constant's comment carries the
+        // topology it depends on.
+        let cfg = Config::new(
+            "https://example.test",
+            "https://auth.example.test",
+            "https://matrix.example.test",
+            "example.test",
+            bind(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some("203.0.113.5"), cfg.trusted_proxy_hops),
+            None
+        );
+    }
+
+    #[test]
     fn strips_trailing_slashes() {
         let cfg = Config::new(
             "https://example.test/",
-            "https://auth.example.test///",
+            "https://auth.example.test",
             "https://matrix.example.test/",
             "example.test",
             bind(),
         )
         .unwrap();
         assert_eq!(cfg.resource_url, "https://example.test");
-        assert_eq!(cfg.authorization_server, "https://auth.example.test");
         assert_eq!(cfg.homeserver_url, "https://matrix.example.test");
+    }
+
+    /// The AS issuer is compared byte-for-byte by clients (RFC 8414 §3.3), so
+    /// a configured trailing slash must survive into the metadata document —
+    /// while endpoint URLs built from it must not double up on slashes.
+    #[test]
+    fn authorization_server_keeps_its_trailing_slash() {
+        let cfg = Config::new(
+            "https://example.test",
+            "https://auth.example.test/",
+            "https://matrix.example.test",
+            "example.test",
+            bind(),
+        )
+        .unwrap();
+        assert_eq!(cfg.authorization_server, "https://auth.example.test/");
+        assert_eq!(cfg.authorization_server_base(), "https://auth.example.test");
     }
 
     #[test]

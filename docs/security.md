@@ -64,8 +64,9 @@ PSS-restricted namespace, read-only root filesystem, audit logging to Loki.
 - SQLite stores encrypted by `matrix-sdk`'s `StoreCipher`.
 - Per-user passphrase = `HKDF-SHA256(salt=owner_key, ikm=pepper,
   info="matrix-mcp-store-cipher v1")`.
-- Owner key = `sha256(mas_subject + device_id)[..32]` – stable across
-  token refreshes, resistant to MXID localpart renames.
+- Owner key = `sha256(mxid)[..32]`. This keeps the matrix-sdk store stable
+  for the Matrix device across token refreshes; see `docs/multi-user.md` for
+  the accepted localpart-reassignment tradeoff.
 - Pepper is a Kubernetes Secret sourced from 1Password via ExternalSecret.
   **Never written to disk.**
 
@@ -92,8 +93,9 @@ PSS-restricted namespace, read-only root filesystem, audit logging to Loki.
   accepted with a WARN log (claude.ai behaviour – see ADR-03).
 - Introspection cached 60 s or token TTL, whichever is shorter.
 - Cache invalidates on a 401 from Synapse.
-- MAS `sub` (stable ULID) used as store ownership key – mutable MXID
-  localpart cannot hijack another user's store (ADR-01).
+- MAS `sub` (stable ULID) is carried in the authenticated identity and used
+  for per-identity controls such as rate limiting and key-backup cooldowns.
+  The matrix-sdk store itself remains MXID-keyed for device-key continuity.
 
 ### /setup hardening
 
@@ -139,7 +141,8 @@ PSS-restricted namespace, read-only root filesystem, audit logging to Loki.
 | Risk | Status |
 |---|---|
 | Pod compromise leaks all active user key stores | **Accepted** – inherent to server-side E2EE. Mitigated by pod hardening + audit log. |
-| SSRF via `send_image_from_url` to RFC-1918 addresses | **Known gap** – HTTPS + redirect cap in place; loopback/RFC-1918 blocking is a future item. |
+| MXID localpart reassignment on a homeserver that allows reuse | **Accepted** – cache/store keying is MXID-based for device-key continuity; only deploy where MXIDs are non-reassignable or re-key first. |
+| Remote BuildKit daemon uses unauthenticated TCP for trusted builds | **Accepted infra risk** – PRs no longer hit BuildKit; main/tag builds still require a hardened runner LAN or BuildKit TLS. |
 | MCP prompt injection via Matrix room content | **Known** – see `matrix_mcp_prompt_injection_pattern` in MEMORY.md. Not a server-side concern. |
 | vodozemac X25519 contributory-check issue (Feb 2026) | **Monitor** – will bump matrix-sdk when the fix lands upstream. |
 | Anthropic egress range change | **Monitor** – auth failure alerts would catch an unannounced change. |

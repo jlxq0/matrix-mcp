@@ -2,9 +2,9 @@
 
 ---
 
-## ADR-01: MAS subject as store ownership key
+## ADR-01: Superseded MAS-subject store key
 
-**Status:** Accepted  
+**Status:** Superseded by ADR-11
 **Date:** 2026-05-15
 
 ### Context
@@ -13,12 +13,11 @@ matrix-mcp needs a stable, non-reusable per-user key for the SQLite
 store directory and the HKDF salt. Matrix MXIDs are mutable – a user
 can rename their localpart, and the old name can be reassigned.
 
-### Decision
+### Original Decision
 
-Use the MAS `sub` claim (a stable, opaque ULID) as the ownership key,
-combined with the device_id. The store path is
-`sha256(mas_subject + device_id)[..32]`. The MXID is used only for
-Matrix API calls, not for store ownership.
+Use the MAS `sub` claim (a stable, opaque ULID), combined with `device_id`, as
+the store ownership key. The MXID is used only for Matrix API calls, not for
+store ownership.
 
 ### Consequences
 
@@ -26,7 +25,48 @@ Matrix API calls, not for store ownership.
 - A post-rename user gets a fresh store on their first reconnect and
   must re-run /setup. This is correct – a renamed user is effectively
   a new identity from the store's perspective.
-- Implemented in: `src/matrix_client.rs`, `src/mas.rs`.
+- Originally implemented in `src/matrix_client.rs` and `src/mas.rs`, then
+  superseded by ADR-11 after device-key continuity issues.
+
+---
+
+## ADR-11: MXID-keyed matrix-sdk store
+
+**Status:** Accepted
+**Date:** 2026-06-12
+
+### Context
+
+ADR-01's MAS-subject/device store key was safer for homeservers that allow
+localpart reassignment, but it caused a worse production failure mode: store-key
+changes for the same Matrix `device_id` created fresh Olm machine state and
+tripped Synapse device-key continuity checks.
+
+### Decision
+
+Keep the in-memory client cache and on-disk matrix-sdk store keyed by MXID:
+
+```
+store_dir = sha256(mxid)[..32]
+passphrase = HKDF-SHA256(
+  salt = mxid,
+  ikm  = pepper,
+  info = "matrix-mcp-store-cipher v1",
+  len  = 32 bytes
+)
+```
+
+MAS `sub` still travels with the authenticated identity and remains the stable
+identifier for controls that do not touch matrix-sdk device state, such as
+rate-limit buckets and key-backup cooldowns.
+
+### Consequences
+
+- Token refreshes and setup recovery keep using the same matrix-sdk store for
+  the same Matrix device.
+- Deployments must use homeserver/MAS configurations where MXIDs are not
+  reassigned to different people, or re-key this module before going live.
+- `docs/multi-user.md` documents the accepted localpart-reassignment risk.
 
 ---
 
@@ -164,7 +204,7 @@ input key material. Derive per-user passphrases as:
 
 ```
 HKDF-SHA256(
-  salt = cache_key (sha256(mas_subject + device_id)[..32]),
+  salt = mxid,
   ikm  = pepper,
   info = "matrix-mcp-store-cipher v1",
   len  = 32 bytes

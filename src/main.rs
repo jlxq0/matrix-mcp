@@ -14,6 +14,7 @@
 mod audit;
 mod audit_room;
 mod auth;
+mod channel;
 mod config;
 mod content_sandbox;
 mod device_identity;
@@ -26,6 +27,7 @@ mod metrics;
 mod oauth_metadata;
 mod rate_limit;
 mod session;
+mod session_store;
 mod setup;
 mod telemetry;
 mod token_introspect;
@@ -41,6 +43,7 @@ use axum::http::{Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use rmcp::transport::streamable_http_server::session::store::SessionStore;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -55,7 +58,9 @@ use crate::matrix_client::MatrixClientCache;
 use crate::mcp::MatrixMcpService;
 use crate::oauth_metadata::protected_resource_metadata;
 use crate::rate_limit::Limiter;
-use crate::rate_limit::{InitializeLimiter, MAX_INITIALIZES_PER_IDENTITY};
+use crate::rate_limit::{
+    INITIALIZE_REFILL_INTERVAL, InitializeLimiter, MAX_INITIALIZES_PER_IDENTITY,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -101,7 +106,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         .clone()
         .context("introspection credentials missing from config")?;
     let mas = MasIntrospectionClient::new(
-        &cfg.authorization_server,
+        cfg.authorization_server_base(),
         cfg.resource_url.clone(),
         creds.client_id,
         creds.client_secret,
@@ -115,7 +120,12 @@ fn build_app(cfg: Config) -> Result<Router> {
     let store = cfg.store.clone().context(
         "E2EE store config missing — set MATRIX_MCP_STORE_DIR and MATRIX_MCP_STORE_PEPPER",
     )?;
-    let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store);
+    let store_root = store.root.clone();
+    // Shared by the channel mount (which registers sessions) and the client
+    // cache (whose sync tasks push to them).
+    let channel_registry = channel::ChannelRegistry::new();
+    let clients = MatrixClientCache::new(cfg.homeserver_url.clone(), store)
+        .with_channel(channel_registry.clone());
     // Shared across SetupState (recover flow) and MatrixMcpService
     // (request_room_keys tool + auto-pull helper) so all room-key
     // backup pulls go through the same concurrency cap + per-room
@@ -133,6 +143,23 @@ fn build_app(cfg: Config) -> Result<Router> {
         )?,
     );
     let download_max_bytes = cfg.download_max_bytes;
+    let tts = cfg.tts.clone().map(Arc::new);
+    // Durable MCP sessions live on the same PVC as the matrix-sdk stores, so
+    // a rollout or an idle-eviction doesn't 404 a client's session id. A
+    // failure to create the directory is a volume misconfiguration: log it and
+    // run without persistence rather than refusing to boot.
+    let session_store: Option<Arc<dyn SessionStore>> =
+        match session_store::FileSessionStore::new(&store_root) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not open the durable session directory; MCP sessions \
+                     will not survive a restart"
+                );
+                None
+            }
+        };
     Ok(build_router(
         cfg,
         auth_state,
@@ -142,7 +169,46 @@ fn build_app(cfg: Config) -> Result<Router> {
         limiter,
         download_max_bytes,
         key_backup_gate,
+        tts,
+        session_store,
+        channel_registry,
     ))
+}
+
+/// Build the per-session service factory for one mount.
+///
+/// `StreamableHttpService` constructs a fresh service for every MCP session,
+/// so everything the service needs is cloned into the factory once here and
+/// then per-session out of it. `channel = Some(..)` produces the `/channel`
+/// surface; `None` produces the full `/mcp` one.
+#[allow(clippy::too_many_arguments)]
+fn service_factory(
+    clients: MatrixClientCache,
+    mas: MasIntrospectionClient,
+    limiter: Arc<Limiter>,
+    download_max_bytes: u64,
+    upload_max_bytes: usize,
+    key_backup_gate: key_backup_gate::KeyBackupGate,
+    tts: Option<Arc<crate::config::TtsConfig>>,
+    deployment: crate::mcp::Deployment,
+    channel: Option<channel::ChannelRegistry>,
+) -> impl Fn() -> Result<MatrixMcpService, std::io::Error> + Send + Sync + 'static {
+    move || {
+        let service = MatrixMcpService::new(
+            clients.clone(),
+            mas.clone(),
+            Arc::clone(&limiter),
+            download_max_bytes,
+            upload_max_bytes,
+            key_backup_gate.clone(),
+            tts.clone(),
+            deployment.clone(),
+        );
+        Ok(match &channel {
+            Some(registry) => service.into_channel_mode(registry.clone()),
+            None => service,
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -155,6 +221,9 @@ fn build_router(
     limiter: Arc<Limiter>,
     download_max_bytes: u64,
     key_backup_gate: key_backup_gate::KeyBackupGate,
+    tts: Option<Arc<crate::config::TtsConfig>>,
+    session_store: Option<Arc<dyn SessionStore>>,
+    channel_registry: channel::ChannelRegistry,
 ) -> Router {
     // rmcp's StreamableHttpService is a tower::Service that handles all the
     // MCP transport details (initialize, tools/list, tools/call, SSE
@@ -175,30 +244,76 @@ fn build_router(
     //   global session count at session::MAX_SESSIONS (256).
     // - InitializeLimiter (below) rate-limits *fresh* MCP session creation
     //   per identity so one bearer token can't cheaply fill the global pool.
+    //
+    // `session_store` makes sessions durable: an `Mcp-Session-Id` the process
+    // has no in-memory record of (pod restart, rollout, idle eviction) is
+    // reloaded from the PVC and its `initialize` handshake replayed, instead
+    // of 404-ing the client into a re-handshake it may be rate-limited out of.
+    // Both mounts get the same transport configuration. `StreamableHttpService`
+    // consumes its config, so the builder runs once per mount.
+    let make_http_config = |mount: &str, store: Option<Arc<dyn SessionStore>>| {
+        let mut c = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts.clone());
+        if !cfg.allowed_origins.is_empty() {
+            info!(origins = ?cfg.allowed_origins, "Origin validation enabled for {mount}");
+            c = c.with_allowed_origins(cfg.allowed_origins.clone());
+        }
+        c.session_store = store;
+        c
+    };
+    let http_config = make_http_config("/mcp", session_store.clone());
+    let channel_http_config = make_http_config("/channel", session_store);
+
+    // `/setup` lives next to `/mcp` on the same public origin.
+    let deployment = crate::mcp::Deployment {
+        server_name: cfg.server_name.clone(),
+        setup_url: format!(
+            "{}/setup",
+            cfg.resource_url
+                .strip_suffix("/mcp")
+                .unwrap_or(&cfg.resource_url)
+                .trim_end_matches('/')
+        ),
+    };
     let mcp_service = StreamableHttpService::new(
-        move || {
-            let mas = mas.clone();
-            let clients = clients.clone();
-            let limiter = Arc::clone(&limiter);
-            let key_backup_gate = key_backup_gate.clone();
-            Ok(MatrixMcpService::new(
-                clients,
-                mas,
-                limiter,
-                download_max_bytes,
-                upload_max_bytes,
-                key_backup_gate,
-            ))
-        },
+        service_factory(
+            clients.clone(),
+            mas.clone(),
+            Arc::clone(&limiter),
+            download_max_bytes,
+            upload_max_bytes,
+            key_backup_gate.clone(),
+            tts.clone(),
+            deployment.clone(),
+            None,
+        ),
         Arc::new(session::CappedSessionManager::new()),
-        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+        http_config,
     );
 
-    // Per-identity initialize-rate-limit. Pairs the refill period with the
-    // session idle TTL so an attacker who has filled their slots can only
-    // open new ones at the rate their old ones idle out.
+    // `/channel` — same auth, same stores, same clients; a narrower tool
+    // surface and the `claude/channel` capability. See `channel.rs`.
+    let channel_service = StreamableHttpService::new(
+        service_factory(
+            clients,
+            mas,
+            limiter,
+            download_max_bytes,
+            upload_max_bytes,
+            key_backup_gate,
+            tts,
+            deployment,
+            Some(channel_registry),
+        ),
+        Arc::new(session::CappedSessionManager::new()),
+        channel_http_config,
+    );
+
+    // Per-identity initialize-rate-limit. See
+    // `rate_limit::INITIALIZE_REFILL_INTERVAL` for why the refill is decoupled
+    // from the session idle TTL: a 429 here lands on the user's *first tool
+    // call* after a reconnect, which is the worst possible place for it.
     let initialize_limiter = Arc::new(InitializeLimiter::new(
-        session::SESSION_KEEP_ALIVE,
+        INITIALIZE_REFILL_INTERVAL,
         MAX_INITIALIZES_PER_IDENTITY,
     ));
 
@@ -214,6 +329,7 @@ fn build_router(
     // .layer() applies bottom-up, so the limiter goes first here.
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp_service)
+        .nest_service("/channel", channel_service)
         .route("/token/introspect", get(token_introspect::handler))
         .layer(middleware::from_fn_with_state(
             initialize_limiter,
@@ -240,6 +356,14 @@ fn build_router(
         .route("/health", get(health))
         .route(
             "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata),
+        )
+        // RFC 9728 §3.1 path-inserted location for the `{origin}/mcp`
+        // resource. Strict clients (LangDock) follow the `resource_metadata`
+        // pointer here; lenient ones (claude.ai) hit the root above. Both
+        // return the same document with `resource = {origin}/mcp`.
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
             get(protected_resource_metadata),
         )
         .merge(setup_routes)
@@ -290,13 +414,35 @@ async fn initialize_rate_limit(
         .check(&bearer_hash, Some(identity.mas_subject.as_str()))
         .is_err()
     {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many MCP initialize requests; try again later\n",
-        )
-            .into_response();
+        return initialize_rate_limited();
     }
     next.run(request).await
+}
+
+/// The 429 for an exhausted initialize bucket.
+///
+/// Shaped for MCP clients rather than for `curl`: a JSON-RPC error body (with
+/// the same `-32029` code the tool layer uses for rate limits) so the client
+/// surfaces a real message instead of "unexpected response", and `Retry-After`
+/// so it knows when the next slot frees up rather than hammering.
+fn initialize_rate_limited() -> axum::response::Response {
+    let retry_after_secs = INITIALIZE_REFILL_INTERVAL.as_secs();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::Value::Null,
+        "error": {
+            "code": crate::audit::RATE_LIMITED_CODE,
+            "message": format!(
+                "too many MCP session handshakes for this identity; retry in {retry_after_secs}s"
+            ),
+        }
+    });
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry_after_secs),
+    );
+    response
 }
 
 fn is_fresh_mcp_session_request(request: &Request<Body>) -> bool {
@@ -394,9 +540,16 @@ mod tests {
     }
 
     fn router(cfg: Config) -> Router {
+        router_with_session_store(cfg, None)
+    }
+
+    fn router_with_session_store(
+        cfg: Config,
+        session_store: Option<Arc<dyn SessionStore>>,
+    ) -> Router {
         let creds = cfg.introspection.clone().unwrap();
         let mas = MasIntrospectionClient::new(
-            &cfg.authorization_server,
+            cfg.authorization_server_base(),
             cfg.resource_url.clone(),
             creds.client_id,
             creds.client_secret,
@@ -434,7 +587,220 @@ mod tests {
             limiter,
             5 * 1024 * 1024, // default 5 MiB cap in tests
             key_backup_gate,
+            None,
+            session_store,
+            channel::ChannelRegistry::new(),
         )
+    }
+
+    /// `initialize` against an arbitrary mount, returning the parsed result.
+    ///
+    /// The channel tests need the initialize *result* itself rather than a
+    /// subsequent tool call, because the capability declaration is what is
+    /// under test.
+    async fn initialize_on(app: &Router, uri: &str) -> Result<Value, anyhow::Error> {
+        let init_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "matrix-mcp-test", "version": "0.0.1"}
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from(serde_json::to_vec(&init_body)?))
+                    .unwrap(),
+            )
+            .await?;
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024).await?;
+        parse_response_body(&body)
+    }
+
+    /// `tools/list` against a mount, returning the advertised tool names.
+    async fn tool_names_on(app: &Router, uri: &str) -> Result<Vec<String>, anyhow::Error> {
+        let init = app
+            .clone()
+            .oneshot({
+                let body = json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                               "clientInfo": {"name": "t", "version": "1"}}
+                });
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from(serde_json::to_vec(&body)?))
+                    .unwrap()
+            })
+            .await?;
+        let session_id = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|h| h.to_str().unwrap_or("").to_owned());
+        let list_body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, "Bearer test-token");
+        if let Some(sid) = &session_id {
+            builder = builder.header("mcp-session-id", sid);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(serde_json::to_vec(&list_body)?))
+                    .unwrap(),
+            )
+            .await?;
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        let parsed = parse_response_body(&bytes)?;
+        Ok(parsed["result"]["tools"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect())
+    }
+
+    async fn mas_backed_router() -> (MockServer, Router) {
+        let mas_mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mas_mock)
+            .await;
+        let app = router(test_config(&mas_mock.uri(), "https://res.example"));
+        (mas_mock, app)
+    }
+
+    #[tokio::test]
+    async fn channel_mount_declares_the_channel_capability() {
+        let (_mas, app) = mas_backed_router().await;
+        let body = initialize_on(&app, "/channel").await.unwrap();
+        let experimental = &body["result"]["capabilities"]["experimental"];
+        assert!(
+            experimental
+                .get(crate::channel::CHANNEL_CAPABILITY)
+                .is_some(),
+            "the capability declaration is the entire registration mechanism; \
+             without it a client silently never becomes a channel. body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_main_mount_never_declares_the_channel_capability() {
+        // The reason /channel is a separate mount at all: existing clients on
+        // /mcp must not be turned into channels and pushed to.
+        let (_mas, app) = mas_backed_router().await;
+        let body = initialize_on(&app, "/mcp").await.unwrap();
+        let experimental = &body["result"]["capabilities"]["experimental"];
+        assert!(
+            experimental
+                .get(crate::channel::CHANNEL_CAPABILITY)
+                .is_none(),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_mount_declares_the_permission_capability() {
+        // Same argument as the channel capability above: presence of the key
+        // is the entire opt-in. Without it Claude Code never forwards a
+        // permission prompt and every gated call still stalls at a keyboard.
+        let (_mas, app) = mas_backed_router().await;
+        let body = initialize_on(&app, "/channel").await.unwrap();
+        let experimental = &body["result"]["capabilities"]["experimental"];
+        let declared = experimental
+            .get(crate::channel::PERMISSION_CAPABILITY)
+            .unwrap_or(&Value::Null);
+        assert!(
+            declared.is_object() && declared.as_object().is_some_and(serde_json::Map::is_empty),
+            "the value is specified as `{{}}`, and clients before 2.1.234 read `false` as \
+             declared, so it must never be a bool. body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_main_mount_never_declares_the_permission_capability() {
+        // /mcp has no sender-gated inbound path at all, so a permission
+        // prompt forwarded there could never be answered — and declaring it
+        // would tell Claude Code otherwise.
+        let (_mas, app) = mas_backed_router().await;
+        let body = initialize_on(&app, "/mcp").await.unwrap();
+        let experimental = &body["result"]["capabilities"]["experimental"];
+        assert!(
+            experimental
+                .get(crate::channel::PERMISSION_CAPABILITY)
+                .is_none(),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_mount_offers_only_the_scoped_tools() {
+        let (_mas, app) = mas_backed_router().await;
+        let channel_tools = tool_names_on(&app, "/channel").await.unwrap();
+        let full_tools = tool_names_on(&app, "/mcp").await.unwrap();
+
+        assert!(
+            !channel_tools.is_empty(),
+            "channel mount advertised no tools"
+        );
+        assert!(
+            channel_tools.len() < full_tools.len(),
+            "channel {} vs full {}: the scoped surface is the point",
+            channel_tools.len(),
+            full_tools.len()
+        );
+        for name in &channel_tools {
+            assert!(
+                crate::channel::CHANNEL_TOOLS.contains(&name.as_str()),
+                "{name} is advertised on /channel but is not in CHANNEL_TOOLS"
+            );
+        }
+        // Removal from the router, not a check at call time, is what keeps
+        // list and call from drifting — so an excluded tool must be absent.
+        assert!(!channel_tools.iter().any(|n| n == "room_ban"));
+        assert!(full_tools.iter().any(|n| n == "room_ban"));
+    }
+
+    #[tokio::test]
+    async fn every_channel_tool_is_actually_advertised() {
+        // The test above runs advertised ⊆ CHANNEL_TOOLS, and that direction
+        // cannot see a name added to the const and never wired to the mount:
+        // the advertised list is simply shorter, and every entry in it still
+        // checks out. The symptom of that bug is indistinguishable from not
+        // having the tool at all — the model is told it exists and every call
+        // fails — so assert the other direction, over the real router.
+        let (_mas, app) = mas_backed_router().await;
+        let channel_tools = tool_names_on(&app, "/channel").await.unwrap();
+        for name in crate::channel::CHANNEL_TOOLS {
+            assert!(
+                channel_tools.iter().any(|n| n == name),
+                "{name} is in CHANNEL_TOOLS but /channel does not advertise it; \
+                 advertised: {channel_tools:?}"
+            );
+        }
     }
 
     /// Active-token introspection body that audiences correctly for our test
@@ -640,6 +1006,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Durable sessions: a session id minted by one process must keep working
+    /// after that process is gone.
+    ///
+    /// Without the store, the second router has never heard of the session id
+    /// and rmcp answers `404` — which is what left claude.ai wedged after
+    /// every rollout: the connector holds a session id the server has
+    /// forgotten, and recovering costs a fresh `initialize` (which the
+    /// per-identity limiter may refuse).
+    #[tokio::test]
+    async fn session_survives_a_server_restart() {
+        let mas_mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mas_mock)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = || test_config(&mas_mock.uri(), "https://res.example");
+        let store = || -> Option<Arc<dyn SessionStore>> {
+            Some(Arc::new(
+                session_store::FileSessionStore::new(dir.path()).unwrap(),
+            ))
+        };
+
+        // Process 1: handshake, capture the session id.
+        let first = router_with_session_store(cfg(), store());
+        let init = first
+            .oneshot(initialize_request("test-token", 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(init.status(), StatusCode::OK);
+        let session_id = init
+            .headers()
+            .get("mcp-session-id")
+            .expect("stateful mode must mint a session id")
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // Process 2: same PVC, no in-memory state.
+        let second = router_with_session_store(cfg(), store());
+        let call_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}}
+        });
+        let response = second
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("mcp-session-id", &session_id)
+                    .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a persisted session must be restored, not 404-ed"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let parsed = parse_response_body(&bytes).unwrap();
+        assert_eq!(
+            parsed["result"]["structuredContent"]["mxid"], "@alice:example.test",
+            "body: {parsed}"
+        );
+    }
+
+    /// The same flow without a store is the behaviour we are fixing: the
+    /// restored-session path is what makes the test above pass, not some
+    /// incidental statelessness in the transport.
+    #[tokio::test]
+    async fn unknown_session_without_a_store_is_rejected() {
+        let mas_mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(active_introspection_body()))
+            .mount(&mas_mock)
+            .await;
+
+        let app = router(test_config(&mas_mock.uri(), "https://res.example"));
+        let call_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}}
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("Host", "localhost")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("mcp-session-id", "a-session-nobody-remembers")
+                    .body(Body::from(serde_json::to_vec(&call_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A 429 on the handshake lands on the user's first tool call, so it has
+    /// to be legible to an MCP client: JSON-RPC error body + `Retry-After`.
+    #[tokio::test]
+    async fn initialize_rate_limit_response_is_client_readable() {
+        let response = initialize_rate_limited();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["error"]["code"], crate::audit::RATE_LIMITED_CODE);
     }
 
     #[tokio::test]

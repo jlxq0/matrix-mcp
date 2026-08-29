@@ -273,7 +273,7 @@ pub async fn login(State(state): State<SetupState>) -> Response {
         "{auth}/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}\
          &code_challenge={challenge}&code_challenge_method=S256&state={state_tok}\
          &scope=openid+urn%3Amatrix%3Aorg.matrix.msc2967.client%3Aapi%3A%2A",
-        auth = state.config.authorization_server,
+        auth = state.config.authorization_server_base(),
         client_id = url_encode(&creds.client_id),
         redirect_uri = url_encode(&redirect_uri),
         challenge = url_encode(&challenge),
@@ -395,6 +395,18 @@ pub async fn form(State(state): State<SetupState>, jar: CookieJar) -> Response {
     let Some(session) = current_session(&state, &jar).await else {
         return Redirect::to("/setup").into_response();
     };
+    // Refuse **before** the key form rather than after the paste. Finding out
+    // that the session is dead while the key is still in the clipboard is the
+    // difference between a fix and a better error message.
+    let cached = state.clients.get_if_cached(&session.mxid).await;
+    let live = match &cached {
+        Some(client) => cached_bearer_is_live(client).await,
+        None => false,
+    };
+    if setup_gate(cached.is_some(), live) == SetupGate::BearerDead {
+        warn!(mxid = %session.mxid, "setup: refusing the key form, cached bearer is dead");
+        return error_page(StatusCode::PRECONDITION_REQUIRED, CONNECTOR_BEARER_DEAD);
+    }
     Html(form_html(&session.mxid, &session.csrf_token)).into_response()
 }
 
@@ -537,6 +549,26 @@ pub async fn recover(
              tool in claude.ai and try /setup again.",
         );
     };
+
+    // **Liveness, not presence.** `contains` above is true for a client whose
+    // bearer Synapse has already revoked, and that is the state he was in:
+    // the gate passed, the key form was shown, the import 401'd, and the page
+    // blamed the key. The form is gated on this too, so reaching it here means
+    // the session died in between; asking again costs one `whoami` and is the
+    // difference between naming the cause and blaming the last thing typed.
+    if setup_gate(true, cached_bearer_is_live(&client).await) == SetupGate::BearerDead {
+        span.record("outcome", "bearer_dead");
+        audit::setup_event(
+            "setup_recover",
+            Some(&session.mxid),
+            outcome::ERROR,
+            SetupExtras {
+                error_class: Some("bearer_dead"),
+                ..SetupExtras::default()
+            },
+        );
+        return error_page(StatusCode::PRECONDITION_REQUIRED, CONNECTOR_BEARER_DEAD);
+    }
 
     match client.encryption().recovery().recover(&key).await {
         Ok(()) => {
@@ -742,14 +774,134 @@ pub async fn recover(
                     ..SetupExtras::default()
                 },
             );
-            error_page(
-                StatusCode::BAD_REQUEST,
-                &format!(
-                    "Couldn't import the cross-signing keys: {e}. \
-                     Double-check the recovery key you pasted (the same string Element X \
-                     showed you when you first enabled cross-signing) and try again."
-                ),
-            )
+            let (status, message) = recover_failure_page(&e.to_string());
+            error_page(status, &message)
+        }
+    }
+}
+
+/// How a failed recovery import should be reported.
+///
+/// **The old handler attributed every failure to the recovery key**, so a dead
+/// access token was rendered as "double-check the key you pasted" and the
+/// operator re-entered a correct key twice at an airport. A recovery key is
+/// used client-side against Secret Storage and never reaches the homeserver as
+/// a token, so `M_UNKNOWN_TOKEN` cannot possibly be caused by one.
+///
+/// An error handler that blames the last thing the user typed is a check that
+/// cannot observe its subject, and it fails in the direction that costs them
+/// time and tells them nothing.
+///
+/// Only one class is claimed with confidence. Everything else says so rather
+/// than guessing, which is worth more than a plausible attribution: a wrong
+/// guess sends someone to fix a thing that is not broken.
+fn recover_failure_page(error: &str) -> (StatusCode, String) {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("m_unknown_token") || lower.contains("token is not active") {
+        // The dead token is **not** this browser session's. `/setup/recover`
+        // deliberately reuses the cached matrix-sdk client, which holds the
+        // bearer from claude.ai's tool calls; see the comment above the
+        // `get_if_cached` call for why it must not route its own token in.
+        // So the thing that expired is that bearer, and the browser session
+        // may still be perfectly valid, which is why re-signing-in here is
+        // offered as the second step rather than the first.
+        return (
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "The Matrix session this deployment holds has expired, so the keys could \
+                 not be imported. This is not about the recovery key you pasted: that key \
+                 is used here in the browser and never sent to the server as a token. \
+                 Make one tool call from the client that mounts this server, which \
+                 refreshes the session, then try again. If that does not help, sign in \
+                 again from /setup. The server said: {error}"
+            ),
+        );
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        format!(
+            "Couldn't import the cross-signing keys, and this page cannot tell you why. \
+             The server said: {error}. Two things it could be, and nothing here \
+             distinguishes them: the recovery key may not match the one Element X showed \
+             you when you first enabled cross-signing, or the import may have failed for \
+             a reason that has nothing to do with the key. Check the key first because it \
+             is the cheaper of the two, and if it is right, this is a defect worth \
+             reporting with the message above."
+        ),
+    )
+}
+
+/// The instruction a dead connector bearer needs, in one place.
+///
+/// It was already written into the absent-client branch of the precondition
+/// and shown only there, so somebody arriving with a **stale** client got
+/// nothing about it and was told to re-check their recovery key instead. The
+/// right answer displayed only where the person who needs it cannot be.
+const CONNECTOR_BEARER_DEAD: &str = concat!(
+    "matrix-mcp's Matrix session is no longer accepted by the homeserver, so there is ",
+    "nothing here that could import your keys. This is not about the recovery key: it ",
+    "is never sent to the server. ",
+    "One action fixes it, once: in claude.ai go to Settings, then Connectors, remove ",
+    "the claude.ai Matrix connector and add it again, then run any matrix-mcp tool ",
+    "(asking Claude for list_joined_rooms is enough) and come back here. ",
+    "Why only you can do that: the import needs a device-scoped session, and the only ",
+    "thing that issues one is claude.ai's own grant. This server cannot mint or refresh ",
+    "it on your behalf, which is why it asks rather than retrying. The typical cause is ",
+    "signing the matrix-mcp device out from Element, which revokes that bearer while ",
+    "everything here still looks healthy."
+);
+
+/// What `/setup` should do about the client it found.
+///
+/// A free function because both call sites need a live `matrix_sdk::Client`
+/// and a `SetupState`, so a test can reach neither: mutations disabling either
+/// gate left the suite green. The decision is the part worth pinning; the
+/// `whoami` that feeds it is one SDK call with no branch of its own.
+#[derive(Debug, PartialEq, Eq)]
+enum SetupGate {
+    /// A cached client whose bearer the homeserver still accepts.
+    Proceed,
+    /// No client cached at all. Nothing to attach keys to.
+    NoClient,
+    /// A client is cached and its bearer is dead. **`contains` is true here**,
+    /// which is why presence was the wrong question: this state passed the old
+    /// gate, the key form was shown, and the import failed with a 401 the page
+    /// blamed on the key.
+    BearerDead,
+}
+
+const fn setup_gate(cached: bool, bearer_live: bool) -> SetupGate {
+    match (cached, bearer_live) {
+        (false, _) => SetupGate::NoClient,
+        (true, false) => SetupGate::BearerDead,
+        (true, true) => SetupGate::Proceed,
+    }
+}
+
+/// Whether the cached client's bearer is still accepted by the homeserver.
+///
+/// **The precondition used to ask whether the cache had an entry, which is a
+/// different question.** `contains` is true for a client whose bearer Synapse
+/// has already revoked, so a dead session passed the gate, the operator was
+/// asked for a recovery key, and the import then failed with a 401 that the
+/// page blamed on the key. He pasted a correct key three times, twice in an
+/// airport.
+///
+/// `whoami` is the cheapest authenticated call there is: no arguments, no
+/// side-effects, and it answers exactly the question the gate is asking.
+///
+/// **The server cannot repair this itself, and that is not an omission.**
+/// Rebuilding the client needs a device-bound bearer, and the only thing that
+/// issues one is claude.ai's own OAuth grant; `/setup`'s token is unbound and
+/// routing it in panics matrix-sdk 0.17 with `AlreadyInitializedError`. So a
+/// retry here cannot succeed however many times it runs, and the honest
+/// design is to detect early and ask for the one action that works.
+async fn cached_bearer_is_live(client: &matrix_sdk::Client) -> bool {
+    match client.whoami().await {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(error = %e, "setup: the cached client's bearer is not accepted");
+            false
         }
     }
 }
@@ -825,7 +977,7 @@ async fn exchange_and_introspect(
         .as_ref()
         .ok_or_else(|| anyhow!("introspection credentials missing on Config"))?;
     let redirect_uri = format!("{}/setup/callback", state.config.resource_url);
-    let token_url = format!("{}/oauth2/token", state.config.authorization_server);
+    let token_url = format!("{}/oauth2/token", state.config.authorization_server_base());
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -1074,6 +1226,104 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn a_cached_client_with_a_dead_bearer_is_refused_not_proceeded() {
+        // The whole defect in one table. `contains` was the old gate and it is
+        // the first column: true for a dead session, which is why presence was
+        // the wrong question and a correct key was blamed three times.
+        assert_eq!(setup_gate(true, true), SetupGate::Proceed);
+        assert_eq!(setup_gate(true, false), SetupGate::BearerDead);
+        assert_eq!(setup_gate(false, false), SetupGate::NoClient);
+        // A liveness answer about a client that does not exist decides
+        // nothing; the absence wins, or a probe failure on nothing would send
+        // someone to re-add a connector they have not yet used.
+        assert_eq!(setup_gate(false, true), SetupGate::NoClient);
+    }
+
+    #[test]
+    fn the_dead_bearer_page_names_the_one_action_and_not_the_key() {
+        // The instruction existed for eighteen months on the branch where no
+        // client is cached at all, and was shown to nobody who arrived with a
+        // stale one. It now has a single home that both branches use.
+        let m = CONNECTOR_BEARER_DEAD;
+        assert!(m.contains("Connectors"), "the one action is not named: {m}");
+        assert!(
+            m.contains("not about the recovery key"),
+            "it does not rule out the thing he was told to re-check: {m}"
+        );
+        assert!(
+            m.contains("cannot mint or refresh"),
+            "it does not say why the server will not just retry: {m}"
+        );
+        // And it must not tell him to try the same screen again, which is the
+        // instruction that cost him three attempts.
+        assert!(
+            !m.to_ascii_lowercase().contains("try again"),
+            "it still sends him back to the same screen: {m}"
+        );
+    }
+
+    #[test]
+    fn a_dead_token_is_not_reported_as_a_bad_recovery_key() {
+        // The verbatim message he was shown, twice, at an airport. A recovery
+        // key is used client-side against Secret Storage and never reaches
+        // the homeserver as a token, so this error cannot be caused by one.
+        let (status, msg) = recover_failure_page(
+            "the server returned an error: [401 / M_UNKNOWN_TOKEN] Token is not active",
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "still a 400 client error");
+        assert!(
+            !msg.to_ascii_lowercase().contains("double-check"),
+            "it still tells him to re-enter a key that was correct: {msg}"
+        );
+        assert!(
+            msg.contains("expired"),
+            "it does not say the session expired: {msg}"
+        );
+        assert!(
+            msg.contains("never sent to the server as a token"),
+            "it does not say why the key cannot be the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_lowercase_form_is_classified_too() {
+        // Synapse and matrix-sdk render this string more than one way, and a
+        // classifier that matches only the shouty form sends the same person
+        // back to the same wrong instruction.
+        for form in [
+            "[401 / M_UNKNOWN_TOKEN] Token is not active",
+            "m_unknown_token",
+            "http 401: token is not active",
+        ] {
+            let (status, _) = recover_failure_page(form);
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "not classified: {form}");
+        }
+    }
+
+    #[test]
+    fn anything_unclassified_says_so_rather_than_blaming_the_last_input() {
+        // The control, and the point of the change. An unrelated failure must
+        // not be attributed to the key either, because a confident wrong
+        // attribution sends someone to fix a thing that is not broken.
+        let (status, msg) = recover_failure_page("secret storage: MAC check failed");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            msg.contains("cannot tell you why"),
+            "it claims to know which of two causes it is: {msg}"
+        );
+        assert!(
+            msg.contains("MAC check failed"),
+            "the server's own words are dropped: {msg}"
+        );
+        // It may still suggest checking the key, as the cheaper of two, but
+        // must not assert that the key is the cause.
+        assert!(
+            !msg.contains("Double-check the recovery key you pasted"),
+            "the old blaming sentence survived: {msg}"
+        );
+    }
+
     use super::*;
 
     #[test]

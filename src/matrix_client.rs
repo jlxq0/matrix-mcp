@@ -10,29 +10,29 @@
 //!
 //! ```text
 //! {MATRIX_MCP_STORE_DIR}/
-//!   {sha256(mas_subject + device_id)[..32]}/
+//!   {sha256(mxid)[..32]}/
 //!     matrix-sdk-state.sqlite3       — room/state cache
 //!     matrix-sdk-crypto.sqlite3      — olm/megolm + cross-signing
 //! ```
 //!
-//! We hash the stable MAS subject plus Matrix device id for the directory
-//! name so the filesystem never sees raw user identifiers and a mutable
-//! Matrix localpart cannot reopen another subject's store after rename/reuse.
+//! We hash the MXID for the directory name so the filesystem never sees raw
+//! user identifiers. This deliberately preserves one stable matrix-sdk store
+//! for the Matrix device across token refreshes; see `docs/multi-user.md` for
+//! the accepted localpart-reassignment tradeoff.
 //!
 //! ## Store-cipher key derivation
 //!
 //! ```text
-//!   passphrase = HKDF-SHA256(salt = cache/store owner key,
+//!   passphrase = HKDF-SHA256(salt = mxid,
 //!                            ikm  = pepper,
 //!                            info = "matrix-mcp-store-cipher v1",
 //!                            len  = 32 bytes) → hex
 //! ```
 //!
-//! `pepper` is a single deployment-wide secret in 1Password
-//! (`MATRIX_MCP_STORE_PEPPER`). Per-owner passphrases never appear in
-//! 1Password — they're derived deterministically from the pepper + stable
-//! MAS subject/device owner key at runtime. This is the Option-A passphrase
-//! model. Pepper rotation is destructive (invalidates every user's store; users will be
+//! `pepper` is a single deployment-wide secret
+//! (`MATRIX_MCP_STORE_PEPPER`), held wherever you keep secrets. Per-user
+//! passphrases are never stored anywhere — they're derived deterministically
+//! from the pepper + MXID at runtime. Pepper rotation is destructive (invalidates every user's store; users will be
 //! re-prompted to verify the matrix-mcp device in Element X). That's a
 //! known property, not a bug.
 //!
@@ -116,6 +116,12 @@ pub struct MatrixClientCache {
     homeserver_url: String,
     store: StoreConfig,
     inner: Arc<RwLock<HashMap<String, CachedClientCell>>>,
+    /// Live `/channel` sessions, when the channel mount is enabled.
+    ///
+    /// Held here because the per-user sync task is the only thing that sees
+    /// inbound Matrix traffic, and it has no request context of its own to
+    /// discover which sessions belong to the identity it syncs for.
+    channel: Option<crate::channel::ChannelRegistry>,
 }
 
 impl MatrixClientCache {
@@ -124,7 +130,27 @@ impl MatrixClientCache {
             homeserver_url: homeserver_url.into(),
             store,
             inner: Arc::new(RwLock::new(HashMap::new())),
+            channel: None,
         }
+    }
+
+    /// This deployment's Secret Storage passphrase for `mxid`.
+    ///
+    /// Derived, not configured, so it exists for every account without the
+    /// operator listing any. See [`derive_recovery_passphrase`].
+    #[must_use]
+    pub fn recovery_passphrase(&self, mxid: &str) -> String {
+        derive_recovery_passphrase(&self.store.pepper, mxid)
+    }
+
+    /// Push inbound room messages to the sessions in `registry`.
+    ///
+    /// Without this the cache behaves exactly as before: clients still sync,
+    /// but nothing is pushed anywhere.
+    #[must_use]
+    pub fn with_channel(mut self, registry: crate::channel::ChannelRegistry) -> Self {
+        self.channel = Some(registry);
+        self
     }
 
     /// Returns `true` iff a matrix-sdk client is already cached *and
@@ -523,6 +549,43 @@ impl MatrixClientCache {
             .await
             .context("restore matrix session")?;
 
+        // Import the cross-signing identity for accounts this deployment set
+        // up itself. Same call `/setup` makes; only the source of the secret
+        // differs. Best-effort — a failure costs E2EE, not the session.
+        {
+            let passphrase = derive_recovery_passphrase(&self.store.pepper, &identity.mxid);
+            match client.encryption().recovery().recover(&passphrase).await {
+                Ok(()) => {
+                    info!(
+                        mxid = %identity.mxid,
+                        "imported cross-signing identity from the configured recovery key"
+                    );
+                    // Refresh the cached identity so `verify_status` reflects
+                    // the signature that was just uploaded.
+                    if let Some(me) = client.user_id() {
+                        let _ = client.encryption().request_user_identity(me).await;
+                    }
+                }
+                // Expected whenever this deployment did not create the
+                // identity — a human's Secret Storage is locked with their own
+                // key, not ours, and `/setup` is the route for those. Nothing
+                // is changed by the failure, so it is not a warning.
+                Err(e) => debug!(
+                    mxid = %identity.mxid,
+                    error = %e,
+                    "no deployment-owned Secret Storage to import for this account"
+                ),
+            }
+        }
+
+        // Turn inbound room messages into channel events. Registered before
+        // the sync task starts so the first sync response is already covered;
+        // matrix-sdk dispatches to handlers from the sync loop, so this is
+        // inert until that task runs.
+        if let Some(registry) = self.channel.clone() {
+            crate::channel::install_event_handler(&client, identity.mxid.clone(), registry);
+        }
+
         // Subscribe the event cache. matrix-sdk's sync handler only feeds the
         // LatestEvents subsystem when the event cache has been subscribed (see
         // matrix-sdk-0.17 sync.rs:362 `if !client.event_cache().has_subscribed()
@@ -711,6 +774,47 @@ fn mxid_dir_name(mxid: &str) -> String {
 /// because the SDK's `passphrase` takes `&str`; using hex keeps the
 /// `&str` invariant clean (no embedded NUL / surrogate concerns) while
 /// preserving full 256-bit entropy.
+/// Per-account Secret Storage passphrase, derived rather than configured.
+///
+/// ## Why derived
+///
+/// `/setup` is a browser flow: sign in at MAS, paste the recovery key Element
+/// produced. An account with no human can never do that, so a bot's
+/// cross-signing identity would live only in this deployment's store — lose
+/// the volume and it is stranded, because the homeserver still holds a master
+/// key and `bootstrap_cross_signing` rightly refuses to mint a second.
+///
+/// An operator-maintained list of per-account passphrases would fix that, and
+/// was the first attempt. It is the wrong shape: this server accepts any
+/// active token, so anyone can connect any number of accounts, and a feature
+/// that needs the operator to add a line before each one works is not really
+/// available to them. Deriving it from the pepper — exactly as
+/// [`derive_store_passphrase`] already does for the store cipher — makes it
+/// automatic for every account, with nothing to configure and no new secret.
+///
+/// ## Why this grants nobody anything new
+///
+/// The pepper already decrypts every per-user store, and those stores hold the
+/// same cross-signing private keys this passphrase protects. Anyone who has
+/// the pepper could already read them. Rotating the pepper is already
+/// documented as destructive to the stores; it is equally destructive here.
+///
+/// ## Why it never touches a human's identity
+///
+/// It is only ever *written* by `bootstrap_cross_signing`, which refuses to
+/// run on an account that already has a cross-signing identity. Reading is a
+/// `recover()` attempt that simply fails when this deployment did not set the
+/// Secret Storage up, which is the case for every human user — their storage
+/// is locked with their own key and is left untouched.
+fn derive_recovery_passphrase(pepper: &str, mxid: &str) -> String {
+    let hkdf = Hkdf::<Sha256>::new(Some(mxid.as_bytes()), pepper.as_bytes());
+    let mut okm = [0u8; 32];
+    #[allow(clippy::expect_used)]
+    hkdf.expand(b"matrix-mcp-recovery v1", &mut okm)
+        .expect("HKDF expand 32 bytes always succeeds");
+    hex::encode(okm)
+}
+
 fn derive_store_passphrase(pepper: &str, mxid: &str) -> String {
     let hkdf = Hkdf::<Sha256>::new(Some(mxid.as_bytes()), pepper.as_bytes());
     let mut okm = [0u8; 32];
@@ -973,6 +1077,34 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "upgrade must return None after Arc is dropped"
+        );
+    }
+
+    #[test]
+    fn recovery_and_store_passphrases_are_different_secrets() {
+        // Same pepper, same account, different HKDF info strings. If these
+        // ever collided, the Secret Storage passphrase would be the store
+        // cipher key, and one leak would be two.
+        let store = derive_store_passphrase("pepper", "@a:example.com");
+        let recovery = derive_recovery_passphrase("pepper", "@a:example.com");
+        assert_ne!(store, recovery);
+        assert_eq!(recovery.len(), 64, "32 bytes hex-encoded");
+    }
+
+    #[test]
+    fn recovery_passphrase_is_per_account_and_stable() {
+        // Stable, so a redeployment recovers what an earlier one created;
+        // per-account, so one account's secret is not another's.
+        let a1 = derive_recovery_passphrase("pepper", "@a:example.com");
+        let a2 = derive_recovery_passphrase("pepper", "@a:example.com");
+        let b = derive_recovery_passphrase("pepper", "@b:example.com");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        // And it follows the pepper, which is why pepper rotation is
+        // documented as destructive.
+        assert_ne!(
+            a1,
+            derive_recovery_passphrase("other-pepper", "@a:example.com")
         );
     }
 }

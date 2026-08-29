@@ -63,9 +63,14 @@ List Matrix rooms the authenticated user has joined.
 
 ## read_recent_messages
 
-Read recent events (newest first) from a Matrix room. The SDK decrypts
-E2EE rooms if this device is cross-signed. Events that cannot be decrypted
-return `status: "unable_to_decrypt"` with a null event body.
+Read events from a Matrix room. By default this returns the latest page
+newest-first (`direction: "backward"`). The SDK decrypts E2EE rooms if this
+device is cross-signed. Events that cannot be decrypted return
+`status: "unable_to_decrypt"` with a null event body.
+
+Pagination uses Matrix batch tokens. To walk back through encrypted history,
+call once without `from`, then pass the returned `end_token` as `from` on the
+next call. Repeat until `end_token` is `null` or the desired point is reached.
 
 **Category:** read  
 **Params:**
@@ -73,7 +78,10 @@ return `status: "unable_to_decrypt"` with a null event body.
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `room_id` | string | required | Matrix room id, e.g. `!abc:example.com` |
-| `limit` | integer | `20` | Max events to return. Capped at 50. |
+| `limit` | integer | `50` | Max events to return. Capped at 200. |
+| `from` | string | `null` | Opaque pagination token. Use the previous response's `end_token` to keep paging. |
+| `to` | string | `null` | Optional stop token for bounded reads. Usually omitted. |
+| `direction` | string | `"backward"` | `"backward"` for newer-to-older pages, `"forward"` for older-to-newer pages from a token. |
 
 **Returns:**
 ```json
@@ -89,7 +97,10 @@ return `status: "unable_to_decrypt"` with a null event body.
       "is_thread_root": false,
       "thread_event_count": null
     }
-  ]
+  ],
+  "start_token": "s123_456_7_8_9",
+  "end_token": "t123_400_7_8_9",
+  "direction": "backward"
 }
 ```
 
@@ -199,7 +210,7 @@ normalized power level.
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `room_id` | string | required | Matrix room id |
-| `limit` | integer | `200` | Max members. Capped at 1000. |
+| `limit` | integer | `200` | Max members. Capped at 1000. Rooms above 1000 joined members are refused before enumeration. |
 
 **Returns:**
 ```json
@@ -317,8 +328,10 @@ power level is below the room's `redact` threshold, you get an error.
 ## download_attachment
 
 Download an attachment from a Matrix room event (`m.file`, `m.image`,
-`m.audio`, or `m.video`) and return it as base64. The SDK handles
-E2EE decryption transparently. Attachments larger than
+`m.audio`, or `m.video`) and return it as base64 — standard alphabet,
+padded, no line breaks, so a strict decoder takes it with no fix-up.
+`size_bytes` is the decoded length; compare the two to know the file
+arrived whole. The SDK handles E2EE decryption transparently. Attachments larger than
 `MATRIX_MCP_DOWNLOAD_MAX_BYTES` (default 5 MiB) are rejected before
 any media I/O.
 
@@ -346,8 +359,9 @@ any media I/O.
 
 Fetch an image from a public HTTPS URL, upload it to the homeserver
 media repo, and post it as `m.image`. URL must be HTTPS. Redirects
-limited to 3 hops. Fetch timeout 15 s. Max size: `MATRIX_MCP_UPLOAD_MAX_BYTES`
-(default 10 MiB).
+limited to 3 hops and each hop is revalidated against the public-address
+denylist. Fetch timeout 15 s. The body is stream-capped at
+`MATRIX_MCP_UPLOAD_MAX_BYTES` (default 10 MiB) before buffering.
 
 **Category:** write  
 **Params:**

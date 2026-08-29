@@ -10,7 +10,7 @@ matrix-mcp deployment.
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `MATRIX_MCP_RESOURCE_URL` | yes | – | Public URL of this server, e.g. `https://matrix-mcp.example.com`. No trailing slash. |
-| `MATRIX_MCP_AUTHORIZATION_SERVER` | yes | – | MAS issuer URL, e.g. `https://matrixauthservice.example.com`. No trailing slash. |
+| `MATRIX_MCP_AUTHORIZATION_SERVER` | yes | – | MAS **issuer identifier**, copied byte-for-byte from the AS metadata document's `issuer` field (MAS publishes it *with* a trailing slash: `https://matrixauthservice.example.com/`). Clients compare it exactly per RFC 8414 §3.3 and refuse the metadata on a mismatch. Endpoint URLs are built from it with any trailing slash removed. |
 | `MATRIX_MCP_HOMESERVER_URL` | yes | – | Synapse base URL, e.g. `https://matrix.example.com`. No trailing slash. |
 | `MATRIX_MCP_SERVER_NAME` | yes | – | Matrix server name (right side of MXIDs), e.g. `example.com`. Not a URL. |
 | `MATRIX_MCP_INTROSPECTION_CLIENT_ID` | yes | – | OAuth client id for MAS introspection endpoint. |
@@ -23,7 +23,38 @@ matrix-mcp deployment.
 | `MATRIX_MCP_RATE_LIMIT_READS_PER_MIN` | no | `60` | Per-identity read quota. |
 | `MATRIX_MCP_RATE_LIMIT_WRITES_PER_MIN` | no | `30` | Per-identity write quota. |
 | `MATRIX_MCP_DOWNLOAD_MAX_BYTES` | no | `5242880` (5 MiB) | Max attachment size for `download_attachment`. |
-| `MATRIX_MCP_UPLOAD_MAX_BYTES` | no | `10485760` (10 MiB) | Max image size for `send_image_from_url`. |
+| `MATRIX_MCP_UPLOAD_MAX_BYTES` | no | `10485760` (10 MiB) | Max streamed fetch size for URL media uploads and TTS responses. |
+| `MATRIX_MCP_ALLOWED_ORIGINS` | no | – (disabled) | Comma-separated browser origins accepted on `/mcp`, e.g. `https://claude.ai`. Each entry needs a scheme; `null` matches `Origin: null`. Empty disables `Origin` validation — see below. |
+
+### `Origin` validation
+
+The MCP Streamable HTTP spec says servers MUST validate `Origin`. It is off by
+default here, deliberately: the attack it defends against is DNS rebinding
+against a server bound to localhost, and non-browser MCP clients (Claude
+Desktop, VS Code, Cursor, CLI tools) either omit `Origin` or send an
+app-private value that no allow-list can enumerate in advance — so a default
+allow-list would lock out desktop clients without improving the security of a
+public, bearer-authenticated deployment. `Host` is validated unconditionally.
+
+Set `MATRIX_MCP_ALLOWED_ORIGINS` when the only clients are browser-based.
+Requests with no `Origin` header still pass; only a present-and-unlisted
+`Origin` is rejected (403).
+
+### Durable MCP sessions
+
+Session state is persisted under `{MATRIX_MCP_STORE_DIR}/mcp-sessions/` — one
+small JSON file per session, named `sha256(session_id)`, holding the client's
+`initialize` parameters (no tokens, no identity). A restart, a rollout, or an
+idle eviction therefore does not invalidate a client's `Mcp-Session-Id`: the
+next request carrying it is restored transparently instead of getting a `404`
+that would force a fresh handshake.
+
+Entries expire seven days after their last write and the directory is capped at
+4096 sessions. To wipe them (clients will simply re-handshake):
+
+```
+kubectl exec -n matrix-mcp deploy/matrix-mcp -- rm -rf /var/lib/matrix-mcp/mcp-sessions
+```
 
 ---
 
@@ -166,3 +197,61 @@ is already verified.
 To update: user visits `/setup` again and pastes the new recovery key.
 The `recover()` call replaces the old secret storage credentials.
 No data is lost; the existing store remains valid.
+
+
+## Recovery for accounts with no human
+
+`/setup` is how a cross-signing identity gets into this deployment, and it is a
+browser flow: sign in at MAS, paste the recovery key Element produced. That
+assumes somebody can sign in.
+
+A **bot account has nobody**. Its identity would therefore live in exactly one
+place — this deployment's encrypted store. Lose the volume, move the
+deployment, or rebuild the store, and the identity is stranded: the homeserver
+still holds a master key, so `bootstrap_cross_signing` correctly refuses to
+mint a second one, and the account is left permanently unverifiable.
+
+**Nothing needs configuring.** When `bootstrap_cross_signing` creates an
+identity, it also writes it to Secret Storage under a passphrase derived from
+the pepper and the MXID:
+
+```text
+passphrase = HKDF-SHA256(salt = mxid, ikm = pepper,
+                         info = "matrix-mcp-recovery v1")
+```
+
+the same construction [`derive_store_passphrase`] already uses for the store
+cipher, with a different `info` string. When a client is built for that account
+later — on another pod, after a volume loss, in a fresh deployment — the
+identity is imported back automatically.
+
+This was first built as an operator-maintained map of per-account passphrases.
+That was the wrong shape: this server accepts any active token, so anyone can
+connect any number of accounts, and a feature that needs the operator to add a
+line before each one works is not really available to them.
+
+### What this does and does not grant
+
+It grants nobody anything new. The pepper already decrypts every per-user
+store, and those stores already contain the same cross-signing private keys.
+Anyone holding the pepper could read them before this existed.
+
+It never touches a human's identity. The passphrase is only ever *written* by
+`bootstrap_cross_signing`, which refuses to run on an account that already has
+a cross-signing identity — so it only ever applies to accounts this deployment
+set up itself. Reading is a `recover()` attempt that simply fails for every
+human user, whose Secret Storage is locked with their own key and is left
+untouched. `/setup` remains the route for those.
+
+Pepper rotation is already documented as destructive to the stores. It is
+equally destructive here: rotate it and previously created identities can no
+longer be recovered.
+
+### One matrix-sdk client per device
+
+Related, and learned the hard way: **never point two matrix-sdk clients at the
+same access token.** Both build a crypto store and generate identity keys for
+the same device id, only one set can be advertised, and the loser can decrypt
+nothing while looking perfectly healthy. Reissuing the token does not fix it —
+the device id, and its keys, survive. Recovery cannot fix it either: it
+restores an identity, not a device. Give each consumer its own account.

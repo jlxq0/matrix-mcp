@@ -6,6 +6,188 @@ All notable changes to matrix-mcp. Format: [Keep a Changelog](https://keepachang
 
 ## [Unreleased]
 
+### Added
+- Release images are mirrored to `ghcr.io/jlxq0/matrix-mcp`, and the image
+  carries standard OCI annotations so the package page links back to the
+  repository, README and licence. The mirror is a registry-to-registry copy of
+  the already-published artifact rather than a second build, and it cannot fail
+  a release: GHCR previously ran inside the build step, where a stale token
+  took a whole tag down with it.
+- **Secret Storage recovery for accounts with no human.** `/setup` is a browser
+  flow, so a bot account can never use it, and its cross-signing identity would
+  exist only in this deployment's store — lose the volume and it is stranded
+  permanently, because the homeserver still holds a master key and
+  `bootstrap_cross_signing` rightly refuses to mint a second. Creating an
+  identity now also writes it to Secret Storage under a passphrase derived from
+  the pepper and the MXID, the same construction already used for the store
+  cipher, and building a client for that account imports it back. Nothing to
+  configure: this server accepts any active token, so a feature that needed the
+  operator to list each account before it worked would not really be available.
+  It grants nobody anything new — the pepper already decrypts the stores those
+  keys live in — and it never touches a human's Secret Storage, which stays
+  locked with their own key.
+- **Answer permission prompts from Matrix.** The `/channel` mount now also
+  declares `claude/channel/permission`, so a session on it forwards each
+  tool-approval dialog to Matrix as a message carrying the five-letter request
+  id, and a reply of `yes <id>` or `no <id>` applies the verdict. Both dialogs
+  stay live and the first answer wins. Without this every gated `Bash`, `Write`
+  or `Edit` in a session driven from a phone stalls until somebody reaches a
+  keyboard, which is most of what the channel exists to avoid.
+
+  The verdict branch runs behind the same sender allowlist as message delivery,
+  because anyone who can reply through the channel can approve tool use in the
+  session. The gate is an argument to a pure classifier rather than statement
+  order in the inbound handler, so "a stranger's `yes abcde` is ignored" is a
+  question a unit test can ask rather than a property of where a `return` sits.
+  A verdict is matched, answered once and never also forwarded as chat.
+
+  A permission request arrives on an MCP peer that carries no room, so the
+  destination comes from `permission_room` in the account's own
+  `app.matrix_mcp.channel` account data, and otherwise from the room an
+  allowlisted sender last wrote in — recorded only *after* the allowlist gate
+  passes, so a stranger who DMs the bot cannot redirect future prompts into a
+  room he controls. Neither known means the prompt is dropped with a log line;
+  a guessed room is an approval handed to whoever is standing in it. Verdicts
+  go back to the session that asked, keyed on `(mxid, request id)` and expiring
+  after fifteen minutes, so a verdict for an id nobody issued is visibly
+  dropped instead of broadcast.
+
+- **`/channel`: serve Matrix as a Claude Code channel.** A second mount that
+  declares the `claude/channel` capability and pushes inbound room messages
+  into a running Claude Code session, so a session can react to Matrix while
+  nobody is at the terminal. `/mcp` is unchanged: a capability declared there
+  would turn every existing client into a channel and start pushing at sessions
+  that never asked. The channel mount offers seven tools rather than sixty,
+  because every tool schema costs client context before any work happens.
+
+  Inbound messages are gated on the sender's full MXID, read from the account's
+  own `app.matrix_mcp.channel` account data and cached briefly. An absent or
+  empty list pushes nothing — an ungated channel is a prompt-injection vector.
+  Gating is on the sender and never the room, which differ in a group room.
+  Bodies go through the same `content_sandbox` the read tools use, and an event
+  that trips the injection heuristic carries `suspicious="true"`.
+
+  Messages that arrive while no session is listening are replayed when one
+  attaches, watermarked by the account's own read receipt. The server never
+  writes that receipt itself: it cannot observe delivery, because a session
+  object outlives the client that opened it. The agent acknowledges with
+  `mark_read`, so delivery is at-least-once.
+
+- **`bootstrap_cross_signing`**: create a cross-signing identity for an account
+  that has none, so bot accounts stop showing as unverified. The `/setup` flow
+  imports an identity from Secret Storage, which assumes a human has run
+  Element's secure-backup flow; nobody signs into a bot. Refuses when an
+  identity already exists, so it can never become a reset that invalidates
+  other people's verifications.
+
+### Fixed
+- `get_info` and `verify_status` reported a hardcoded `example.com` /
+  `matrix-mcp.example.com` rather than the configured server name and setup
+  URL. The former reached the model's system prompt on every session.
+
+### Fixed
+- Tokens audienced at the canonical resource identifier
+  (`https://<host>/mcp` — the value we publish in the RFC 9728 document, and
+  the one the MCP authorization spec requires clients to send as the RFC 8707
+  `resource` parameter) were rejected: the introspection audience check still
+  compared against the bare origin. Both forms are now accepted, and an
+  audience mismatch returns `401` with a `WWW-Authenticate` challenge instead
+  of `500`, so the client re-authorizes rather than retrying a token that can
+  never work.
+- `MATRIX_MCP_AUTHORIZATION_SERVER` is no longer trailing-slash-stripped. It is
+  an OAuth issuer identifier, compared byte-for-byte against the AS metadata
+  document (RFC 8414 §3.3); stripping it made strict clients refuse MAS's
+  metadata, which publishes the issuer *with* a trailing slash. Endpoint URLs
+  are built from the slash-trimmed form. **Deployments should set this variable
+  to exactly the `issuer` value their AS publishes.**
+
+### Added
+- MCP sessions are now durable: session state is persisted under
+  `{MATRIX_MCP_STORE_DIR}/mcp-sessions/` and an `Mcp-Session-Id` the process
+  has no in-memory record of (restart, rollout, idle eviction) is restored and
+  its handshake replayed, instead of returning `404` and wedging the connector.
+  Entries expire after 7 days, the directory is capped at 4096 sessions, and
+  restores are subject to the same global session cap as fresh sessions.
+- `WWW-Authenticate` challenges now carry the `scope` parameter (RFC 6750 §3)
+  listing the scopes required to use this server, including the dynamic
+  device-binding scope. Clients treat the challenge scopes as authoritative, so
+  this removes a path where a client authorized without device binding and
+  silently lost E2EE.
+- `MATRIX_MCP_ALLOWED_ORIGINS` enables `Origin` validation on `/mcp`. Off by
+  default — see `docs/operations.md` for why.
+
+### Changed
+- The per-identity MCP handshake rate limit refills one slot every 2 minutes
+  (was: one every 30 minutes) with a burst of 16 (was: 8). A 429 here lands on
+  the user's *first tool call* after a reconnect, and the old refill period
+  meant an afternoon of ordinary reconnect churn could lock an identity out for
+  hours. The response is now a JSON-RPC error with a `Retry-After` header
+  rather than plain text.
+
+### Security
+- URL media uploads (`send_image_from_url`, `send_file`, `send_audio`,
+  `send_video`, `me_set_avatar`, and `upload_media_from_url`) now enforce
+  `MATRIX_MCP_UPLOAD_MAX_BYTES` while streaming the HTTP response instead of
+  after buffering the full body. Oversized responses are rejected before the
+  process allocates beyond the configured cap.
+- `send_tts_voice_message` now disables automatic redirects so the configured
+  bearer token is never forwarded to an unvalidated redirect target. TTS
+  responses also use the same streaming cap as URL media uploads.
+- `room_members` now refuses to enumerate rooms whose cached joined-member
+  count is above the hard cap (1000), avoiding a full SDK member-list load for
+  very large rooms. Use `room_info` for counts in those rooms.
+- Pull-request CI no longer runs the Docker/BuildKit job. PRs still run cargo
+  checks, but untrusted branches no longer get access to the LAN BuildKit
+  daemon.
+- Store-keying documentation is now consistent with the implementation:
+  matrix-sdk cache/store/passphrase keying is MXID-based as an accepted
+  device-key-continuity tradeoff, documented in ADR-11 and `docs/multi-user.md`.
+
+### Changed
+- `read_recent_messages` now exposes Matrix `/messages` pagination. Responses
+  include `start_token` and `end_token`; pass `end_token` back as `from` to
+  page older E2EE history without relying on homeserver full-text search.
+- `read_recent_messages` now defaults to 50 events per page and allows callers
+  to request up to 200 events per page, so deep encrypted-history scans need
+  fewer round trips while staying bounded.
+- `send_tts_voice_message` is more resilient to TTS endpoint flakiness:
+  the reqwest client is now pinned to HTTP/1.1 (so a slow Chatterbox
+  cold start doesn't get killed by Cloudflare's HTTP/2 stream-idle
+  timeout at ~60 s and surface as `error decoding response body`),
+  and the call retries once on transient failures (mid-stream cut,
+  5xx including Cloudflare 530 when the tunnel is bouncing). Caller
+  errors (4xx) and oversize responses are still surfaced immediately.
+- `send_tts_voice_message` now transcodes Chatterbox's WAV output
+  to Ogg/Opus (`audio/ogg`) before uploading to the homeserver.
+  WAV-mimetype voice messages rendered as generic file attachments
+  in Element regardless of the MSC3245 voice flag; Ogg/Opus is what
+  Element actually treats as a voice memo (bubble + play button +
+  waveform bars). The MSC1767 audio block now carries a real
+  40-bucket peak waveform computed from the PCM samples (previously
+  empty), so Element draws the bars instead of a flat line.
+  Implemented in pure Rust via `opus` (libopus C bindings, built
+  static) + `ogg` — no system libraries needed at runtime.
+
+### Added
+- `send_voice_message` MCP tool: posts `m.audio` with the MSC3245
+  voice flag + MSC1767 audio block (duration + waveform) so Element
+  renders the event as a voice-memo bubble instead of a generic audio
+  attachment. Accepts an optional caller-supplied waveform (0..=1024
+  samples, cap 200 entries); without one, clients still treat the
+  event as a voice message but show a flat bar. Audio is not decoded
+  server-side. Enables `ruma`'s `unstable-msc3245-v1-compat` feature.
+- `send_tts_voice_message` MCP tool: POSTs caller text to a
+  configured OpenAI-compatible TTS endpoint
+  (`{base}/audio/speech`, e.g. Chatterbox), parses the returned
+  WAV for duration, uploads to the homeserver media repo, and
+  sends the result as a voice message (same MSC3245 + MSC1767
+  envelope as `send_voice_message`). New env vars
+  `MATRIX_MCP_TTS_BASE_URL` and `MATRIX_MCP_TTS_BEARER_TOKEN` —
+  both must be set together, or both unset (the tool then
+  returns `invalid_params`). Input capped at 4096 chars; response
+  capped at the existing `MATRIX_MCP_UPLOAD_MAX_BYTES`. Token
+  is never logged.
+
 ### Security (secscan Group D: rescan follow-ups)
 - `CappedSessionManager::create_session` now takes a `tokio::sync::Mutex`
   gate before reading the session count and inserting. Previously the

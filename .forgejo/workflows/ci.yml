@@ -12,6 +12,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  # `audiopus_sys` defaults to dynamic linking on Linux/glibc, which
+  # would make our distroless runtime image require libopus.so. Force
+  # static so the same library shipped in the binary is what runs.
+  OPUS_STATIC: "1"
 
 jobs:
   # All cargo checks in one job. On a fast runner the cache hit + shared
@@ -21,8 +25,20 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      # Pin a commit on master, not on `stable`. Forge resolves actions from its
+      # own mirrors (DEFAULT_ACTIONS_URL = forge.oddie.app), and dtolnay
+      # force-pushes `stable`, so the mirror's 24h sync prunes the old tip and
+      # the pin 404s — the job then dies in ~2s with no steps and no error.
+      # master/v1 is append-only. It has no default `toolchain`.
+      # An exact version, not `stable`. With `RUSTFLAGS: -Dwarnings` a moving
+      # stable means the next clippy release fires a new lint on untouched code
+      # and reds whatever pull request happens to be open, and each `#[allow]`
+      # added to quiet one raises the version below which nobody can lint the
+      # tree at all — silently, because CI is always on the new side of it.
+      # Bump this deliberately, in its own change, and read AGENTS.md first.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # v1
         with:
+          toolchain: "1.98.0"
           components: rustfmt, clippy
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
@@ -33,6 +49,12 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
+      # `opus` (via audiopus_sys) builds libopus from C source at
+      # crate-build time using CMake. Even `cargo clippy` runs the
+      # build script, so cmake must be present on the runner for any
+      # cargo step to succeed.
+      - name: Install C build deps for libopus
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
@@ -51,9 +73,8 @@ jobs:
   docker:
     runs-on: ubuntu-22.04
     needs: cargo
+    if: github.event_name != 'pull_request'
     permissions: { contents: read, packages: write }
-    env:
-      BUILDKIT_HOST: tcp://10.0.1.57:1234
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }
@@ -76,22 +97,23 @@ jobs:
       # a cold build with no buildcache import — slower, but no
       # package-write PAT lands in the runner's docker config for a
       # PR-triggered job to potentially exfiltrate.
-      # GHCR login only when we're about to push real tags.
       - name: Login to Forgejo registry
         if: github.event_name != 'pull_request'
         run: |
           mkdir -p ~/.docker
-          F_AUTH=$(printf "%s:%s" "julian" "${{ secrets.FORGE_PUSH_TOKEN }}" | base64 -w0)
+          F_AUTH=$(printf "%s:%s" "jlxq0" "${{ secrets.FORGE_PUSH_TOKEN }}" | base64 -w0)
           echo "{\"auths\":{\"forge.oddie.app\":{\"auth\":\"$F_AUTH\"}}}" > ~/.docker/config.json
-      - name: Login to GHCR (tag only)
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          G_AUTH=$(printf "%s:%s" "jlxq0" "${{ secrets.GHCR_TOKEN }}" | base64 -w0)
-          jq --arg a "$G_AUTH" '.auths["ghcr.io"] = {auth: $a}' ~/.docker/config.json > /tmp/d && mv /tmp/d ~/.docker/config.json
       - name: Build (and push on tag)
         run: |
           set -euo pipefail
-          CACHE_REF="forge.oddie.app/julian/matrix-mcp:buildcache"
+          # buildkitd runs on the runner host; from inside this job container the
+          # host is our own bridge gateway. Never hardcode it (changes on
+          # reboot/DHCP, differs per repo/run). Slim image has no `ip`, so read
+          # the default route from /proc/net/route via node (always present).
+          GW="$(node -e 'const fs=require("fs");for(const l of fs.readFileSync("/proc/net/route","utf8").split("\n").slice(1)){const f=l.trim().split(/\s+/);if(f[1]==="00000000"){const h=f[2];console.log([h.slice(6,8),h.slice(4,6),h.slice(2,4),h.slice(0,2)].map(x=>parseInt(x,16)).join("."));break;}}')"
+          export BUILDKIT_HOST="tcp://${GW}:1234"
+          echo "buildkitd at ${BUILDKIT_HOST}"
+          CACHE_REF="forge.oddie.app/jlxq0/matrix-mcp:buildcache"
           # Cache import/export only on trusted refs (main + release
           # tags). PRs build cold — they can't poison the cache that
           # the next tag build pulls, and they don't need the Forgejo
@@ -100,17 +122,17 @@ jobs:
           EXPORT_CACHE_ARG=()
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             V="${GITHUB_REF#refs/tags/}"
-            TAGS="forge.oddie.app/julian/matrix-mcp:${V},forge.oddie.app/julian/matrix-mcp:latest,ghcr.io/jlxq0/matrix-mcp:${V},ghcr.io/jlxq0/matrix-mcp:latest"
+            TAGS="forge.oddie.app/jlxq0/matrix-mcp:${V},forge.oddie.app/jlxq0/matrix-mcp:latest"
             PUSH=true
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
             EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
           elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            TAGS="forge.oddie.app/julian/matrix-mcp:ci-${GITHUB_SHA::8}"
+            TAGS="forge.oddie.app/jlxq0/matrix-mcp:ci-${GITHUB_SHA::8}"
             PUSH=false
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
             EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
           else
-            TAGS="forge.oddie.app/julian/matrix-mcp:ci-${GITHUB_SHA::8}"
+            TAGS="forge.oddie.app/jlxq0/matrix-mcp:ci-${GITHUB_SHA::8}"
             PUSH=false
           fi
           buildctl build \
@@ -120,3 +142,34 @@ jobs:
             "${IMPORT_CACHE_ARG[@]}" \
             "${EXPORT_CACHE_ARG[@]}" \
             --output "type=image,\"name=${TAGS}\",push=${PUSH}"
+
+      # Mirror the pushed release to GHCR so the image is reachable from where
+      # people expect to find it, next to the mirrored source.
+      #
+      # A *copy*, not a second build: the artifact is already published and
+      # identical by digest, and this cannot rebuild it differently.
+      #
+      # `continue-on-error` is the point. GHCR previously ran inside the build
+      # itself, so a stale token took the whole v0.6.0 release down with it and
+      # GHCR was dropped entirely. Publishing to forge is what must not fail;
+      # the mirror is a convenience and is allowed to be broken without
+      # blocking a release. Missing credentials skip it quietly.
+      - name: Mirror release to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_TOKEN:-}" ]; then
+            echo "GHCR_TOKEN not set; skipping the GHCR mirror"
+            exit 0
+          fi
+          V="${GITHUB_REF#refs/tags/}"
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
+          printf '%s' "$GHCR_TOKEN" | skopeo login ghcr.io -u jlxq0 --password-stdin
+          for T in "$V" latest; do
+            skopeo copy --src-no-creds \
+              "docker://forge.oddie.app/jlxq0/matrix-mcp:${T}" \
+              "docker://ghcr.io/jlxq0/matrix-mcp:${T}"
+          done
