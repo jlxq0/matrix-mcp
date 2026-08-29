@@ -171,6 +171,54 @@ impl MatrixClientCache {
             .is_some_and(|cell| cell.initialized())
     }
 
+    /// Wait for a rebuilt client to publish its device keys, and report which
+    /// way the wait ended.
+    ///
+    /// Extracted because `verify_or_heal` crossed clippy's hundred-line limit,
+    /// and it reads better split: the caller decides to heal, this reports
+    /// what came of it. Returns nothing because every outcome is a log line
+    /// and a metric; `keys_verified` is deliberately left false in all three
+    /// cases so the next call re-checks.
+    async fn await_publication(&self, rebuilt: &Arc<Client>, mxid: &str) {
+        let mxid = mxid.to_owned();
+        let waited = wait_for_publish(
+            || verify_device_keys_published(rebuilt, &mxid),
+            PUBLISH_CEILING,
+            PUBLISH_POLL_INTERVAL,
+        )
+        .await;
+        match waited {
+            PublishWait::Published => {
+                info!(
+                    mxid = %mxid,
+                    "device keys published after the rebuild; self-heal complete"
+                );
+                crate::metrics::SELF_HEAL_COUNTER
+                    .with_label_values(&["published_after_rebuild"])
+                    .inc();
+            }
+            PublishWait::Expired => {
+                warn!(
+                    mxid = %mxid,
+                    ceiling_secs = PUBLISH_CEILING.as_secs(),
+                    "stopped waiting for device keys to publish after the rebuild. The \
+                     wait expired; this is not a statement that they are unpublished, \
+                     and the next call will look again"
+                );
+                crate::metrics::SELF_HEAL_COUNTER
+                    .with_label_values(&["publish_wait_expired"])
+                    .inc();
+            }
+            PublishWait::CheckFailed => {
+                warn!(
+                    mxid = %mxid,
+                    "the publication check failed while waiting after the rebuild; \
+                     leaving keys_verified false so the next call re-checks"
+                );
+            }
+        }
+    }
+
     /// Take this identity's one heal, returning whether it was still
     /// available.
     ///
@@ -487,43 +535,7 @@ impl MatrixClientCache {
                 // Polling the observable rather than sleeping once: the
                 // original fault was a single check at a single moment, and a
                 // fixed sleep is that fault with a larger constant.
-                let mxid = identity.mxid.clone();
-                let waited = wait_for_publish(
-                    || verify_device_keys_published(&rebuilt, &mxid),
-                    PUBLISH_CEILING,
-                    PUBLISH_POLL_INTERVAL,
-                )
-                .await;
-                match waited {
-                    PublishWait::Published => {
-                        info!(
-                            mxid = %identity.mxid,
-                            "device keys published after the rebuild; self-heal complete"
-                        );
-                        crate::metrics::SELF_HEAL_COUNTER
-                            .with_label_values(&["published_after_rebuild"])
-                            .inc();
-                    }
-                    PublishWait::Expired => {
-                        warn!(
-                            mxid = %identity.mxid,
-                            ceiling_secs = PUBLISH_CEILING.as_secs(),
-                            "stopped waiting for device keys to publish after the rebuild. The \
-                             wait expired; this is not a statement that they are unpublished, \
-                             and the next call will look again"
-                        );
-                        crate::metrics::SELF_HEAL_COUNTER
-                            .with_label_values(&["publish_wait_expired"])
-                            .inc();
-                    }
-                    PublishWait::CheckFailed => {
-                        warn!(
-                            mxid = %identity.mxid,
-                            "the publication check failed while waiting after the rebuild; \
-                             leaving keys_verified false so the next call re-checks"
-                        );
-                    }
-                }
+                self.await_publication(&rebuilt, &identity.mxid).await;
                 Ok(rebuilt)
             }
             Err(e) => {
