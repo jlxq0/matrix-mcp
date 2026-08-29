@@ -454,3 +454,18 @@
   belongs in the code.** Rebuilding the client needs a device-bound session and
   only claude.ai's own grant issues one, so a retry cannot succeed however many
   times it runs. Without the comment the next reader's instinct is to add one.
+- **A doc comment stating the wrong mechanism is how a broken predicate keeps
+  looking right.** `verify_device_keys_published` was
+  `get_user_devices(own).get(own_device).is_some()`, and its own doc asserted
+  that call "also issues `/keys/query` to the homeserver". It does not:
+  `OlmMachine::get_user_devices` is `self.store().get_user_devices(...)`, and
+  `wait_if_user_pending` waits for a query in flight rather than starting one.
+  The SDK's own note says our own device **is always present in the store**, so
+  the predicate was invariantly true for the case it existed to detect and its
+  negative branch was unreachable for three months. **When a comment explains
+  why a check works, verify the explanation before the check**; a wrong one is
+  worse than none because it answers the question a reviewer would have asked.
+- **The store answers what we believe; only a query answers what the server
+  has.** Any check on whether the homeserver holds something must read the
+  response, not a store the response would have populated. `secret_store.rs`
+  already had the right shape and this one did not.

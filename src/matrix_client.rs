@@ -44,7 +44,7 @@
 //! Tool methods sleep on `sync_once` if they need fresh room state;
 //! the background task keeps state warm between calls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -122,6 +122,12 @@ pub struct MatrixClientCache {
     /// inbound Matrix traffic, and it has no request context of its own to
     /// discover which sessions belong to the identity it syncs for.
     channel: Option<crate::channel::ChannelRegistry>,
+    /// Identities whose store this process has already wiped once.
+    ///
+    /// Deliberately **not** persisted: it bounds a loop within one process,
+    /// and a restart is a fresh chance to heal a genuinely new occurrence
+    /// rather than a state to carry forward.
+    healed: Arc<RwLock<HashSet<String>>>,
 }
 
 impl MatrixClientCache {
@@ -131,6 +137,7 @@ impl MatrixClientCache {
             store,
             inner: Arc::new(RwLock::new(HashMap::new())),
             channel: None,
+            healed: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -162,6 +169,19 @@ impl MatrixClientCache {
             .await
             .get(mxid)
             .is_some_and(|cell| cell.initialized())
+    }
+
+    /// Take this identity's one heal, returning whether it was still
+    /// available.
+    ///
+    /// A free function on the cache rather than a check at the call site so
+    /// the claim and the wipe cannot drift apart: whoever wipes must have
+    /// claimed, and claiming twice is what the caller reports on.
+    async fn claim_heal(&self, mxid: &str) -> bool {
+        let mut guard = self.healed.write().await;
+        let first = guard.insert(mxid.to_owned());
+        drop(guard);
+        first
     }
 
     /// Drop the cached `matrix_sdk::Client` for this mxid, if any.
@@ -361,6 +381,16 @@ impl MatrixClientCache {
                 Ok(cached.client.clone())
             }
             Ok(false) => {
+                // **Measured before the heal runs, because the heal destroys
+                // the evidence.** Today's state — a device Synapse holds no
+                // key for — is the only control that says this predicate can
+                // return false at all, and it exists once. A verdict logged
+                // here survives the wipe that follows.
+                info!(
+                    mxid = %identity.mxid,
+                    device_id = ?cached.client.device_id(),
+                    "device keys absent from the homeserver's /keys/query response"
+                );
                 if retry {
                     // Second pass after wipe+rebuild and Synapse still
                     // doesn't have our keys. Surface the failure rather
@@ -374,11 +404,49 @@ impl MatrixClientCache {
                         identity.mxid
                     ));
                 }
+                // **At most one heal per identity per process.** A second
+                // demand is a report rather than a second wipe: an
+                // unexplained recurrence then surfaces as "the heal was
+                // needed twice" instead of as a crypto store being wiped in a
+                // loop. What set the SDK's `shared` flag on a device Synapse
+                // never keyed is unmeasured, so this bound is what makes the
+                // fix survivable without that answer.
+                if !self.claim_heal(&identity.mxid).await {
+                    warn!(
+                        mxid = %identity.mxid,
+                        device_id = ?cached.client.device_id(),
+                        "device keys still unpublished and this identity has already been \
+                         healed once in this process; refusing a second wipe. Something \
+                         re-creates the split-brain state and wiping again would loop"
+                    );
+                    crate::metrics::SELF_HEAL_COUNTER
+                        .with_label_values(&["refused_second_heal"])
+                        .inc();
+                    return Ok(cached.client.clone());
+                }
+                // **Never wipe a store whose contents cannot be restored.**
+                // The wipe discards olm and megolm state and is cheap only
+                // because key backup restores it. Checked per identity here
+                // rather than assumed fleet-wide, because it differs per bot.
+                if !key_backup_is_recoverable(&cached.client).await {
+                    warn!(
+                        mxid = %identity.mxid,
+                        device_id = ?cached.client.device_id(),
+                        "device keys are unpublished, and there is no recoverable key backup \
+                         for this identity; refusing to wipe. Wiping would discard message \
+                         history with nothing to restore it from, which is worse than the \
+                         unverified state it would clear"
+                    );
+                    crate::metrics::SELF_HEAL_COUNTER
+                        .with_label_values(&["refused_no_key_backup"])
+                        .inc();
+                    return Ok(cached.client.clone());
+                }
                 warn!(
                     mxid = %identity.mxid,
                     device_id = ?cached.client.device_id(),
-                    "split-brain crypto state detected (local SDK has device_keys, \
-                     Synapse does not); self-healing by wiping per-MXID store",
+                    "split-brain crypto state detected (the homeserver holds no device keys \
+                     for this device); self-healing by wiping per-MXID store",
                 );
                 crate::metrics::SELF_HEAL_COUNTER
                     .with_label_values(&["device_keys_missing"])
@@ -730,20 +798,39 @@ fn is_permanent_auth_failure(msg: &str) -> bool {
     msg.contains("M_UNKNOWN_TOKEN") || msg.contains("Token is not active")
 }
 
-/// Ask matrix-rust-sdk for the user's device set and check whether
-/// `client.device_id()` is present.
+/// Whether **Synapse** holds device keys for this client's device.
 ///
-/// `Client::encryption().get_user_devices` routes through the
-/// `OlmMachine`, which consults its local crypto store but also issues
-/// `/keys/query` to the homeserver for any user with a pending key-query
-/// (and our own user is always in that set after a successful sync).
-/// We treat:
+/// **This function's own doc comment used to state the mechanism wrongly, and
+/// that is why the predicate looked correct.** It said
+/// `Client::encryption().get_user_devices` consults the local crypto store
+/// "but also issues `/keys/query` to the homeserver for any user with a
+/// pending key-query". It does not: the call is `OlmMachine::get_user_devices`,
+/// which is `self.store().get_user_devices(...)`, and `wait_if_user_pending`
+/// only waits for a query already in flight rather than starting one.
 ///
-/// - `Ok(true)` — device id present in response → keys are published
-/// - `Ok(false)` — device id absent → split-brain, caller should self-heal
-/// - `Err(_)` — network or olm-machine error → propagate; caller decides
-///   whether to fail closed (we don't; we log and leave `keys_verified`
-///   false so the next call retries)
+/// Outcomes: `Ok(true)` the homeserver announces this device; `Ok(false)` it
+/// does not, and the caller should heal; `Err` a network or olm-machine
+/// failure, propagated so the caller leaves `keys_verified` false and retries
+/// rather than failing closed.
+///
+/// **The first version of this asked the local store and could not fail.** It
+/// was `get_user_devices(own_user).get(own_device_id).is_some()`, and
+/// `Encryption::get_user_devices` reads `OlmMachine::get_user_devices`, which
+/// is `self.store().get_user_devices(...)` with no homeserver round trip. The
+/// SDK's own note on that function says *"This method will include our own
+/// device which is always present in the store"*, and the memory store asserts
+/// it: `.expect("Invalid state: Should always have a own device")`.
+///
+/// So the predicate was invariantly `true` for the case it existed to detect:
+/// it returned `Ok(true)` for a device Synapse has never held a key for, the
+/// verified flag latched, and the heal below never ran. **Its negative branch
+/// was unreachable**, which is why nothing exercised the machinery it guards
+/// and why no unit test could have caught it — the fault needs a live
+/// homeserver disagreeing with a live store.
+///
+/// Forcing the `/keys/query` first is the shape `secret_store.rs` already uses
+/// after uploading a signature, for the same reason: the store answers what we
+/// believe, and only a query answers what the server has.
 async fn verify_device_keys_published(client: &Client, mxid: &str) -> Result<bool> {
     let user_id = UserId::parse(mxid).with_context(|| format!("parse mxid: {mxid}"))?;
     let Some(device_id) = client.device_id() else {
@@ -751,12 +838,56 @@ async fn verify_device_keys_published(client: &Client, mxid: &str) -> Result<boo
             "client has no device_id; cannot verify device_keys for {mxid}"
         ));
     };
-    let devices = client
-        .encryption()
-        .get_user_devices(&user_id)
+    // Ask the homeserver and read **its** answer. The store is not consulted
+    // at all: it holds our own device unconditionally, so any path through it
+    // returns true regardless of what Synapse has.
+    let mut request = matrix_sdk::ruma::api::client::keys::get_keys::v3::Request::new();
+    request.device_keys.insert(user_id.clone(), Vec::new());
+    let response = client
+        .send(request)
         .await
-        .with_context(|| format!("get_user_devices({mxid})"))?;
-    Ok(devices.get(device_id).is_some())
+        .with_context(|| format!("keys_query({mxid})"))?;
+
+    Ok(device_in_keys_response(&response, &user_id, device_id))
+}
+
+/// Whether a `/keys/query` response announces this device.
+///
+/// Split from the request because the request needs a live `Client` and this
+/// is the judgement: **absence from the response is the negative.** The old
+/// predicate had no reachable negative at all, so the one thing worth pinning
+/// is that a homeserver saying nothing about the user, or nothing about the
+/// device, reads as *not published* rather than as *no information*.
+fn device_in_keys_response(
+    response: &matrix_sdk::ruma::api::client::keys::get_keys::v3::Response,
+    user_id: &matrix_sdk::ruma::UserId,
+    device_id: &matrix_sdk::ruma::DeviceId,
+) -> bool {
+    response
+        .device_keys
+        .get(user_id)
+        .is_some_and(|devices| devices.contains_key(device_id))
+}
+
+/// Whether this identity has a recoverable key backup on the server.
+///
+/// **Refusing the heal without one is a hard precondition.** Wiping the
+/// per-MXID store discards olm and megolm state, which is cheap to lose only
+/// because key backup restores it — the figure on this PR is ~12 s for 924
+/// keys across 31 rooms. With no backup there is nothing to restore from, and
+/// **a heal that destroys history to clear a shield is worse than the shield**.
+///
+/// Checked per identity immediately before wiping rather than assumed
+/// fleet-wide: it differs per bot, and at least one account on this
+/// deployment has no cross-signing keys at all.
+async fn key_backup_is_recoverable(client: &Client) -> bool {
+    match client.encryption().backups().exists_on_server().await {
+        Ok(exists) => exists,
+        Err(e) => {
+            warn!(error = %e, "could not determine whether a key backup exists; refusing to wipe");
+            false
+        }
+    }
 }
 
 /// SHA-256 the mxid, hex-encode, take the first 32 chars. Stable and
@@ -847,6 +978,78 @@ fn token_hash(access_token: &str) -> [u8; 32] {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn a_keys_query_that_omits_the_device_reads_as_not_published() {
+        use matrix_sdk::ruma::api::client::keys::get_keys::v3::Response;
+        use matrix_sdk::ruma::{device_id, user_id};
+
+        let me = user_id!("@a:example.org");
+        let mine = device_id!("MATRIXMCP-TEST1234");
+
+        // The live state this exists for: Synapse holds no device keys, so
+        // the user does not appear in the response at all.
+        let empty = Response::new();
+        assert!(
+            !device_in_keys_response(&empty, me, mine),
+            "an empty response read as published"
+        );
+
+        // Present user, other devices, ours absent. Distinct from the case
+        // above because a homeserver that knows the user but not the device
+        // is the state after a device is created and never uploads.
+        let mut other_device = Response::new();
+        other_device
+            .device_keys
+            .entry(me.to_owned())
+            .or_default()
+            .insert(
+                device_id!("SOMEOTHERDEVICE").to_owned(),
+                serde_json::from_str("{}").unwrap(),
+            );
+        assert!(
+            !device_in_keys_response(&other_device, me, mine),
+            "a response listing only another device read as published"
+        );
+
+        // The control, or every assertion above passes against a predicate
+        // that is invariantly false — which is the mirror of the bug being
+        // fixed, where it was invariantly true.
+        let mut published = Response::new();
+        published
+            .device_keys
+            .entry(me.to_owned())
+            .or_default()
+            .insert(mine.to_owned(), serde_json::from_str("{}").unwrap());
+        assert!(
+            device_in_keys_response(&published, me, mine),
+            "a response announcing our device read as not published"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_gets_exactly_one_heal_per_process() {
+        // The bound that makes this fix survivable without knowing what set
+        // the SDK's `shared` flag. A heal firing on every rebuild would wipe
+        // a crypto store in a loop; the second demand has to be a report.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_store_root(dir.path().to_path_buf());
+
+        assert!(
+            cache.claim_heal("@a:example.org").await,
+            "first heal refused"
+        );
+        assert!(
+            !cache.claim_heal("@a:example.org").await,
+            "a second wipe was allowed for the same identity"
+        );
+        // The bound is per identity, not global: one bot looping must not
+        // deny another its single repair.
+        assert!(
+            cache.claim_heal("@b:example.org").await,
+            "another identity was denied because the first had healed"
+        );
+    }
+
     use super::*;
 
     #[test]
