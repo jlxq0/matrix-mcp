@@ -487,11 +487,19 @@ pub async fn recover(
     // "Unlocked", `verify_status` reports cross_signed=false, and the
     // signature appears on Synapse pointing at the wrong device pubkey).
     //
-    // We avoid the trap by refusing /setup outright unless the
-    // per-mxid SDK cache already has an entry. If absent, the user is
-    // told to run a Matrix tool from claude.ai first. This is the
-    // single safety net that makes /setup's design invariant
-    // ("piggyback on claude.ai's client") explicit and enforced.
+    // We avoid the trap with belt-and-braces:
+    //   1. `MatrixClientCache::for_user` itself now post-verifies via
+    //      `/keys/query` once per cached client; if Synapse doesn't
+    //      have the device's keys it wipes the per-MXID store and
+    //      rebuilds before returning the client. So by the time
+    //      `contains()` below answers `true`, the cached client has
+    //      already been validated against the homeserver.
+    //   2. The `contains()` check here stays as defense-in-depth: it
+    //      catches the race where `/setup/recover` is hit before any
+    //      tool call has triggered `for_user`, and (in theory) any
+    //      window where the cache was evicted concurrently. If the
+    //      cache is empty we redirect the user to run a Matrix tool
+    //      from claude.ai first.
     if !state.clients.contains(&session.mxid).await {
         span.record("outcome", "precondition");
         return error_page(
