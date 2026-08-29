@@ -513,3 +513,24 @@
   handed the same screenshot should not go looking through this repository for
   it again.
 ||||||| 752e454
+- **The five gates pass on a tree that cannot be merged.** Conflict markers in
+  a `.md` file compile and test fine, so `fmt`, `clippy`, `312 passed`, `audit`
+  and `deny` all went green on a working tree with an unresolved `AGENTS.md`
+  conflict in it. Nothing in their output hints at the condition, and the
+  markers can be `git add`ed and committed, so trusting the gates there pushes
+  a conflicted branch and calls it verified.
+
+  **This collides structurally rather than by bad luck**: every entry here is
+  appended at the end of the file, so any two branches that both add one
+  conflict, and `AGENTS.md` is the file this repository asks everyone to touch.
+
+  The check costs nothing and goes **before** the gates. Measured rather than
+  assumed:
+
+      git diff --name-only --diff-filter=U     prints the paths, exits 0 — test the output, not the code
+      git ls-files -u                          one line per unmerged stage, empty when clean
+      git diff --check                         names the marker lines, exits 2
+
+  **`git diff --check` exits 2, not 1**, and it also fires on whitespace
+  errors, so a non-zero exit from it is not specifically a conflict. Use the
+  `--diff-filter=U` form when you want the question answered exactly.
