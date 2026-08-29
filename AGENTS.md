@@ -491,3 +491,25 @@
   began failing where it had returned `cross_signed: false`. It now returns the
   client and leaves `keys_verified` false, so a late publish is picked up on the
   next call without another wipe.
+- **A repair can succeed and report failure, and the only thing that found it
+  was re-running the check an hour later.** The device-key heal wiped, rebuilt
+  and re-checked 531 ms later, then said *"device keys still not published
+  after rebuild"*. It had published: `verify_status` answered normally hours
+  afterwards and Synapse's row count for that device went 0 at 12:25:13Z to 1
+  at 16:13:10Z. Nothing in the diff shows this, and no test could: the code is
+  correct at every line and wrong about *when* it looks. **When a repair
+  reports failure, re-run its own check before believing it**, because a
+  verification that runs immediately after the thing it verifies is measuring
+  the repair rather than the repaired.
+
+  Which of the two published is an inference from timing rather than something
+  the rows record: two samples four hours apart cannot separate the 16:08
+  rebuild from anything between them.
+- **`/setup` never renders the string `Unexpected error`.** It was reported as
+  our defect and it is not ours: `error_page` renders a headed page carrying
+  the escaped message and a *Start over* link, and a grep of `src/` for that
+  string returns nothing. The page came from MAS. **Recorded because "we do not
+  render that" is a fact about where this surface ends**, and the next person
+  handed the same screenshot should not go looking through this repository for
+  it again.
+||||||| 752e454
