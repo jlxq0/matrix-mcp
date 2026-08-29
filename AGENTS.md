@@ -469,6 +469,28 @@
   has.** Any check on whether the homeserver holds something must read the
   response, not a store the response would have populated. `secret_store.rs`
   already had the right shape and this one did not.
+- **Verifying a repair immediately after making it measures the repair, not
+  the thing it repaired.** The device-key heal wiped the store, rebuilt the
+  client and re-checked **531 ms later**, then reported *"device keys still not
+  published after rebuild"*. The rebuilt client publishes from the background
+  sync loop rather than from `for_user`, so nothing could have happened yet;
+  the device had in fact published, and a call hours later answered normally.
+  **The failure it reported was its own impatience.** For scale, a healthy
+  client on this deployment takes 1.19 s from build to first tool call with no
+  key publication in that path.
+- **Wait on the observable with a ceiling, never on a duration.** The original
+  fault was one check at one moment, and a fixed sleep is that fault with a
+  larger constant. `wait_for_publish` polls and returns three outcomes, and
+  **`Expired` is deliberately not `NotPublished`**: at the ceiling we know only
+  that we stopped asking. Conflating those is what turned a slow *not yet* into
+  a reported *never*. The ceiling is **chosen, not derived** — 531 ms is known
+  too short and 1.19 s is a different measurement — and the comment says so, so
+  the number does not become folklore the moment somebody tunes it.
+- **A hard error where a status used to answer converts an unknown into an
+  outage.** The first version raised at the second negative and `verify_status`
+  began failing where it had returned `cross_signed: false`. It now returns the
+  client and leaves `keys_verified` false, so a late publish is picked up on the
+  next call without another wipe.
 - **A repair can succeed and report failure, and the only thing that found it
   was re-running the check an hour later.** The device-key heal wiped, rebuilt
   and re-checked 531 ms later, then said *"device keys still not published
@@ -490,3 +512,4 @@
   render that" is a fact about where this surface ends**, and the next person
   handed the same screenshot should not go looking through this repository for
   it again.
+||||||| 752e454
