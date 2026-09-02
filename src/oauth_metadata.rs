@@ -250,6 +250,9 @@ mod tests {
             meta.registration_endpoint,
             "https://auth.example.test/oauth2/registration"
         );
-        assert_eq!(meta.authorization_endpoint, "https://auth.example.test/authorize");
+        assert_eq!(
+            meta.authorization_endpoint,
+            "https://auth.example.test/authorize"
+        );
     }
 }
