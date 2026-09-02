@@ -354,6 +354,18 @@ fn build_router(
 
     Router::new()
         .route("/health", get(health))
+        .merge(well_known_routes())
+        .merge(setup_routes)
+        .merge(mcp_routes)
+        .layer(TraceLayer::new_for_http())
+        .with_state(cfg)
+}
+
+/// The unauthenticated OAuth discovery documents, kept out of
+/// [`build_router`] so that adding one does not push it past clippy's
+/// `too_many_lines` ceiling.
+fn well_known_routes() -> Router<Config> {
+    Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
@@ -374,10 +386,6 @@ fn build_router(
             "/.well-known/oauth-authorization-server/mcp",
             get(authorization_server_metadata),
         )
-        .merge(setup_routes)
-        .merge(mcp_routes)
-        .layer(TraceLayer::new_for_http())
-        .with_state(cfg)
 }
 
 async fn health() -> impl IntoResponse {
