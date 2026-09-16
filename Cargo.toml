@@ -67,7 +67,7 @@ rand = "0.8"
 # Official MCP Rust SDK. `transport-streamable-http-server` umbrella enables
 # session manager + http transport + worker bits we need to mount the service
 # via `axum::Router::nest_service("/mcp", ...)`.
-rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
+rmcp = { version = "2.0", features = ["transport-streamable-http-server"] }
 # rmcp's `SessionStore` trait (durable MCP sessions, see `session_store.rs`)
 # is declared with `#[async_trait::async_trait]`, so implementing it requires
 # the same macro. Already in the tree via rmcp; named here for the import path.
